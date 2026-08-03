@@ -13,7 +13,7 @@ namespace SatList.ImportLists
         public SatListRequestGenerator()
         {
             MaxPages = 1;
-            PageSize = 100;
+            PageSize = 1000;
         }
 
         public virtual ImportListPageableRequestChain GetListItems()
@@ -25,23 +25,9 @@ namespace SatList.ImportLists
 
         private IEnumerable<ImportListRequest> GetRequest()
         {
-            var request = new HttpRequest(Settings.ApiUrl, HttpAccept.Json);
+            var request = new HttpRequest($"{Settings.BaseUrl}/api/feed?limit={Settings.ResultCount}", HttpAccept.Json);
 
-            if (!string.IsNullOrWhiteSpace(Settings.ApiKey))
-            {
-                var paramName = string.IsNullOrWhiteSpace(Settings.ApiKeyParameterName)
-                    ? "api_key"
-                    : Settings.ApiKeyParameterName;
-
-                if (Settings.ApiKeyLocation == (int)ApiKeyLocation.Header)
-                {
-                    request.Headers.Add(paramName, Settings.ApiKey);
-                }
-                else
-                {
-                    request.AddQueryParam(paramName, Settings.ApiKey);
-                }
-            }
+            request.Headers.Add("User-Agent", "SatList-Lidarr-Plugin/1.0");
 
             yield return new ImportListRequest(request);
         }

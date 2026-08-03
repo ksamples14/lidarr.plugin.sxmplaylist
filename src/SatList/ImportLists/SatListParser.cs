@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using Newtonsoft.Json;
 using NzbDrone.Common.Extensions;
@@ -10,6 +11,8 @@ namespace SatList.ImportLists
 {
     public class SatListParser : IParseImportListResponse
     {
+        public SatListImportSettings Settings { get; set; }
+
         private ImportListResponse _importListResponse;
 
         public IList<ImportListItemInfo> ParseResponse(ImportListResponse importListResponse)
@@ -25,39 +28,76 @@ namespace SatList.ImportLists
 
             try
             {
-                var entries = JsonConvert.DeserializeObject<List<SatListEntry>>(_importListResponse.Content);
+                var feed = JsonConvert.DeserializeObject<XmFeedResponse>(_importListResponse.Content);
 
-                if (entries == null)
+                if (feed?.Results == null || feed.Results.Count == 0)
                 {
                     return items;
                 }
 
-                foreach (var entry in entries)
+                var channelFilter = ParseChannelFilter();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var play in feed.Results)
                 {
-                    if (entry.Artist.IsNullOrWhiteSpace() &&
-                        entry.Album.IsNullOrWhiteSpace() &&
-                        entry.ArtistMusicBrainzId.IsNullOrWhiteSpace() &&
-                        entry.AlbumMusicBrainzId.IsNullOrWhiteSpace())
+                    if (play.Track?.Artists == null || play.Track.Artists.Count == 0)
                     {
                         continue;
                     }
 
-                    items.Add(new ImportListItemInfo
+                    if (channelFilter.Count > 0 && !channelFilter.Contains(play.ChannelId))
                     {
-                        Artist = entry.Artist,
-                        ArtistMusicBrainzId = entry.ArtistMusicBrainzId,
-                        Album = entry.Album,
-                        AlbumMusicBrainzId = entry.AlbumMusicBrainzId,
-                        ReleaseDate = entry.ReleaseDate != default ? entry.ReleaseDate : (DateTime?)null
-                    });
+                        continue;
+                    }
+
+                    foreach (var artist in play.Track.Artists)
+                    {
+                        if (artist.IsNullOrWhiteSpace())
+                        {
+                            continue;
+                        }
+
+                        if (Settings.DedupeArtists && !seen.Add(artist))
+                        {
+                            continue;
+                        }
+
+                        items.Add(new ImportListItemInfo
+                        {
+                            Artist = artist,
+                            Album = play.Track.Title,
+                            ReleaseDate = play.Timestamp
+                        });
+                    }
                 }
             }
             catch (Exception ex)
             {
-                throw new ImportListException(_importListResponse, "Failed to parse import list JSON: {0}", ex.Message);
+                throw new ImportListException(_importListResponse, "Failed to parse xmplaylist feed: {0}", ex.Message);
             }
 
             return items;
+        }
+
+        private HashSet<string> ParseChannelFilter()
+        {
+            var filter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (Settings.ChannelFilter.IsNullOrWhiteSpace())
+            {
+                return filter;
+            }
+
+            foreach (var channel in Settings.ChannelFilter.Split(','))
+            {
+                var trimmed = channel.Trim();
+                if (trimmed.IsNotNullOrWhiteSpace())
+                {
+                    filter.Add(trimmed);
+                }
+            }
+
+            return filter;
         }
 
         protected virtual bool PreProcess(ImportListResponse importListResponse)
@@ -66,25 +106,38 @@ namespace SatList.ImportLists
             {
                 throw new ImportListException(
                     importListResponse,
-                    "API call returned status {0}",
+                    "xmplaylist API returned status {0}",
                     importListResponse.HttpResponse.StatusCode);
             }
 
             if (importListResponse.Content.IsNullOrWhiteSpace())
             {
-                throw new ImportListException(importListResponse, "API returned empty response");
+                throw new ImportListException(importListResponse, "xmplaylist API returned empty response");
             }
 
             return true;
         }
     }
 
-    internal class SatListEntry
+    internal class XmFeedResponse
     {
-        public string Artist { get; set; }
-        public string ArtistMusicBrainzId { get; set; }
-        public string Album { get; set; }
-        public string AlbumMusicBrainzId { get; set; }
-        public DateTime ReleaseDate { get; set; }
+        public int Count { get; set; }
+        public List<XmPlayEntry> Results { get; set; }
+    }
+
+    internal class XmPlayEntry
+    {
+        public string Id { get; set; }
+        public DateTime Timestamp { get; set; }
+        public XmTrackInfo Track { get; set; }
+        [JsonProperty("channelId")]
+        public string ChannelId { get; set; }
+    }
+
+    internal class XmTrackInfo
+    {
+        public string Id { get; set; }
+        public List<string> Artists { get; set; }
+        public string Title { get; set; }
     }
 }

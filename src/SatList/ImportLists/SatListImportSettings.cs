@@ -9,14 +9,9 @@ namespace SatList.ImportLists
     {
         public SatListImportSettingsValidator()
         {
-            RuleFor(c => c.ApiUrl)
-                .NotEmpty()
-                .WithMessage("API URL is required");
-
-            RuleFor(c => c.ApiUrl)
-                .Must(url => Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
-                             (uri.Scheme == "http" || uri.Scheme == "https"))
-                .WithMessage("API URL must be a valid HTTP or HTTPS URL");
+            RuleFor(c => c.ResultCount)
+                .InclusiveBetween(1, 1000)
+                .WithMessage("Result count must be between 1 and 1000");
         }
     }
 
@@ -26,21 +21,18 @@ namespace SatList.ImportLists
 
         public SatListImportSettings()
         {
-            BaseUrl = "";
-            ApiUrl = "";
+            BaseUrl = "https://xmplaylist.com";
+            ResultCount = 200;
         }
 
-        [FieldDefinition(0, Label = "API URL", HelpText = "Full URL of the JSON endpoint that returns your import list")]
-        public string ApiUrl { get; set; }
+        [FieldDefinition(0, Label = "Result Count", HelpText = "Number of recent plays to fetch (1-1000, default 200)", Type = FieldType.Number)]
+        public int ResultCount { get; set; }
 
-        [FieldDefinition(1, Label = "API Key", HelpText = "API key to include as a query parameter or header (optional)", Type = FieldType.Password)]
-        public string ApiKey { get; set; }
+        [FieldDefinition(1, Label = "Channel Filter", HelpText = "Comma-separated channel IDs to filter by (e.g. altnation, xmu, thespectrum). Leave empty for all channels.", Advanced = true)]
+        public string ChannelFilter { get; set; }
 
-        [FieldDefinition(2, Label = "API Key Location", HelpText = "Where to send the API key", Type = FieldType.Select, SelectOptions = typeof(ApiKeyLocation))]
-        public int ApiKeyLocation { get; set; }
-
-        [FieldDefinition(3, Label = "API Key Parameter Name", HelpText = "Name of the query parameter or header (default: api_key)", Advanced = true)]
-        public string ApiKeyParameterName { get; set; }
+        [FieldDefinition(2, Label = "Dedupe Artists", HelpText = "Only return each unique artist once (recommended to avoid duplicates)", Type = FieldType.Checkbox)]
+        public bool DedupeArtists { get; set; }
 
         public string BaseUrl { get; set; }
 
@@ -48,11 +40,5 @@ namespace SatList.ImportLists
         {
             return new NzbDroneValidationResult(Validator.Validate(this));
         }
-    }
-
-    public enum ApiKeyLocation
-    {
-        Query,
-        Header
     }
 }

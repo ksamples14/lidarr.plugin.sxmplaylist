@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using NLog;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
@@ -9,13 +8,13 @@ namespace SatList.ImportLists
 {
     public class SatListImport : HttpImportListBase<SatListImportSettings>
     {
-        public override string Name => "SatList Import";
+        public override string Name => "XM Playlist";
 
         public override ImportListType ListType => ImportListType.Other;
 
-        public override TimeSpan MinRefreshInterval => TimeSpan.FromHours(6);
+        public override TimeSpan MinRefreshInterval => TimeSpan.FromMinutes(30);
 
-        public override int PageSize => 100;
+        public override int PageSize => 1000;
 
         public SatListImport(
             IHttpClient httpClient,
@@ -37,7 +36,10 @@ namespace SatList.ImportLists
 
         public override IParseImportListResponse GetParser()
         {
-            return new SatListParser();
+            return new SatListParser
+            {
+                Settings = Settings
+            };
         }
     }
 }
