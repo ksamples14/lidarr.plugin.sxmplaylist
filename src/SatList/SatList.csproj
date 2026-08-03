@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>SatList</RootNamespace>
+    <AssemblyName>Lidarr.Plugin.SatList</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <RestoreAdditionalProjectSources>https://nuget.pkg.github.com/Lidarr/index.json</RestoreAdditionalProjectSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Submodules\Lidarr\src\NzbDrone.Common\Lidarr.Common.csproj" />
+    <ProjectReference Include="..\..\Submodules\Lidarr\src\NzbDrone.Core\Lidarr.Core.csproj" />
+    <ProjectReference Include="..\..\Submodules\Lidarr\src\Lidarr.Http\Lidarr.Http.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ILRepack" Version="2.0.28">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <Import Project="PreBuild.targets" />
+  <Import Project="PluginInfo.targets" />
+
+  <Target Name="ILRepack" AfterTargets="Build">
+    <ItemGroup>
+      <InputAssemblies Include="$(OutputPath)\Lidarr.Common.dll" />
+      <InputAssemblies Include="$(OutputPath)\Lidarr.Core.dll" />
+      <InputAssemblies Include="$(OutputPath)\Lidarr.Http.dll" />
+      <InputAssemblies Include="$(OutputPath)\$(AssemblyName).dll" />
+    </ItemGroup>
+    <ILRepack
+      Parallel="true"
+      DebugInfo="true"
+      AllowDuplicateResources="false"
+      InputAssemblies="@(InputAssemblies)"
+      TargetKind="Dll"
+      LibraryPath="$(OutputPath)"
+      OutputFile="$(SatListPluginOutputDirectory)\$(AssemblyName).dll" />
+    <Message Text="Plugin packaged to $(SatListPluginOutputDirectory)\$(AssemblyName).dll" Importance="high" />
+  </Target>
+</Project>

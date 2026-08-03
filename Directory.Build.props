@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <AccelerateBuildsInVisualStudio>true</AccelerateBuildsInVisualStudio>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <SatListBuildDirectory>$(MSBuildThisFileDirectory)_build</SatListBuildDirectory>
+    <SatListPluginOutputDirectory>$(MSBuildThisFileDirectory)_plugins\$(TargetFramework)\$(MSBuildProjectName)</SatListPluginOutputDirectory>
+  </PropertyGroup>
+</Project>
