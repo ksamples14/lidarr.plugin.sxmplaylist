@@ -1,4 +1,4 @@
-# SatList - XM Playlist Importer for Lidarr
+# Lidarr.Plugin.XmPlaylist
 
 A Lidarr import list plugin that discovers artists from the [xmplaylist.com](https://xmplaylist.com) SiriusXM radio play feed and adds them to your Lidarr library.
 
@@ -19,7 +19,7 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 ### From GitHub Releases
 
 1. In Lidarr, go to **Settings → Plugins**
-2. Paste `https://github.com/ksamples14/sat-list` into the GitHub URL box
+2. Paste `https://github.com/ksamples14/lidarr.plugin.xmplaylist` into the GitHub URL box
 3. Click **Install**
 4. **Restart Lidarr**
 
@@ -44,13 +44,13 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 ## Building From Source
 
 ```powershell
-git clone --recursive https://github.com/ksamples14/sat-list.git
-cd sat-list
+git clone --recursive https://github.com/ksamples14/lidarr.plugin.xmplaylist.git
+cd lidarr.plugin.xmplaylist
 dotnet restore SatList.sln
 dotnet build SatList.sln -c Release
 ```
 
-Output: `_plugins/net8.0/SatList/Lidarr.Plugin.SatList.dll`
+Output: `_plugins/net8.0/SatList/Lidarr.Plugin.XmPlaylist.dll`
 
 ## Project Structure
 

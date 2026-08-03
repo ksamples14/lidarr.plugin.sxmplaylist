@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <RootNamespace>SatList</RootNamespace>
-    <AssemblyName>Lidarr.Plugin.SatList</AssemblyName>
+    <AssemblyName>Lidarr.Plugin.XmPlaylist</AssemblyName>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <RestoreAdditionalProjectSources>https://nuget.pkg.github.com/Lidarr/index.json</RestoreAdditionalProjectSources>
   </PropertyGroup>

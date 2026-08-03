@@ -17,9 +17,9 @@ namespace SatList
 {
     public static class PluginInfo
     {
-        public const string Name = &quot;SatList&quot;;
-        public const string Author = &quot;&quot;;
-        public const string RepoUrl = &quot;&quot;;
+        public const string Name = &quot;XmPlaylist&quot;;
+        public const string Author = &quot;ksamples14&quot;;
+        public const string RepoUrl = &quot;https://github.com/ksamples14/lidarr.plugin.xmplaylist&quot;;
         public const string Version = &quot;1.0.0&quot;;
         public const string Branch = &quot;main&quot;;
         public const string BuildDate = &quot;$(PluginBuildDate)&quot;;
