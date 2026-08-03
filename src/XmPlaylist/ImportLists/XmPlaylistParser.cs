@@ -7,11 +7,11 @@ using NzbDrone.Common.Extensions;
 using NzbDrone.Core.ImportLists.Exceptions;
 using NzbDrone.Core.Parser.Model;
 
-namespace SatList.ImportLists
+namespace XmPlaylist.ImportLists
 {
-    public class SatListParser : IParseImportListResponse
+    public class XmPlaylistParser : IParseImportListResponse
     {
-        public SatListImportSettings Settings { get; set; }
+        public XmPlaylistImportSettings Settings { get; set; }
 
         private ImportListResponse _importListResponse;
 

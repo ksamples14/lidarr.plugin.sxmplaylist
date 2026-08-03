@@ -46,28 +46,28 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 ```powershell
 git clone --recursive https://github.com/ksamples14/lidarr.plugin.xmplaylist.git
 cd lidarr.plugin.xmplaylist
-dotnet restore SatList.sln
-dotnet build SatList.sln -c Release
+dotnet restore XmPlaylist.sln
+dotnet build XmPlaylist.sln -c Release
 ```
 
-Output: `_plugins/net8.0/SatList/Lidarr.Plugin.XmPlaylist.dll`
+Output: `_plugins/net8.0/XmPlaylist/Lidarr.Plugin.XmPlaylist.dll`
 
 ## Project Structure
 
 ```
 sat-list/
-├── src/SatList/
-│   ├── SatList.csproj
-│   ├── Plugin.cs                          # IPlugin entry point
-│   ├── PluginInfo.targets                 # Build-time metadata generation
-│   ├── PreBuild.targets                   # Lidarr submodule init
+├── src/XmPlaylist/
+│   ├── XmPlaylist.csproj
+│   ├── Plugin.cs                              # IPlugin entry point
+│   ├── PluginInfo.targets                     # Build-time metadata generation
+│   ├── PreBuild.targets                       # Lidarr submodule init
 │   └── ImportLists/
-│       ├── SatListImport.cs              # HttpImportListBase<TSettings>
-│       ├── SatListImportSettings.cs      # [FieldDefinition] + validation
-│       ├── SatListRequestGenerator.cs    # /api/feed request builder
-│       └── SatListParser.cs             # xmplaylist JSON → ImportListItemInfo
-├── Submodules/Lidarr/                     # Lidarr source (git submodule)
-└── SatList.sln
+│       ├── XmPlaylistImport.cs                # HttpImportListBase<TSettings>
+│       ├── XmPlaylistImportSettings.cs        # [FieldDefinition] + validation
+│       ├── XmPlaylistRequestGenerator.cs      # /api/feed request builder
+│       └── XmPlaylistParser.cs               # xmplaylist JSON → ImportListItemInfo
+├── Submodules/Lidarr/                         # Lidarr source (git submodule)
+└── XmPlaylist.sln
 ```
 
 ## API Usage Notes

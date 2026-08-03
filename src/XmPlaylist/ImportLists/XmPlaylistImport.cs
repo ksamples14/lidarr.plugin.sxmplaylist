@@ -4,9 +4,9 @@ using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
 using NzbDrone.Core.Parser;
 
-namespace SatList.ImportLists
+namespace XmPlaylist.ImportLists
 {
-    public class SatListImport : HttpImportListBase<SatListImportSettings>
+    public class XmPlaylistImport : HttpImportListBase<XmPlaylistImportSettings>
     {
         public override string Name => "XM Playlist";
 
@@ -16,7 +16,7 @@ namespace SatList.ImportLists
 
         public override int PageSize => 1000;
 
-        public SatListImport(
+        public XmPlaylistImport(
             IHttpClient httpClient,
             IImportListStatusService importListStatusService,
             IConfigService configService,
@@ -28,7 +28,7 @@ namespace SatList.ImportLists
 
         public override IImportListRequestGenerator GetRequestGenerator()
         {
-            return new SatListRequestGenerator
+            return new XmPlaylistRequestGenerator
             {
                 Settings = Settings
             };
@@ -36,7 +36,7 @@ namespace SatList.ImportLists
 
         public override IParseImportListResponse GetParser()
         {
-            return new SatListParser
+            return new XmPlaylistParser
             {
                 Settings = Settings
             };

@@ -1,16 +1,16 @@
 using System.Collections.Generic;
 using NzbDrone.Common.Http;
 
-namespace SatList.ImportLists
+namespace XmPlaylist.ImportLists
 {
-    public class SatListRequestGenerator : IImportListRequestGenerator
+    public class XmPlaylistRequestGenerator : IImportListRequestGenerator
     {
-        public SatListImportSettings Settings { get; set; }
+        public XmPlaylistImportSettings Settings { get; set; }
 
         public int MaxPages { get; set; }
         public int PageSize { get; set; }
 
-        public SatListRequestGenerator()
+        public XmPlaylistRequestGenerator()
         {
             MaxPages = 1;
             PageSize = 1000;
@@ -27,7 +27,7 @@ namespace SatList.ImportLists
         {
             var request = new HttpRequest($"{Settings.BaseUrl}/api/feed?limit={Settings.ResultCount}", HttpAccept.Json);
 
-            request.Headers.Add("User-Agent", "SatList-Lidarr-Plugin/1.0");
+            request.Headers.Add("User-Agent", "XmPlaylist-Lidarr-Plugin/1.0");
 
             yield return new ImportListRequest(request);
         }

@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <RootNamespace>SatList</RootNamespace>
+    <RootNamespace>XmPlaylist</RootNamespace>
     <AssemblyName>Lidarr.Plugin.XmPlaylist</AssemblyName>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <RestoreAdditionalProjectSources>https://nuget.pkg.github.com/Lidarr/index.json</RestoreAdditionalProjectSources>
@@ -37,7 +37,7 @@
       InputAssemblies="@(InputAssemblies)"
       TargetKind="Dll"
       LibraryPath="$(OutputPath)"
-      OutputFile="$(SatListPluginOutputDirectory)\$(AssemblyName).dll" />
-    <Message Text="Plugin packaged to $(SatListPluginOutputDirectory)\$(AssemblyName).dll" Importance="high" />
+      OutputFile="$(XmPlaylistPluginOutputDirectory)\$(AssemblyName).dll" />
+    <Message Text="Plugin packaged to $(XmPlaylistPluginOutputDirectory)\$(AssemblyName).dll" Importance="high" />
   </Target>
 </Project>

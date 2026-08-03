@@ -6,16 +6,16 @@ using NzbDrone.Core.Lifecycle;
 using NzbDrone.Core.Messaging.Events;
 using NzbDrone.Core.Plugins;
 
-namespace SatList
+namespace XmPlaylist
 {
-    public class SatListPlugin : Plugin,
+    public class XmPlaylistPlugin : Plugin,
         IHandle<ApplicationStartingEvent>
     {
         public override string Name => PluginInfo.Name;
         public override string Owner => PluginInfo.Author;
         public override string GithubUrl => PluginInfo.RepoUrl;
 
-        public SatListPlugin()
+        public XmPlaylistPlugin()
         {
         }
 
@@ -24,7 +24,7 @@ namespace SatList
             var config = LogManager.Configuration;
             if (config != null)
             {
-                var rule = new LoggingRule($"SatList.*", LogLevel.Debug, config.FindTargetByName("file"));
+                var rule = new LoggingRule($"XmPlaylist.*", LogLevel.Debug, config.FindTargetByName("file"));
                 if (!config.LoggingRules.Contains(rule))
                 {
                     config.LoggingRules.Add(rule);

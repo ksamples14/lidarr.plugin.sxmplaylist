@@ -3,11 +3,11 @@ using NzbDrone.Core.Annotations;
 using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Validation;
 
-namespace SatList.ImportLists
+namespace XmPlaylist.ImportLists
 {
-    public class SatListImportSettingsValidator : AbstractValidator<SatListImportSettings>
+    public class XmPlaylistImportSettingsValidator : AbstractValidator<XmPlaylistImportSettings>
     {
-        public SatListImportSettingsValidator()
+        public XmPlaylistImportSettingsValidator()
         {
             RuleFor(c => c.ResultCount)
                 .InclusiveBetween(1, 1000)
@@ -15,11 +15,11 @@ namespace SatList.ImportLists
         }
     }
 
-    public class SatListImportSettings : IImportListSettings
+    public class XmPlaylistImportSettings : IImportListSettings
     {
-        private static readonly SatListImportSettingsValidator Validator = new();
+        private static readonly XmPlaylistImportSettingsValidator Validator = new();
 
-        public SatListImportSettings()
+        public XmPlaylistImportSettings()
         {
             BaseUrl = "https://xmplaylist.com";
             ResultCount = 200;

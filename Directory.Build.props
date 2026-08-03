@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>disable</ImplicitUsings>
-    <SatListBuildDirectory>$(MSBuildThisFileDirectory)_build</SatListBuildDirectory>
-    <SatListPluginOutputDirectory>$(MSBuildThisFileDirectory)_plugins\$(TargetFramework)\$(MSBuildProjectName)</SatListPluginOutputDirectory>
+    <XmPlaylistBuildDirectory>$(MSBuildThisFileDirectory)_build</XmPlaylistBuildDirectory>
+    <XmPlaylistPluginOutputDirectory>$(MSBuildThisFileDirectory)_plugins\$(TargetFramework)\$(MSBuildProjectName)</XmPlaylistPluginOutputDirectory>
   </PropertyGroup>
 </Project>
