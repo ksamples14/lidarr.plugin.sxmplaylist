@@ -43,6 +43,8 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 | Result Count | 200 | Number of recent plays to fetch (1-1000). |
 | Dedupe Artists | on | Only add each unique artist once per fetch (recommended). |
 
+> The list refreshes every **6 hours** (matching Lidarr's Custom import list). The feed is cached server-side for 2 minutes, so more frequent polling yields no new data.
+
 ## Building From Source
 
 ```powershell

@@ -13,7 +13,7 @@ namespace XmPlaylist.ImportLists
 
         public override ImportListType ListType => ImportListType.Other;
 
-        public override TimeSpan MinRefreshInterval => TimeSpan.FromMinutes(30);
+        public override TimeSpan MinRefreshInterval => TimeSpan.FromHours(6);
 
         public override int PageSize => 1000;
 
