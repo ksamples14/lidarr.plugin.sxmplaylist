@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using FluentValidation.Results;
 using NLog;
+using Newtonsoft.Json.Linq;
 using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
@@ -61,6 +63,43 @@ namespace XmPlaylist.ImportLists
         {
             _historyStore.PruneOldPlays();
             return XmPlaylistStationBackfill.Fetch(request, MinRefreshInterval, r => XmPlaylistFeedCache.Get(_httpClient, r));
+        }
+
+        // Lidarr's default TestConnection() calls FetchPage(), which goes through our overridden
+        // FetchImportListResponse (the full 6-hour cursor backfill) and the full parser (album
+        // resolution against Deezer/MusicBrainz/Apple for every newly-seen song). For a first-ever
+        // Test against a busy channel that's a lot of work behind one click. Test only needs to
+        // confirm the endpoint is reachable and returning data - a single un-backfilled page, with
+        // no parsing, does that far faster.
+        protected override ValidationFailure TestConnection()
+        {
+            try
+            {
+                var generator = GetRequestGenerator();
+                var request = generator.GetListItems().GetAllTiers().First().First();
+                var response = XmPlaylistFeedCache.Get(_httpClient, request.HttpRequest);
+
+                if (response.StatusCode != System.Net.HttpStatusCode.OK)
+                {
+                    return new ValidationFailure(string.Empty, $"xmplaylist API returned status {response.StatusCode}");
+                }
+
+                var results = response.Content.IsNotNullOrWhiteSpace()
+                    ? JObject.Parse(response.Content)["results"] as JArray
+                    : null;
+
+                if (results == null || results.Count == 0)
+                {
+                    return new ValidationFailure(string.Empty, "No results were returned from your import list, please check your settings.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(ex, "Unable to connect to xmplaylist");
+                return new ValidationFailure(string.Empty, "Unable to connect to xmplaylist: " + ex.Message);
+            }
+
+            return null!;
         }
 
         public override object RequestAction(string action, IDictionary<string, string> query)

@@ -33,6 +33,7 @@ internal static class Program
         TestChannelDirectoryFetchesAndParses();
         TestChannelCacheStoresAndReuses();
         TestSettingsRequireNonEmptyChannel();
+        TestAlbumResolutionSkippedOncePerFetchTimeBudgetExceeded();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -289,6 +290,42 @@ internal static class Program
         Assert("falls back to Deezer's own album title", items[0].Album == "No Code");
         Assert("no album MBID (no MusicBrainz match)", items[0].AlbumMusicBrainzId.IsNullOrWhiteSpace());
         Assert($"only the single Deezer call was made, no Apple fallback needed (calls: {httpClient.CallCount})", httpClient.CallCount == 1);
+    }
+
+    private static void TestAlbumResolutionSkippedOncePerFetchTimeBudgetExceeded()
+    {
+        Console.WriteLine("\n[Test] Album resolution is skipped once the per-fetch time budget is exceeded, and retried on a later fetch");
+
+        var store = NewHistoryStore();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
+
+        var exhaustedParser = new XmPlaylistParser
+        {
+            Settings = settings,
+            HistoryStore = store,
+            AlbumResolver = resolver,
+            AlbumResolutionBudget = TimeSpan.Zero
+        };
+        var first = exhaustedParser.ParseResponse(BuildFeedFromEntries(BuildEntry("playI", "trackI", "Artist One", "I'm Open", links)));
+
+        Assert($"still emits the artist item (got {first.Count})", first.Count == 1);
+        Assert("no album set once the budget is exhausted", first[0].Album.IsNullOrWhiteSpace());
+        Assert($"no HTTP calls were made once the budget is exhausted (calls: {httpClient.CallCount})", httpClient.CallCount == 0);
+
+        // Nothing was cached for the skipped attempt, so a later fetch (fresh budget) still resolves it.
+        var freshParser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
+        var second = freshParser.ParseResponse(BuildFeedFromEntries(BuildEntry("playJ", "trackI", "Artist One", "I'm Open", links)));
+
+        Assert($"a later fetch with a fresh budget still resolves it (got '{second[0].Album}')", second[0].Album == "No Code");
     }
 
     private static void TestChannelDirectoryFetchesAndParses()

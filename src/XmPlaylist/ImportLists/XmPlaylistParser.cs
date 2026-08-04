@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using Newtonsoft.Json;
@@ -12,11 +13,21 @@ namespace XmPlaylist.ImportLists
 {
     public class XmPlaylistParser : IParseImportListResponse
     {
+        // MusicBrainz's own rate limit (1 req/sec, up to 2 calls per newly-seen song) means a
+        // fetch with many brand-new songs - e.g. a first-ever Test that just backfilled a full
+        // 6-hour window - could otherwise spend minutes doing sequential album lookups before
+        // Lidarr ever gets a response back. Cap it so a fetch always returns promptly; whatever
+        // didn't get resolved in time is imported artist-only and picked up fresh on a later poll
+        // (nothing is cached for a skipped attempt, so it isn't treated as a permanent failure).
+        public TimeSpan AlbumResolutionBudget { get; set; } = TimeSpan.FromSeconds(20);
+
         public XmPlaylistImportSettings? Settings { get; set; }
 
         public XmPlaylistHistoryStore? HistoryStore { get; set; }
 
         public XmPlaylistAlbumResolver? AlbumResolver { get; set; }
+
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
 
         private ImportListResponse _importListResponse = null!;
 
@@ -122,6 +133,11 @@ namespace XmPlaylist.ImportLists
             if (cached != null)
             {
                 return cached;
+            }
+
+            if (_stopwatch.Elapsed > AlbumResolutionBudget)
+            {
+                return null;
             }
 
             var links = play.Links?
