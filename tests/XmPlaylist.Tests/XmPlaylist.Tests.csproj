@@ -32,6 +32,7 @@
     <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistStationBackfill.cs" Link="XmPlaylistStationBackfill.cs" />
     <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistHistoryStore.cs" Link="XmPlaylistHistoryStore.cs" />
     <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistAlbumResolver.cs" Link="XmPlaylistAlbumResolver.cs" />
+    <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistChannelDirectory.cs" Link="XmPlaylistChannelDirectory.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
 </Project>

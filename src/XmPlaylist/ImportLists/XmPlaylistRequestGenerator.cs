@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using NzbDrone.Core.ImportLists;
 
 namespace XmPlaylist.ImportLists
@@ -27,8 +28,9 @@ namespace XmPlaylist.ImportLists
         {
             var settings = Settings!;
             var baseUrl = settings.BaseUrl.TrimEnd('/');
+            var channel = settings.Channel.FirstOrDefault() ?? "";
 
-            yield return new ImportListRequest(XmPlaylistRequestBuilder.Build($"{baseUrl}/api/station/{settings.Channel}"));
+            yield return new ImportListRequest(XmPlaylistRequestBuilder.Build($"{baseUrl}/api/station/{channel}"));
         }
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using NLog;
 using NzbDrone.Common.EnvironmentInfo;
@@ -29,6 +30,9 @@ internal static class Program
         TestAlbumResolutionIsCachedPerTrack();
         TestAlbumResolutionSkippedForMultiArtistPlays();
         TestAlbumResolutionFallsBackToDeezerTitleWithoutMbid();
+        TestChannelDirectoryFetchesAndParses();
+        TestChannelCacheStoresAndReuses();
+        TestSettingsRequireExactlyOneChannel();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -40,7 +44,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Every play emits one artist-only item");
 
         var store = NewHistoryStore();
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store };
         var feed = BuildFeed(("Artist One", "Song A"));
 
@@ -56,7 +60,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Re-fetching an overlapping window doesn't re-emit the same play");
 
         var store = NewHistoryStore();
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store };
 
         // Same play id both times, simulating overlapping backfill windows between polls.
@@ -74,7 +78,7 @@ internal static class Program
         Console.WriteLine("\n[Test] A play with multiple credited artists records/emits each independently");
 
         var store = NewHistoryStore();
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store };
 
         var entry = "{\"id\":\"playB\",\"timestamp\":\"2026-08-04T00:00:00Z\"," +
@@ -96,7 +100,7 @@ internal static class Program
         var appFolder = new FakeAppFolderInfo(Path.Combine(Path.GetTempPath(), "xmplaylist-test-" + Guid.NewGuid()));
 
         var store1 = new XmPlaylistHistoryStore(appFolder);
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser1 = new XmPlaylistParser { Settings = settings, HistoryStore = store1 };
         var feed = BuildFeed(("playC", "Artist Persisted", "Song A"));
         parser1.ParseResponse(feed);
@@ -166,7 +170,7 @@ internal static class Program
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
 
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
@@ -190,7 +194,7 @@ internal static class Program
         httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"No Code\"}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
 
         var links = new (string Site, string Url)[] { ("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507") };
@@ -216,7 +220,7 @@ internal static class Program
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
 
@@ -243,7 +247,7 @@ internal static class Program
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"Collab Album\",\"primary-type\":\"Album\",\"first-release-date\":\"2020-01-01\"}}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
 
@@ -273,7 +277,7 @@ internal static class Program
         httpClient.Respond("api.deezer.com/track/624510", "{\"album\":{\"title\":\"No Code\"}}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
+        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
 
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
@@ -285,6 +289,58 @@ internal static class Program
         Assert("falls back to Deezer's own album title", items[0].Album == "No Code");
         Assert("no album MBID (no MusicBrainz match)", items[0].AlbumMusicBrainzId.IsNullOrWhiteSpace());
         Assert($"only the single Deezer call was made, no Apple fallback needed (calls: {httpClient.CallCount})", httpClient.CallCount == 1);
+    }
+
+    private static void TestChannelDirectoryFetchesAndParses()
+    {
+        Console.WriteLine("\n[Test] Channel directory parses /api/station into deeplink/name/number");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station", "{\"count\":2,\"results\":[" +
+            "{\"deeplink\":\"altnation\",\"name\":\"Alt Nation\",\"number\":\"36\"}," +
+            "{\"deeplink\":\"thespectrum\",\"name\":\"The Spectrum\",\"number\":\"28\"}]}");
+
+        var channels = XmPlaylistChannelDirectory.Fetch(httpClient, "https://xmplaylist.com");
+
+        Assert($"parses both channels (got {channels.Count})", channels.Count == 2);
+        Assert("has altnation with the right name/number", channels.Any(c => c.Deeplink == "altnation" && c.Name == "Alt Nation" && c.Number == "36"));
+    }
+
+    private static void TestChannelCacheStoresAndReuses()
+    {
+        Console.WriteLine("\n[Test] Channel cache stores and reuses the channel list");
+
+        var store = NewHistoryStore();
+
+        Assert("cache starts empty", store.GetCachedChannels().Count == 0);
+        Assert("cache age is null when empty", store.GetChannelCacheAge() == null);
+
+        store.SaveChannels(new[]
+        {
+            new ChannelInfo("altnation", "Alt Nation", "36"),
+            new ChannelInfo("thespectrum", "The Spectrum", "28")
+        });
+
+        var cached = store.GetCachedChannels();
+        Assert($"cache now has 2 channels (got {cached.Count})", cached.Count == 2);
+        Assert("cache age is set after saving", store.GetChannelCacheAge() != null);
+
+        // Saving again should replace, not append.
+        store.SaveChannels(new[] { new ChannelInfo("altnation", "Alt Nation", "36") });
+        Assert($"re-saving replaces rather than appends (got {store.GetCachedChannels().Count})", store.GetCachedChannels().Count == 1);
+    }
+
+    private static void TestSettingsRequireExactlyOneChannel()
+    {
+        Console.WriteLine("\n[Test] Settings validation requires exactly one channel");
+
+        var none = new XmPlaylistImportSettings { Channel = Array.Empty<string>() };
+        var one = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var two = new XmPlaylistImportSettings { Channel = new[] { "altnation", "thespectrum" } };
+
+        Assert("zero channels fails validation", !none.Validate().IsValid);
+        Assert("one channel passes validation", one.Validate().IsValid);
+        Assert("two channels fails validation", !two.Validate().IsValid);
     }
 
     private static string BuildEntry(string playId, string trackId, string artist, string title, (string Site, string Url)[] links)

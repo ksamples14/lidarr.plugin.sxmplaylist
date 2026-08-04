@@ -69,6 +69,17 @@ namespace XmPlaylist.ImportLists
             {
                 command.ExecuteNonQuery();
             }
+
+            using (var command = new SQLiteCommand(
+                "CREATE TABLE IF NOT EXISTS Channels (" +
+                "Deeplink TEXT PRIMARY KEY, " +
+                "Name TEXT NOT NULL, " +
+                "Number TEXT, " +
+                "CachedUtc TEXT NOT NULL)",
+                connection))
+            {
+                command.ExecuteNonQuery();
+            }
         }
 
         // Returns true if this (play, artist) pair was newly recorded, false if already known.
@@ -173,6 +184,65 @@ namespace XmPlaylist.ImportLists
             return results;
         }
 
+        // Null if the channel list has never been cached.
+        public DateTime? GetChannelCacheAge()
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand("SELECT MAX(CachedUtc) FROM Channels", connection);
+
+            var result = command.ExecuteScalar();
+            return result == null || result is DBNull ? (DateTime?)null : DateTime.Parse((string)result).ToUniversalTime();
+        }
+
+        public IReadOnlyList<ChannelInfo> GetCachedChannels()
+        {
+            var results = new List<ChannelInfo>();
+
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand("SELECT Deeplink, Name, Number FROM Channels ORDER BY Name", connection);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add(new ChannelInfo(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.IsDBNull(2) ? null : reader.GetString(2)));
+            }
+
+            return results;
+        }
+
+        public void SaveChannels(IEnumerable<ChannelInfo> channels)
+        {
+            using var connection = OpenConnection();
+            using var transaction = connection.BeginTransaction();
+
+            using (var clear = new SQLiteCommand("DELETE FROM Channels", connection, transaction))
+            {
+                clear.ExecuteNonQuery();
+            }
+
+            var cachedUtc = DateTime.UtcNow.ToString("O");
+
+            foreach (var channel in channels)
+            {
+                using var insert = new SQLiteCommand(
+                    "INSERT INTO Channels (Deeplink, Name, Number, CachedUtc) VALUES (@deeplink, @name, @number, @cachedUtc)",
+                    connection,
+                    transaction);
+
+                insert.Parameters.AddWithValue("@deeplink", channel.Deeplink);
+                insert.Parameters.AddWithValue("@name", channel.Name);
+                insert.Parameters.AddWithValue("@number", (object?)channel.Number ?? DBNull.Value);
+                insert.Parameters.AddWithValue("@cachedUtc", cachedUtc);
+
+                insert.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+        }
+
         private SQLiteConnection OpenConnection()
         {
             var connection = new SQLiteConnection(_connectionString);
@@ -193,6 +263,20 @@ namespace XmPlaylist.ImportLists
         public string Artist { get; }
         public string Song { get; }
         public DateTime TimestampUtc { get; }
+    }
+
+    public class ChannelInfo
+    {
+        public ChannelInfo(string deeplink, string name, string? number)
+        {
+            Deeplink = deeplink;
+            Name = name;
+            Number = number;
+        }
+
+        public string Deeplink { get; }
+        public string Name { get; }
+        public string? Number { get; }
     }
 
     public class AlbumResolution

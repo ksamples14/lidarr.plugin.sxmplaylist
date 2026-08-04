@@ -49,9 +49,19 @@ Resolved albums are cached per song (in the same history database, keyed by xmpl
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Channel | *(empty, required)* | SiriusXM channel ID to track (e.g. `altnation`, `xmu`, `thespectrum`). One list = one channel — add one import list per channel you want to monitor. |
+| Channel | *(empty, required)* | A dropdown of every SiriusXM channel xmplaylist tracks (e.g. "36 - Alt Nation"). One list = one channel — add one import list per channel you want to monitor. |
+
+The Channel dropdown populates itself automatically whenever you open the Add/Edit dialog — no separate button to press. Behind the scenes it's backed by a small cache (see [Channel List](#channel-list) below) so opening the dialog doesn't hit xmplaylist.com every time.
 
 > The list refreshes every **6 hours** (matching Lidarr's Custom import list). Each poll backfills the full 6-hour window via cursor pagination rather than relying on a single snapshot, so plays aren't missed between polls. Artist monitoring, quality profile, and root folder are configured in Lidarr's own **Added Artist Settings** section of the import list modal, not by this plugin. Whether a previously-unmonitored artist gets re-monitored when it shows up in the feed again is controlled by Lidarr's own **Monitor Existing** setting on the list — not by this plugin.
+
+## Channel List
+
+xmplaylist's own frontend derives its channel picker from `/api/station` (distinct from the per-channel `/api/station/{channel}` play endpoint) — a free, unauthenticated list of every SiriusXM channel it tracks, with a display name and channel number alongside the deeplink used to build the play-fetching URL. This plugin uses the same endpoint to populate the Channel dropdown.
+
+The fetched list is cached (in the same history database) rather than re-fetched every time the Add/Edit dialog opens. It's treated as stale after 24 hours — SiriusXM's lineup doesn't change often — at which point the next dialog open refreshes it automatically before serving the dropdown. If that refresh fails (network hiccup, xmplaylist down), the plugin falls back to whatever was cached rather than leaving the dropdown empty.
+
+> Lidarr's plugin settings framework doesn't support a standalone clickable button for this kind of thing — `FieldType.Action` exists in Lidarr's own code but isn't wired to anything in its frontend. The dropdown-refreshes-on-open behavior above is the closest available mechanism.
 
 ## Play History
 
@@ -108,8 +118,9 @@ lidarr.plugin.xmplaylist/
 │       ├── XmPlaylistRequestBuilder.cs        # shared HttpRequest construction (headers)
 │       ├── XmPlaylistStationBackfill.cs       # cursor pagination to cover the 6h poll window
 │       ├── XmPlaylistParser.cs               # xmplaylist JSON → ImportListItemInfo
-│       ├── XmPlaylistHistoryStore.cs          # SQLite play history + dedup + album cache
+│       ├── XmPlaylistHistoryStore.cs          # SQLite play history + dedup + album/channel cache
 │       ├── XmPlaylistAlbumResolver.cs         # Deezer/MusicBrainz/Apple album lookup
+│       ├── XmPlaylistChannelDirectory.cs      # /api/station channel list lookup
 │       └── XmPlaylistFeedCache.cs            # shared in-process HTTP cache (limits API hits)
 ├── tests/XmPlaylist.Tests/                    # parser, backfill-cursor, history-store, and album-resolver tests
 ├── Submodules/Lidarr/                         # Lidarr source (git submodule)
@@ -123,6 +134,7 @@ lidarr.plugin.xmplaylist/
 - Each page covers only a few minutes of history (~24 plays), which is why the plugin walks the `next` cursor to backfill the full 6-hour poll window instead of relying on a single page
 - Lidarr matches artists (and unresolved albums) by name, so accuracy depends on consistent naming
 - Deezer's API (`api.deezer.com`), Apple's iTunes Lookup API (`itunes.apple.com`), and MusicBrainz's web service (`musicbrainz.org/ws/2`) are all free and require no authentication either — see [Album Resolution](#album-resolution)
+- `/api/station` (no channel suffix) is a separate endpoint from `/api/station/{channel}` — it lists every channel instead of that channel's plays — see [Channel List](#channel-list)
 
 ## Roadmap
 
