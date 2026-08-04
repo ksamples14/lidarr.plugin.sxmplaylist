@@ -32,7 +32,7 @@ internal static class Program
         TestAlbumResolutionFallsBackToDeezerTitleWithoutMbid();
         TestChannelDirectoryFetchesAndParses();
         TestChannelCacheStoresAndReuses();
-        TestSettingsRequireExactlyOneChannel();
+        TestSettingsRequireNonEmptyChannel();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -44,7 +44,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Every play emits one artist-only item");
 
         var store = NewHistoryStore();
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store };
         var feed = BuildFeed(("Artist One", "Song A"));
 
@@ -60,7 +60,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Re-fetching an overlapping window doesn't re-emit the same play");
 
         var store = NewHistoryStore();
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store };
 
         // Same play id both times, simulating overlapping backfill windows between polls.
@@ -78,7 +78,7 @@ internal static class Program
         Console.WriteLine("\n[Test] A play with multiple credited artists records/emits each independently");
 
         var store = NewHistoryStore();
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store };
 
         var entry = "{\"id\":\"playB\",\"timestamp\":\"2026-08-04T00:00:00Z\"," +
@@ -100,7 +100,7 @@ internal static class Program
         var appFolder = new FakeAppFolderInfo(Path.Combine(Path.GetTempPath(), "xmplaylist-test-" + Guid.NewGuid()));
 
         var store1 = new XmPlaylistHistoryStore(appFolder);
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser1 = new XmPlaylistParser { Settings = settings, HistoryStore = store1 };
         var feed = BuildFeed(("playC", "Artist Persisted", "Song A"));
         parser1.ParseResponse(feed);
@@ -170,7 +170,7 @@ internal static class Program
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
 
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
@@ -194,7 +194,7 @@ internal static class Program
         httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"No Code\"}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
 
         var links = new (string Site, string Url)[] { ("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507") };
@@ -220,7 +220,7 @@ internal static class Program
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
 
@@ -247,7 +247,7 @@ internal static class Program
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"Collab Album\",\"primary-type\":\"Album\",\"first-release-date\":\"2020-01-01\"}}]}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
 
@@ -277,7 +277,7 @@ internal static class Program
         httpClient.Respond("api.deezer.com/track/624510", "{\"album\":{\"title\":\"No Code\"}}");
 
         var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
-        var settings = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
+        var settings = new XmPlaylistImportSettings { Channel = "altnation" };
         var parser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
 
         var links = new (string Site, string Url)[] { ("deezer", "https://www.deezer.com/track/624510") };
@@ -330,17 +330,15 @@ internal static class Program
         Assert($"re-saving replaces rather than appends (got {store.GetCachedChannels().Count})", store.GetCachedChannels().Count == 1);
     }
 
-    private static void TestSettingsRequireExactlyOneChannel()
+    private static void TestSettingsRequireNonEmptyChannel()
     {
-        Console.WriteLine("\n[Test] Settings validation requires exactly one channel");
+        Console.WriteLine("\n[Test] Settings validation requires a channel to be selected");
 
-        var none = new XmPlaylistImportSettings { Channel = Array.Empty<string>() };
-        var one = new XmPlaylistImportSettings { Channel = new[] { "altnation" } };
-        var two = new XmPlaylistImportSettings { Channel = new[] { "altnation", "thespectrum" } };
+        var none = new XmPlaylistImportSettings { Channel = "" };
+        var one = new XmPlaylistImportSettings { Channel = "altnation" };
 
-        Assert("zero channels fails validation", !none.Validate().IsValid);
-        Assert("one channel passes validation", one.Validate().IsValid);
-        Assert("two channels fails validation", !two.Validate().IsValid);
+        Assert("empty channel fails validation", !none.Validate().IsValid);
+        Assert("a selected channel passes validation", one.Validate().IsValid);
     }
 
     private static string BuildEntry(string playId, string trackId, string artist, string title, (string Site, string Url)[] links)

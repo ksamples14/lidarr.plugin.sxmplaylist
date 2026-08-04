@@ -94,7 +94,8 @@ namespace XmPlaylist.ImportLists
             return new
             {
                 options = channels
-                    .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(c => int.TryParse(c.Number, out var n) ? n : int.MaxValue)
+                    .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
                     .Select(c => new
                     {
                         Value = c.Deeplink,

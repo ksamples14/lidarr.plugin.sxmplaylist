@@ -1,5 +1,3 @@
-using System.Collections.Generic;
-using System.Linq;
 using FluentValidation;
 using NzbDrone.Core.Annotations;
 using NzbDrone.Core.ImportLists;
@@ -12,8 +10,8 @@ namespace XmPlaylist.ImportLists
         public XmPlaylistImportSettingsValidator()
         {
             RuleFor(c => c.Channel)
-                .Must(c => c != null && c.Count() == 1)
-                .WithMessage("Select exactly one channel");
+                .NotEmpty()
+                .WithMessage("Channel is required");
         }
     }
 
@@ -24,15 +22,15 @@ namespace XmPlaylist.ImportLists
         public XmPlaylistImportSettings()
         {
             BaseUrl = "https://xmplaylist.com";
-            Channel = new List<string>();
+            Channel = "";
         }
 
-        // Lidarr's dynamic Select field (SelectOptionsProviderAction) only has precedent as a
-        // multi-select IEnumerable in Lidarr's own codebase - there's no scalar single-value
-        // usage anywhere to model this on. Modeled as a collection and validated down to exactly
-        // one selection, rather than risk guessing at an unproven single-value binding.
+        // Lidarr's dynamic Select field renders as a multi-select checklist or a single dropdown
+        // based purely on whether the bound value is an array at runtime (EnhancedSelectInput.js:
+        // `isMultiSelect = Array.isArray(value)`), not on the field type - a plain scalar string
+        // here is what gives a real single-pick dropdown.
         [FieldDefinition(0, Label = "Channel", Type = FieldType.Select, SelectOptionsProviderAction = "getChannels", HelpText = "SiriusXM channel to pull plays from. One list tracks one channel.")]
-        public IEnumerable<string> Channel { get; set; }
+        public string Channel { get; set; }
 
         public string BaseUrl { get; set; }
 

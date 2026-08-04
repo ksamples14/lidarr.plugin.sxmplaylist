@@ -40,7 +40,7 @@ namespace XmPlaylist.ImportLists
                     return items;
                 }
 
-                var channel = Settings?.Channel.FirstOrDefault() ?? "";
+                var channel = Settings?.Channel ?? "";
 
                 foreach (var play in feed.Results)
                 {
