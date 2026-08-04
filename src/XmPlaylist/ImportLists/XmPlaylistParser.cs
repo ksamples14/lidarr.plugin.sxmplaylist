@@ -14,9 +14,9 @@ namespace XmPlaylist.ImportLists
     {
         public XmPlaylistImportSettings? Settings { get; set; }
 
-        public XmPlaylistStateStore? StateStore { get; set; }
+        public XmPlaylistHistoryStore? HistoryStore { get; set; }
 
-        public int ListId { get; set; }
+        public XmPlaylistAlbumResolver? AlbumResolver { get; set; }
 
         private ImportListResponse _importListResponse = null!;
 
@@ -40,25 +40,19 @@ namespace XmPlaylist.ImportLists
                     return items;
                 }
 
-                var importType = (XmPlaylistImportType)(Settings?.ImportType ?? (int)XmPlaylistImportType.Artists);
-                var onlyNewArtists = Settings?.OnlyNewArtists ?? true;
-                var channelFilter = ParseChannelFilter();
-                var state = onlyNewArtists ? StateStore?.Load(ListId) ?? new XmPlaylistState() : null;
-
-                var seenArtists = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var seenAlbums = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var channel = Settings?.Channel ?? "";
 
                 foreach (var play in feed.Results)
                 {
-                    if (play.Track?.Artists == null || play.Track.Artists.Count == 0)
+                    if (play.Id.IsNullOrWhiteSpace() || play.Track?.Artists == null || play.Track.Artists.Count == 0)
                     {
                         continue;
                     }
 
-                    if (channelFilter.Count > 0 && (play.ChannelId == null || !channelFilter.Contains(play.ChannelId)))
-                    {
-                        continue;
-                    }
+                    var playChannel = play.ChannelId.IsNotNullOrWhiteSpace() ? play.ChannelId! : channel;
+                    var song = play.Track.Title ?? "";
+
+                    var newArtistsThisPlay = new List<string>();
 
                     foreach (var artist in play.Track.Artists)
                     {
@@ -67,57 +61,45 @@ namespace XmPlaylist.ImportLists
                             continue;
                         }
 
-                        var importArtist = importType == XmPlaylistImportType.Artists ||
-                                          importType == XmPlaylistImportType.ArtistsAndAlbums;
-                        var importAlbum = importType == XmPlaylistImportType.Albums ||
-                                          importType == XmPlaylistImportType.ArtistsAndAlbums;
+                        var isNewPlay = HistoryStore?.TryRecordPlay(play.Id!, playChannel, artist, song, play.Timestamp) ?? true;
 
-                        if (importArtist)
+                        if (isNewPlay)
                         {
-                            if (onlyNewArtists && state != null && !state.SeenArtists.Contains(artist))
-                            {
-                                state.SeenArtists.Add(artist);
-                            }
-                            else if (onlyNewArtists && state != null)
-                            {
-                                continue;
-                            }
-
-                            if (Settings is { DedupeArtists: true } && !seenArtists.Add(artist))
-                            {
-                                continue;
-                            }
-                        }
-
-                        if (importAlbum)
-                        {
-                            var albumKey = $"{artist}|{play.Track.Title}";
-                            if (Settings is { DedupeArtists: true } && !seenAlbums.Add(albumKey))
-                            {
-                                continue;
-                            }
-
-                            items.Add(new ImportListItemInfo
-                            {
-                                Artist = artist,
-                                Album = play.Track.Title,
-                                ReleaseDate = play.Timestamp
-                            });
-                        }
-                        else
-                        {
-                            items.Add(new ImportListItemInfo
-                            {
-                                Artist = artist,
-                                ReleaseDate = play.Timestamp
-                            });
+                            newArtistsThisPlay.Add(artist);
                         }
                     }
-                }
 
-                if (onlyNewArtists && state != null && StateStore != null)
-                {
-                    StateStore.Save(ListId, state);
+                    if (newArtistsThisPlay.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var album = ResolveAlbum(play, song);
+
+                    foreach (var artist in newArtistsThisPlay)
+                    {
+                        var item = new ImportListItemInfo
+                        {
+                            Artist = artist,
+                            ReleaseDate = play.Timestamp
+                        };
+
+                        if (album is { Resolved: true })
+                        {
+                            item.Album = album.Album;
+                            item.AlbumMusicBrainzId = album.AlbumMusicBrainzId ?? "";
+
+                            // Only trust the resolved artist MBID when this play has exactly one
+                            // credited artist - a multi-artist (collab) play's single artist-credit
+                            // match doesn't reliably map onto every credited artist string.
+                            if (newArtistsThisPlay.Count == 1)
+                            {
+                                item.ArtistMusicBrainzId = album.ArtistMusicBrainzId ?? "";
+                            }
+                        }
+
+                        items.Add(item);
+                    }
                 }
             }
             catch (Exception ex)
@@ -128,27 +110,32 @@ namespace XmPlaylist.ImportLists
             return items;
         }
 
-        private HashSet<string> ParseChannelFilter()
+        private AlbumResolution? ResolveAlbum(XmPlayEntry play, string song)
         {
-            var filter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            var channelFilter = Settings?.ChannelFilter;
-
-            if (string.IsNullOrWhiteSpace(channelFilter))
+            var trackId = play.Track?.Id;
+            if (trackId.IsNullOrWhiteSpace() || AlbumResolver == null)
             {
-                return filter;
+                return null;
             }
 
-            foreach (var channel in channelFilter.Split(','))
+            var cached = HistoryStore?.GetCachedAlbumResolution(trackId!);
+            if (cached != null)
             {
-                var trimmed = channel.Trim();
-                if (trimmed.IsNotNullOrWhiteSpace())
-                {
-                    filter.Add(trimmed);
-                }
+                return cached;
             }
 
-            return filter;
+            var links = play.Links?
+                .Where(l => l.Site.IsNotNullOrWhiteSpace() && l.Url.IsNotNullOrWhiteSpace())
+                .GroupBy(l => l.Site!, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Url!, StringComparer.OrdinalIgnoreCase)
+                ?? new Dictionary<string, string>();
+
+            var artist = play.Track?.Artists?.FirstOrDefault() ?? "";
+            var resolution = AlbumResolver.Resolve(artist, song, links);
+
+            HistoryStore?.CacheAlbumResolution(trackId!, resolution);
+
+            return resolution;
         }
 
         protected virtual bool PreProcess(ImportListResponse importListResponse)
@@ -183,6 +170,7 @@ namespace XmPlaylist.ImportLists
         public XmTrackInfo? Track { get; set; }
         [JsonProperty("channelId")]
         public string? ChannelId { get; set; }
+        public List<XmLink>? Links { get; set; }
     }
 
     internal class XmTrackInfo
@@ -190,5 +178,11 @@ namespace XmPlaylist.ImportLists
         public string? Id { get; set; }
         public List<string>? Artists { get; set; }
         public string? Title { get; set; }
+    }
+
+    internal class XmLink
+    {
+        public string? Site { get; set; }
+        public string? Url { get; set; }
     }
 }

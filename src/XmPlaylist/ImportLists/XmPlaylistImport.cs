@@ -1,8 +1,5 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using NLog;
-using NzbDrone.Common.Disk;
 using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
@@ -13,7 +10,8 @@ namespace XmPlaylist.ImportLists
 {
     public class XmPlaylistImport : HttpImportListBase<XmPlaylistImportSettings>
     {
-        private readonly XmPlaylistStateStore _stateStore;
+        private readonly XmPlaylistHistoryStore _historyStore;
+        private readonly XmPlaylistAlbumResolver _albumResolver;
 
         public override string Name => "XM Playlist";
 
@@ -28,12 +26,12 @@ namespace XmPlaylist.ImportLists
             IImportListStatusService importListStatusService,
             IConfigService configService,
             IParsingService parsingService,
-            IDiskProvider diskProvider,
             IAppFolderInfo appFolderInfo,
             Logger logger)
             : base(httpClient, importListStatusService, configService, parsingService, logger)
         {
-            _stateStore = new XmPlaylistStateStore(diskProvider, appFolderInfo);
+            _historyStore = new XmPlaylistHistoryStore(appFolderInfo);
+            _albumResolver = new XmPlaylistAlbumResolver(httpClient, logger);
         }
 
         public override IImportListRequestGenerator GetRequestGenerator()
@@ -49,15 +47,15 @@ namespace XmPlaylist.ImportLists
             return new XmPlaylistParser
             {
                 Settings = Settings,
-                StateStore = _stateStore,
-                ListId = Definition?.Id ?? 0
+                HistoryStore = _historyStore,
+                AlbumResolver = _albumResolver
             };
         }
 
         protected override ImportListResponse FetchImportListResponse(ImportListRequest request)
         {
-            var response = XmPlaylistFeedCache.Get(_httpClient, request.HttpRequest);
-            return new ImportListResponse(request, response);
+            _historyStore.PruneOldPlays();
+            return XmPlaylistStationBackfill.Fetch(request, MinRefreshInterval, r => XmPlaylistFeedCache.Get(_httpClient, r));
         }
     }
 }

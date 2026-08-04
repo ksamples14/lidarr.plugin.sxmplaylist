@@ -1,7 +1,4 @@
 using System.Collections.Generic;
-using System.Linq;
-using NzbDrone.Common.Extensions;
-using NzbDrone.Common.Http;
 using NzbDrone.Core.ImportLists;
 
 namespace XmPlaylist.ImportLists
@@ -31,20 +28,7 @@ namespace XmPlaylist.ImportLists
             var settings = Settings!;
             var baseUrl = settings.BaseUrl.TrimEnd('/');
 
-            if ((XmPlaylistListMode)settings.ListMode == XmPlaylistListMode.Channel && settings.Channel.IsNotNullOrWhiteSpace())
-            {
-                yield return BuildRequest($"{baseUrl}/api/station/{settings.Channel}");
-                yield break;
-            }
-
-            yield return BuildRequest($"{baseUrl}/api/feed");
-        }
-
-        private ImportListRequest BuildRequest(string url)
-        {
-            var request = new HttpRequest(url, HttpAccept.Json);
-            request.Headers.Add("User-Agent", "XmPlaylist-Lidarr-Plugin/1.0");
-            return new ImportListRequest(request);
+            yield return new ImportListRequest(XmPlaylistRequestBuilder.Build($"{baseUrl}/api/station/{settings.Channel}"));
         }
     }
 }

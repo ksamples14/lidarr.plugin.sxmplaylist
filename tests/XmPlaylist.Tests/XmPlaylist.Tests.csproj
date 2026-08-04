@@ -20,13 +20,18 @@
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageReference Include="FluentValidation" Version="9.5.4" />
-    <PackageReference Include="System.IO.Abstractions" Version="17.0.24" />
+    <PackageReference Include="System.Data.SQLite" Version="2.0.3" />
+    <PackageReference Include="SourceGear.sqlite3" Version="3.50.4.5" />
+    <PackageReference Include="NLog" Version="5.5.1" />
   </ItemGroup>
 
   <ItemGroup>
     <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistParser.cs" Link="XmPlaylistParser.cs" />
     <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistImportSettings.cs" Link="XmPlaylistImportSettings.cs" />
-    <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistStateStore.cs" Link="XmPlaylistStateStore.cs" />
+    <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistRequestBuilder.cs" Link="XmPlaylistRequestBuilder.cs" />
+    <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistStationBackfill.cs" Link="XmPlaylistStationBackfill.cs" />
+    <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistHistoryStore.cs" Link="XmPlaylistHistoryStore.cs" />
+    <Compile Include="..\..\src\XmPlaylist\ImportLists\XmPlaylistAlbumResolver.cs" Link="XmPlaylistAlbumResolver.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
 </Project>
