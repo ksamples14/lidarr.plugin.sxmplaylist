@@ -179,10 +179,12 @@ internal static class Program
 
         var items = parser.ParseResponse(feed);
 
-        Assert($"emits 1 item (got {items.Count})", items.Count == 1);
-        Assert("album resolved to real title", items[0].Album == "No Code");
-        Assert("album MBID attached", items[0].AlbumMusicBrainzId == "album-mbid-1");
-        Assert("artist MBID attached (single-artist play)", items[0].ArtistMusicBrainzId == "artist-mbid-1");
+        Assert($"emits 2 items - artist-only safety net + album (got {items.Count})", items.Count == 2);
+        var albumItem = FindAlbumItem(items, "Artist One");
+        Assert("album item resolved to real title", albumItem?.Album == "No Code");
+        Assert("album MBID attached", albumItem?.AlbumMusicBrainzId == "album-mbid-1");
+        Assert("artist MBID attached (single-artist play)", albumItem?.ArtistMusicBrainzId == "artist-mbid-1");
+        Assert("artist-only safety net item also present", FindArtistOnlyItem(items, "Artist One") != null);
         Assert("Deezer, ISRC, and recording endpoints were each called once", httpClient.CallCount == 3);
     }
 
@@ -203,9 +205,11 @@ internal static class Program
 
         var items = parser.ParseResponse(feed);
 
-        Assert($"emits 1 item (got {items.Count})", items.Count == 1);
-        Assert("album resolved via Apple fallback", items[0].Album == "No Code");
-        Assert("no album MBID (Apple path doesn't have one)", items[0].AlbumMusicBrainzId.IsNullOrWhiteSpace());
+        Assert($"emits 2 items - artist-only safety net + album (got {items.Count})", items.Count == 2);
+        var albumItem = FindAlbumItem(items, "Artist One");
+        Assert("album resolved via Apple fallback", albumItem?.Album == "No Code");
+        Assert("no album MBID (Apple path doesn't have one)", albumItem?.AlbumMusicBrainzId.IsNullOrWhiteSpace() ?? true);
+        Assert("artist-only safety net item also present, so Lidarr still adds the artist even if this album match fails", FindArtistOnlyItem(items, "Artist One") != null);
     }
 
     private static void TestAlbumResolutionIsCachedPerTrack()
@@ -230,8 +234,11 @@ internal static class Program
         var callsAfterFirst = httpClient.CallCount;
         var second = parser.ParseResponse(BuildFeedFromEntries(BuildEntry("playF2", "trackF", "Artist One", "I'm Open", links)));
 
-        Assert($"first play resolves the album (got '{first[0].Album}')", first[0].Album == "No Code");
-        Assert($"second play (same track id) reuses the cached album (got '{second[0].Album}')", second[0].Album == "No Code");
+        var firstAlbum = FindAlbumItem(first, "Artist One");
+        var secondAlbum = FindAlbumItem(second, "Artist One");
+
+        Assert($"first play resolves the album (got '{firstAlbum?.Album}')", firstAlbum?.Album == "No Code");
+        Assert($"second play (same track id) reuses the cached album (got '{secondAlbum?.Album}')", secondAlbum?.Album == "No Code");
         Assert($"no extra HTTP calls made for the second play (before {callsAfterFirst}, after {httpClient.CallCount})", httpClient.CallCount == callsAfterFirst);
     }
 
@@ -258,11 +265,13 @@ internal static class Program
 
         var items = parser.ParseResponse(BuildFeedFromEntries(entry));
 
-        Assert($"emits one item per credited artist (got {items.Count})", items.Count == 2);
-        foreach (var item in items)
+        Assert($"emits an artist-only + album item per credited artist (got {items.Count})", items.Count == 4);
+        foreach (var artistName in new[] { "Artist X", "Artist Y" })
         {
-            Assert($"{item.Artist} gets the resolved album", item.Album == "Collab Album");
-            Assert($"{item.Artist} does not get a borrowed artist MBID", item.ArtistMusicBrainzId.IsNullOrWhiteSpace());
+            var albumItem = FindAlbumItem(items, artistName);
+            Assert($"{artistName} gets an album item with the resolved album", albumItem?.Album == "Collab Album");
+            Assert($"{artistName} does not get a borrowed artist MBID", albumItem?.ArtistMusicBrainzId.IsNullOrWhiteSpace() ?? true);
+            Assert($"{artistName} also gets an artist-only safety net item", FindArtistOnlyItem(items, artistName) != null);
         }
     }
 
@@ -286,9 +295,11 @@ internal static class Program
 
         var items = parser.ParseResponse(feed);
 
-        Assert($"emits 1 item (got {items.Count})", items.Count == 1);
-        Assert("falls back to Deezer's own album title", items[0].Album == "No Code");
-        Assert("no album MBID (no MusicBrainz match)", items[0].AlbumMusicBrainzId.IsNullOrWhiteSpace());
+        Assert($"emits 2 items - artist-only safety net + album (got {items.Count})", items.Count == 2);
+        var albumItem = FindAlbumItem(items, "Artist One");
+        Assert("falls back to Deezer's own album title", albumItem?.Album == "No Code");
+        Assert("no album MBID (no MusicBrainz match)", albumItem?.AlbumMusicBrainzId.IsNullOrWhiteSpace() ?? true);
+        Assert("artist-only safety net item also present, so Lidarr still adds the artist even if this album match fails", FindArtistOnlyItem(items, "Artist One") != null);
         Assert($"only the single Deezer call was made, no Apple fallback needed (calls: {httpClient.CallCount})", httpClient.CallCount == 1);
     }
 
@@ -324,8 +335,9 @@ internal static class Program
         // Nothing was cached for the skipped attempt, so a later fetch (fresh budget) still resolves it.
         var freshParser = new XmPlaylistParser { Settings = settings, HistoryStore = store, AlbumResolver = resolver };
         var second = freshParser.ParseResponse(BuildFeedFromEntries(BuildEntry("playJ", "trackI", "Artist One", "I'm Open", links)));
+        var secondAlbum = FindAlbumItem(second, "Artist One");
 
-        Assert($"a later fetch with a fresh budget still resolves it (got '{second[0].Album}')", second[0].Album == "No Code");
+        Assert($"a later fetch with a fresh budget still resolves it (got '{secondAlbum?.Album}')", secondAlbum?.Album == "No Code");
     }
 
     private static void TestChannelDirectoryFetchesAndParses()
@@ -466,6 +478,16 @@ internal static class Program
         }
 
         return false;
+    }
+
+    private static ImportListItemInfo? FindAlbumItem(IList<ImportListItemInfo> items, string artist)
+    {
+        return items.FirstOrDefault(i => i.Artist == artist && i.Album.IsNotNullOrWhiteSpace());
+    }
+
+    private static ImportListItemInfo? FindArtistOnlyItem(IList<ImportListItemInfo> items, string artist)
+    {
+        return items.FirstOrDefault(i => i.Artist == artist && i.Album.IsNullOrWhiteSpace());
     }
 
     private static void Assert(string description, bool condition)

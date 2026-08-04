@@ -89,27 +89,40 @@ namespace XmPlaylist.ImportLists
 
                     foreach (var artist in newArtistsThisPlay)
                     {
-                        var item = new ImportListItemInfo
+                        // Always emit a plain artist item. Lidarr's own sync deliberately drops the
+                        // whole item - artist included - if an Album it was given can't be matched
+                        // (ImportListSyncService.MapAlbumReport: "avoid us from adding the artist and
+                        // possibly getting it wrong"). Sending the artist on its own too, alongside
+                        // whatever album item we can build below, means a failed/rejected album match
+                        // never costs us the artist - Lidarr dedupes both back into one artist via its
+                        // own MusicBrainz-ID staging, so this doesn't create a duplicate when the album
+                        // item succeeds.
+                        items.Add(new ImportListItemInfo
                         {
                             Artist = artist,
                             ReleaseDate = play.Timestamp
-                        };
+                        });
 
                         if (album is { Resolved: true })
                         {
-                            item.Album = album.Album;
-                            item.AlbumMusicBrainzId = album.AlbumMusicBrainzId ?? "";
+                            var albumItem = new ImportListItemInfo
+                            {
+                                Artist = artist,
+                                Album = album.Album,
+                                AlbumMusicBrainzId = album.AlbumMusicBrainzId ?? "",
+                                ReleaseDate = play.Timestamp
+                            };
 
                             // Only trust the resolved artist MBID when this play has exactly one
                             // credited artist - a multi-artist (collab) play's single artist-credit
                             // match doesn't reliably map onto every credited artist string.
                             if (newArtistsThisPlay.Count == 1)
                             {
-                                item.ArtistMusicBrainzId = album.ArtistMusicBrainzId ?? "";
+                                albumItem.ArtistMusicBrainzId = album.ArtistMusicBrainzId ?? "";
                             }
-                        }
 
-                        items.Add(item);
+                            items.Add(albumItem);
+                        }
                     }
                 }
             }
