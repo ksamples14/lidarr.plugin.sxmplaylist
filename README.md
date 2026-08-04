@@ -27,19 +27,21 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 
 1. Go to **Settings → Import Lists → Add (+)**
 2. Select **XM Playlist** from the list
-3. Configure:
-   - **Result Count**: How many recent plays to fetch (1-1000, default 200)
-   - **Channel Filter** (optional): Comma-separated channel IDs (e.g. `altnation, xmu, thespectrum`). Leave empty for all channels.
-   - **Dedupe Artists**: Only add each artist once per fetch (recommended)
+3. The import list modal shows three sections:
+   - **General Import List Settings** — name, enable, etc. (provided by Lidarr)
+   - **Added Artist Settings** — monitor, search, quality/metadata profile, root folder (provided by Lidarr)
+   - **Import List Specific Settings** — the xmplaylist controls below
 4. Click **Test** to verify, then **Save**
 
-## Configuration
+## Import List Specific Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Result Count | 200 | Number of recent plays to pull from the feed |
-| Channel Filter | *(all)* | Comma-separated SiriusXM channel IDs to filter by |
-| Dedupe Artists | on | Skip duplicate artists within a single fetch |
+| List Mode | Recent Plays (All Channels) | How the list is built. `Recent Plays` scans the global `/api/feed` across all channels; `Specific Channel` pulls one channel's plays from `/api/station/{channel}`. |
+| Channel | *(empty)* | SiriusXM channel ID (e.g. `altnation`, `xmu`, `thespectrum`). Required when List Mode is `Specific Channel`. |
+| Import Type | Artists | What to import per play: `Artists` (artist name only), `Albums` (artist + track as album), or `Artists and Albums`. |
+| Result Count | 200 | Number of recent plays to fetch (1-1000). |
+| Dedupe Artists | on | Only add each unique artist once per fetch (recommended). |
 
 ## Building From Source
 

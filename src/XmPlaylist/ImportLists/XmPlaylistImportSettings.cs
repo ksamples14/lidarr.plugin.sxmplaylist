@@ -12,6 +12,11 @@ namespace XmPlaylist.ImportLists
             RuleFor(c => c.ResultCount)
                 .InclusiveBetween(1, 1000)
                 .WithMessage("Result count must be between 1 and 1000");
+
+            RuleFor(c => c.Channel)
+                .NotEmpty()
+                .When(c => c.ListMode == (int)XmPlaylistListMode.Channel)
+                .WithMessage("Channel is required when the list mode is set to a specific channel");
         }
     }
 
@@ -22,16 +27,26 @@ namespace XmPlaylist.ImportLists
         public XmPlaylistImportSettings()
         {
             BaseUrl = "https://xmplaylist.com";
+            ListMode = (int)XmPlaylistListMode.Feed;
+            Channel = "";
+            ImportType = (int)XmPlaylistImportType.Artists;
             ResultCount = 200;
+            DedupeArtists = true;
         }
 
-        [FieldDefinition(0, Label = "Result Count", HelpText = "Number of recent plays to fetch (1-1000, default 200)", Type = FieldType.Number)]
+        [FieldDefinition(0, Label = "List Mode", HelpText = "How the import list should be built from xmplaylist data", Type = FieldType.Select, SelectOptions = typeof(XmPlaylistListMode))]
+        public int ListMode { get; set; }
+
+        [FieldDefinition(1, Label = "Channel", HelpText = "SiriusXM channel ID to pull plays from (e.g. altnation, xmu, thespectrum). Used when List Mode is set to 'Specific Channel'.", Hidden = HiddenType.HiddenIfNotSet)]
+        public string Channel { get; set; }
+
+        [FieldDefinition(2, Label = "Import Type", HelpText = "What to import for each play found in the feed", Type = FieldType.Select, SelectOptions = typeof(XmPlaylistImportType))]
+        public int ImportType { get; set; }
+
+        [FieldDefinition(3, Label = "Result Count", HelpText = "Number of recent plays to fetch (1-1000, default 200)", Type = FieldType.Number)]
         public int ResultCount { get; set; }
 
-        [FieldDefinition(1, Label = "Channel Filter", HelpText = "Comma-separated channel IDs to filter by (e.g. altnation, xmu, thespectrum). Leave empty for all channels.", Advanced = true)]
-        public string? ChannelFilter { get; set; }
-
-        [FieldDefinition(2, Label = "Dedupe Artists", HelpText = "Only return each unique artist once (recommended to avoid duplicates)", Type = FieldType.Checkbox)]
+        [FieldDefinition(4, Label = "Dedupe Artists", HelpText = "Only return each unique artist once per fetch (recommended to avoid duplicates)", Type = FieldType.Checkbox)]
         public bool DedupeArtists { get; set; }
 
         public string BaseUrl { get; set; }
@@ -40,5 +55,26 @@ namespace XmPlaylist.ImportLists
         {
             return new NzbDroneValidationResult(Validator.Validate(this));
         }
+    }
+
+    public enum XmPlaylistListMode
+    {
+        [FieldOption(Label = "Recent Plays (All Channels)")]
+        Feed = 0,
+
+        [FieldOption(Label = "Specific Channel")]
+        Channel = 1
+    }
+
+    public enum XmPlaylistImportType
+    {
+        [FieldOption(Label = "Artists")]
+        Artists = 0,
+
+        [FieldOption(Label = "Albums")]
+        Albums = 1,
+
+        [FieldOption(Label = "Artists and Albums")]
+        ArtistsAndAlbums = 2
     }
 }

@@ -36,17 +36,13 @@ namespace XmPlaylist.ImportLists
                     return items;
                 }
 
-                var channelFilter = ParseChannelFilter();
-                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var importType = (XmPlaylistImportType)(Settings?.ImportType ?? (int)XmPlaylistImportType.Artists);
+                var seenArtists = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var seenAlbums = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                 foreach (var play in feed.Results)
                 {
                     if (play.Track?.Artists == null || play.Track.Artists.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    if (channelFilter.Count > 0 && (play.ChannelId == null || !channelFilter.Contains(play.ChannelId)))
                     {
                         continue;
                     }
@@ -58,17 +54,39 @@ namespace XmPlaylist.ImportLists
                             continue;
                         }
 
-                        if (Settings is { DedupeArtists: true } && !seen.Add(artist))
+                        var importArtist = importType == XmPlaylistImportType.Artists ||
+                                          importType == XmPlaylistImportType.ArtistsAndAlbums;
+                        var importAlbum = importType == XmPlaylistImportType.Albums ||
+                                          importType == XmPlaylistImportType.ArtistsAndAlbums;
+
+                        if (importArtist && Settings is { DedupeArtists: true } && !seenArtists.Add(artist))
                         {
                             continue;
                         }
 
-                        items.Add(new ImportListItemInfo
+                        if (importAlbum)
                         {
-                            Artist = artist,
-                            Album = play.Track.Title,
-                            ReleaseDate = play.Timestamp
-                        });
+                            var albumKey = $"{artist}|{play.Track.Title}";
+                            if (Settings is { DedupeArtists: true } && !seenAlbums.Add(albumKey))
+                            {
+                                continue;
+                            }
+
+                            items.Add(new ImportListItemInfo
+                            {
+                                Artist = artist,
+                                Album = play.Track.Title,
+                                ReleaseDate = play.Timestamp
+                            });
+                        }
+                        else
+                        {
+                            items.Add(new ImportListItemInfo
+                            {
+                                Artist = artist,
+                                ReleaseDate = play.Timestamp
+                            });
+                        }
                     }
                 }
             }
@@ -78,29 +96,6 @@ namespace XmPlaylist.ImportLists
             }
 
             return items;
-        }
-
-        private HashSet<string> ParseChannelFilter()
-        {
-            var filter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            var channelFilter = Settings?.ChannelFilter;
-
-            if (string.IsNullOrWhiteSpace(channelFilter))
-            {
-                return filter;
-            }
-
-            foreach (var channel in channelFilter.Split(','))
-            {
-                var trimmed = channel.Trim();
-                if (trimmed.IsNotNullOrWhiteSpace())
-                {
-                    filter.Add(trimmed);
-                }
-            }
-
-            return filter;
         }
 
         protected virtual bool PreProcess(ImportListResponse importListResponse)
