@@ -47,19 +47,23 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 git clone --recursive https://github.com/ksamples14/lidarr.plugin.xmplaylist.git
 cd lidarr.plugin.xmplaylist
 dotnet restore XmPlaylist.sln
-dotnet build XmPlaylist.sln -c Release
+dotnet build XmPlaylist.sln -c Release -p:EnableAnalyzers=false
 ```
 
-Output: `_plugins/net8.0/XmPlaylist/Lidarr.Plugin.XmPlaylist.dll`
+> `-p:EnableAnalyzers=false` is required because Lidarr's own build props enable StyleCop with `TreatWarningsAsErrors`, which fails on Lidarr's submodule source.
+
+Output: `src/XmPlaylist/bin/Release/net8.0/Lidarr.Plugin.XmPlaylist.dll` (single merged DLL via ILRepack)
 
 ## Project Structure
 
 ```
-sat-list/
+lidarr.plugin.xmplaylist/
 ├── src/XmPlaylist/
 │   ├── XmPlaylist.csproj
+│   ├── ILRepack.targets                      # Merges Lidarr deps into single DLL
 │   ├── Plugin.cs                              # IPlugin entry point
-│   ├── PluginInfo.targets                     # Build-time metadata generation
+│   ├── PluginInfo.cs                          # Plugin metadata constants
+│   ├── PluginInfo.targets                     # Version/build metadata properties
 │   ├── PreBuild.targets                       # Lidarr submodule init
 │   └── ImportLists/
 │       ├── XmPlaylistImport.cs                # HttpImportListBase<TSettings>

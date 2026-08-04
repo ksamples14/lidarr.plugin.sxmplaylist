@@ -29,7 +29,7 @@ namespace XmPlaylist.ImportLists
         public int ResultCount { get; set; }
 
         [FieldDefinition(1, Label = "Channel Filter", HelpText = "Comma-separated channel IDs to filter by (e.g. altnation, xmu, thespectrum). Leave empty for all channels.", Advanced = true)]
-        public string ChannelFilter { get; set; }
+        public string? ChannelFilter { get; set; }
 
         [FieldDefinition(2, Label = "Dedupe Artists", HelpText = "Only return each unique artist once (recommended to avoid duplicates)", Type = FieldType.Checkbox)]
         public bool DedupeArtists { get; set; }

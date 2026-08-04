@@ -2,6 +2,7 @@ using System;
 using NLog;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
+using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Parser;
 
 namespace XmPlaylist.ImportLists

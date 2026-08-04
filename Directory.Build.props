@@ -7,5 +7,6 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <XmPlaylistBuildDirectory>$(MSBuildThisFileDirectory)_build</XmPlaylistBuildDirectory>
     <XmPlaylistPluginOutputDirectory>$(MSBuildThisFileDirectory)_plugins\$(TargetFramework)\$(MSBuildProjectName)</XmPlaylistPluginOutputDirectory>
+    <LidarrOutputDir>$(MSBuildThisFileDirectory)Submodules\Lidarr\_output\net8.0\</LidarrOutputDir>
   </PropertyGroup>
 </Project>

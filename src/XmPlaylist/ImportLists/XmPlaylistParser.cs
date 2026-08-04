@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net;
 using Newtonsoft.Json;
 using NzbDrone.Common.Extensions;
+using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.ImportLists.Exceptions;
 using NzbDrone.Core.Parser.Model;
 
@@ -11,9 +12,9 @@ namespace XmPlaylist.ImportLists
 {
     public class XmPlaylistParser : IParseImportListResponse
     {
-        public XmPlaylistImportSettings Settings { get; set; }
+        public XmPlaylistImportSettings? Settings { get; set; }
 
-        private ImportListResponse _importListResponse;
+        private ImportListResponse _importListResponse = null!;
 
         public IList<ImportListItemInfo> ParseResponse(ImportListResponse importListResponse)
         {
@@ -45,7 +46,7 @@ namespace XmPlaylist.ImportLists
                         continue;
                     }
 
-                    if (channelFilter.Count > 0 && !channelFilter.Contains(play.ChannelId))
+                    if (channelFilter.Count > 0 && (play.ChannelId == null || !channelFilter.Contains(play.ChannelId)))
                     {
                         continue;
                     }
@@ -57,7 +58,7 @@ namespace XmPlaylist.ImportLists
                             continue;
                         }
 
-                        if (Settings.DedupeArtists && !seen.Add(artist))
+                        if (Settings is { DedupeArtists: true } && !seen.Add(artist))
                         {
                             continue;
                         }
@@ -83,12 +84,14 @@ namespace XmPlaylist.ImportLists
         {
             var filter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            if (Settings.ChannelFilter.IsNullOrWhiteSpace())
+            var channelFilter = Settings?.ChannelFilter;
+
+            if (string.IsNullOrWhiteSpace(channelFilter))
             {
                 return filter;
             }
 
-            foreach (var channel in Settings.ChannelFilter.Split(','))
+            foreach (var channel in channelFilter.Split(','))
             {
                 var trimmed = channel.Trim();
                 if (trimmed.IsNotNullOrWhiteSpace())
@@ -122,22 +125,22 @@ namespace XmPlaylist.ImportLists
     internal class XmFeedResponse
     {
         public int Count { get; set; }
-        public List<XmPlayEntry> Results { get; set; }
+        public List<XmPlayEntry>? Results { get; set; }
     }
 
     internal class XmPlayEntry
     {
-        public string Id { get; set; }
+        public string? Id { get; set; }
         public DateTime Timestamp { get; set; }
-        public XmTrackInfo Track { get; set; }
+        public XmTrackInfo? Track { get; set; }
         [JsonProperty("channelId")]
-        public string ChannelId { get; set; }
+        public string? ChannelId { get; set; }
     }
 
     internal class XmTrackInfo
     {
-        public string Id { get; set; }
-        public List<string> Artists { get; set; }
-        public string Title { get; set; }
+        public string? Id { get; set; }
+        public List<string>? Artists { get; set; }
+        public string? Title { get; set; }
     }
 }
