@@ -14,6 +14,10 @@ namespace XmPlaylist.ImportLists
     {
         public XmPlaylistImportSettings? Settings { get; set; }
 
+        public XmPlaylistStateStore? StateStore { get; set; }
+
+        public int ListId { get; set; }
+
         private ImportListResponse _importListResponse = null!;
 
         public IList<ImportListItemInfo> ParseResponse(ImportListResponse importListResponse)
@@ -37,12 +41,21 @@ namespace XmPlaylist.ImportLists
                 }
 
                 var importType = (XmPlaylistImportType)(Settings?.ImportType ?? (int)XmPlaylistImportType.Artists);
+                var onlyNewArtists = Settings?.OnlyNewArtists ?? true;
+                var channelFilter = ParseChannelFilter();
+                var state = onlyNewArtists ? StateStore?.Load(ListId) ?? new XmPlaylistState() : null;
+
                 var seenArtists = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var seenAlbums = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                 foreach (var play in feed.Results)
                 {
                     if (play.Track?.Artists == null || play.Track.Artists.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (channelFilter.Count > 0 && (play.ChannelId == null || !channelFilter.Contains(play.ChannelId)))
                     {
                         continue;
                     }
@@ -59,9 +72,21 @@ namespace XmPlaylist.ImportLists
                         var importAlbum = importType == XmPlaylistImportType.Albums ||
                                           importType == XmPlaylistImportType.ArtistsAndAlbums;
 
-                        if (importArtist && Settings is { DedupeArtists: true } && !seenArtists.Add(artist))
+                        if (importArtist)
                         {
-                            continue;
+                            if (onlyNewArtists && state != null && !state.SeenArtists.Contains(artist))
+                            {
+                                state.SeenArtists.Add(artist);
+                            }
+                            else if (onlyNewArtists && state != null)
+                            {
+                                continue;
+                            }
+
+                            if (Settings is { DedupeArtists: true } && !seenArtists.Add(artist))
+                            {
+                                continue;
+                            }
                         }
 
                         if (importAlbum)
@@ -89,6 +114,11 @@ namespace XmPlaylist.ImportLists
                         }
                     }
                 }
+
+                if (onlyNewArtists && state != null && StateStore != null)
+                {
+                    StateStore.Save(ListId, state);
+                }
             }
             catch (Exception ex)
             {
@@ -96,6 +126,29 @@ namespace XmPlaylist.ImportLists
             }
 
             return items;
+        }
+
+        private HashSet<string> ParseChannelFilter()
+        {
+            var filter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            var channelFilter = Settings?.ChannelFilter;
+
+            if (string.IsNullOrWhiteSpace(channelFilter))
+            {
+                return filter;
+            }
+
+            foreach (var channel in channelFilter.Split(','))
+            {
+                var trimmed = channel.Trim();
+                if (trimmed.IsNotNullOrWhiteSpace())
+                {
+                    filter.Add(trimmed);
+                }
+            }
+
+            return filter;
         }
 
         protected virtual bool PreProcess(ImportListResponse importListResponse)
