@@ -10,16 +10,16 @@
 
   <ItemGroup>
     <Reference Include="Lidarr.Common">
-      <HintPath>..\..\Submodules\Lidarr\_output\net8.0\Lidarr.Common.dll</HintPath>
+      <HintPath>..\..\lib\Lidarr.Common.dll</HintPath>
     </Reference>
     <Reference Include="Lidarr.Core">
-      <HintPath>..\..\Submodules\Lidarr\_output\net8.0\Lidarr.Core.dll</HintPath>
+      <HintPath>..\..\lib\Lidarr.Core.dll</HintPath>
     </Reference>
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
-    <PackageReference Include="FluentValidation" Version="11.9.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="FluentValidation" Version="9.5.4" />
     <PackageReference Include="System.IO.Abstractions" Version="17.0.24" />
   </ItemGroup>
 

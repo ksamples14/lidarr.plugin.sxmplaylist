@@ -60,6 +60,8 @@ If you add several import lists (e.g. one per channel), the plugin keeps API usa
 
 ## Building From Source
 
+The plugin references the **exact Lidarr DLLs from your running Lidarr instance** (in `lib/`), not the source submodule. This ensures the compiled assembly versions match the host, which is required for the plugin's isolated load context to resolve them.
+
 ```powershell
 git clone --recursive https://github.com/ksamples14/lidarr.plugin.xmplaylist.git
 cd lidarr.plugin.xmplaylist
@@ -68,7 +70,10 @@ dotnet build XmPlaylist.sln -c Release -p:EnableAnalyzers=false
 dotnet run --project tests/XmPlaylist.Tests/XmPlaylist.Tests.csproj
 ```
 
-> `-p:EnableAnalyzers=false` is required because Lidarr's own build props enable StyleCop with `TreatWarningsAsErrors`, which fails on Lidarr's submodule source.
+> `-p:EnableAnalyzers=false` avoids StyleCop/TreatWarningsAsErrors issues from Lidarr's build props.
+>
+> **Important:** the `lib/*.dll` files are the Lidarr assemblies from the container you deploy to (`v3.1.3.4987`). If you update Lidarr to a new nightly, re-extract the DLLs from your container:
+> `docker cp <container>:/app/lidarr/bin/Lidarr.Core.dll lib/` (also `Lidarr.Common.dll`, `Lidarr.Http.dll`) and rebuild.
 
 Output: `src/XmPlaylist/bin/Release/net8.0/Lidarr.Plugin.XmPlaylist.dll` (single merged DLL via ILRepack)
 
@@ -76,13 +81,14 @@ Output: `src/XmPlaylist/bin/Release/net8.0/Lidarr.Plugin.XmPlaylist.dll` (single
 
 ```
 lidarr.plugin.xmplaylist/
+├── lib/                                    # Lidarr DLLs from your running instance (version-matched)
 ├── src/XmPlaylist/
-│   ├── XmPlaylist.csproj
-│   ├── ILRepack.targets                      # Merges Lidarr deps into single DLL
-│   ├── Plugin.cs                              # IPlugin entry point
-│   ├── PluginInfo.cs                          # Plugin metadata constants
-│   ├── PluginInfo.targets                     # Version/build metadata properties
-│   ├── PreBuild.targets                       # Lidarr submodule init
+│   ├── XmPlaylist.csproj                   # References lib/*.dll (Reference, Private=false)
+│   ├── ILRepack.targets                    # Merges plugin into single DLL
+│   ├── Plugin.cs                            # IPlugin entry point
+│   ├── PluginInfo.cs                        # Plugin metadata constants
+│   ├── PluginInfo.targets                   # Version/build metadata properties
+│   ├── PreBuild.targets                     # Lidarr submodule init (IDE only)
 │   └── ImportLists/
 │       ├── XmPlaylistImport.cs                # HttpImportListBase<TSettings>
 │       ├── XmPlaylistImportSettings.cs        # [FieldDefinition] + validation

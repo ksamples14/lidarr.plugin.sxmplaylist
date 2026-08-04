@@ -11,7 +11,7 @@
       InputAssemblies="@(InputAssemblies)"
       TargetKind="Dll"
       DebugInfo="true"
-      LibraryPath="..\..\Submodules\Lidarr\_output\net8.0\;$(OutputPath)"
+      LibraryPath="..\..\lib\;$(OutputPath)"
       OutputFile="$(OutputPath)$(AssemblyName).dll" />
   </Target>
 </Project>

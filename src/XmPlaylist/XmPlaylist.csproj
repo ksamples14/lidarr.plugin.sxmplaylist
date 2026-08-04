@@ -10,8 +10,18 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\Submodules\Lidarr\src\NzbDrone.Common\Lidarr.Common.csproj" />
-    <ProjectReference Include="..\..\Submodules\Lidarr\src\NzbDrone.Core\Lidarr.Core.csproj" />
+    <Reference Include="Lidarr.Common">
+      <HintPath>..\..\lib\Lidarr.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Lidarr.Core">
+      <HintPath>..\..\lib\Lidarr.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Lidarr.Http">
+      <HintPath>..\..\lib\Lidarr.Http.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>
@@ -19,6 +29,9 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="NLog" Version="5.5.1" />
+    <PackageReference Include="FluentValidation" Version="9.5.4" />
   </ItemGroup>
 
   <Import Project="PreBuild.targets" />
