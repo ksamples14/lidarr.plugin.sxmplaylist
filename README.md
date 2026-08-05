@@ -4,11 +4,13 @@ A Lidarr import list plugin that discovers artists from the [xmplaylist.com](htt
 
 ## How It Works
 
-1. Each list is scoped to one SiriusXM channel and polls `https://xmplaylist.com/api/station/{channel}` every 6 hours
-2. The channel endpoint only returns a channel's most recent ~24 plays (a few minutes of history) per page, so each poll walks the API's `next` cursor backwards, merging pages until it has covered the full 6-hour window since the last poll (capped at 50 pages as a safety limit)
-3. Every play is recorded in a local SQLite history database (artist, song, channel, timestamp) — see [Play History](#play-history) below
-4. For plays not already in that history, the plugin tries to resolve the real album (see [Album Resolution](#album-resolution) below) and adds an artist import list entry to Lidarr
-5. Lidarr resolves artists (and, when resolved, albums) by name and adds them to your library
+The plugin is split into a background worker and a thin import-list shell. The worker runs continuously from Lidarr startup, watches Lidarr's import-list definitions for XM Playlist channels, and does all the downloading and album resolution. The import lists only query the local database for what's ready and hand it to Lidarr.
+
+1. **Capture (hourly, per channel).** The worker downloads `https://xmplaylist.com/api/station/{channel}` for every configured channel that hasn't been captured in the last hour. The endpoint only returns ~24 plays (a few minutes of history) per page, so each capture walks the API's `next` cursor backwards, merging pages until it has covered a ~2-hour window (slightly wider than the hourly cadence to absorb a missed poll; capped at 50 pages).
+2. **Record.** Every play is appended to a local SQLite history database (artist, song, channel, timestamp) — see [Play History](#play-history) below. Exact duplicates are ignored. Each new play also registers a per-track row holding the resolution inputs (artist, song, Deezer/Apple links).
+3. **Resolve (background).** The worker resolves due tracks' albums against Deezer/MusicBrainz/Apple (see [Album Resolution](#album-resolution) below), retrying each track up to 3 times before giving up. This runs in the background at MusicBrainz's 1 req/s, decoupled from any import-list fetch.
+4. **Present (hourly).** Each XM Playlist import list's `Fetch()` is a pure DB query: resolved tracks for its channel that fell within the last 25 hours, capped at 20 per fetch. It returns those to Lidarr, which resolves the artists/albums and adds them to your library. Lidarr's import-list processing is idempotent, so the same track being returned across a few hourly fetches is harmless.
+5. When an album is added or newly monitored for an artist already in your library, the plugin queues a Lidarr **Refresh & Scan** for that artist so the change is picked up immediately (Lidarr already refresh-scans brand-new artists on its own).
 
 ## Album Resolution
 
@@ -17,9 +19,9 @@ xmplaylist itself only ever gives a song/track title, never a real album name. E
 1. **Deezer → MusicBrainz (preferred).** If the play has a Deezer link, the plugin looks up that track on Deezer's public API, which returns both the track's ISRC (a unique code identifying that specific recording) and Deezer's own album title in one call. The ISRC is looked up on MusicBrainz — an exact match, not a fuzzy text search — and when that succeeds, the plugin hands Lidarr the real album title *and* its MusicBrainz IDs directly, so Lidarr trusts those outright and skips its own search.
 2. **Deezer's own title (fallback within the same call).** If the MusicBrainz step doesn't pan out (no ISRC, no match, or nothing usable), the plugin falls back to the album title Deezer already returned — no extra network call, since that response was already fetched for the ISRC.
 3. **Apple Music (last-resort fallback).** Only used when there's no Deezer link at all, or Deezer's response had no album title either. Uses Apple's iTunes Lookup API via the Apple Music link's album ID. Real album title, no MusicBrainz ID — Lidarr resolves it the normal way via its own built-in fuzzy album search.
-4. **Artist-only (final fallback).** If nothing resolves, the play is imported as an artist only, same as before this feature existed.
+4. **Skip (final fallback).** If nothing resolves, the track is not imported at all. The plugin never hands Lidarr an artist without a MusicBrainz ID — Lidarr would otherwise fall back to a name-only search, which can pick the wrong artist (e.g. a different band sharing the same name) and create a duplicate. Each track gets up to 3 resolution attempts across worker passes; if all fail it stops being retried (it only returns if the song airs again with new links).
 
-Resolved albums are cached per song (in the same history database, keyed by xmplaylist's own track id) rather than per play, since a rotation-heavy station replays the same songs constantly and the album never changes between plays. A failed lookup is retried after 7 days rather than cached forever, in case the track shows up on Deezer/Apple later. MusicBrainz's API is rate-limited to 1 request/second per their usage policy; the plugin throttles to that automatically, and since lookups are cached per song, only genuinely new songs ever hit it.
+Resolution runs entirely in the background worker, so there is no per-fetch time budget. MusicBrainz's API is rate-limited to 1 request/second per their usage policy; the plugin throttles to that automatically and retries transient 503 "server busy" responses a couple of times with a short backoff. Results are stored per track (a rotation-heavy station replays the same song constantly and its album never changes between plays), so only genuinely new tracks ever hit the catalogs.
 
 ## Installation
 
@@ -53,7 +55,7 @@ Resolved albums are cached per song (in the same history database, keyed by xmpl
 
 The Channel dropdown populates itself automatically whenever you open the Add/Edit dialog — no separate button to press. Behind the scenes it's backed by a small cache (see [Channel List](#channel-list) below) so opening the dialog doesn't hit xmplaylist.com every time.
 
-> The list refreshes every **6 hours** (matching Lidarr's Custom import list). Each poll backfills the full 6-hour window via cursor pagination rather than relying on a single snapshot, so plays aren't missed between polls. Artist monitoring, quality profile, and root folder are configured in Lidarr's own **Added Artist Settings** section of the import list modal, not by this plugin. Whether a previously-unmonitored artist gets re-monitored when it shows up in the feed again is controlled by Lidarr's own **Monitor Existing** setting on the list — not by this plugin.
+> The background worker captures each channel roughly every **1 hour**, and the import lists present resolved tracks to Lidarr hourly (capped at 20 per fetch). Resolution happens in the background, so imports arrive spread across the day rather than in bursts. Artist monitoring, quality profile, and root folder are configured in Lidarr's own **Added Artist Settings** section of the import list modal, not by this plugin. Whether a previously-unmonitored artist gets re-monitored when it shows up in the feed again is controlled by Lidarr's own **Monitor Existing** setting on the list — not by this plugin.
 
 ## Channel List
 
@@ -65,18 +67,19 @@ The fetched list is cached (in the same history database) rather than re-fetched
 
 ## Play History
 
-The plugin keeps a local SQLite database (`Lidarr/AppData/XmPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp (plus a small cache of resolved albums, see [Album Resolution](#album-resolution)). This does two things:
+The plugin keeps a local SQLite database (`Lidarr/AppData/XmPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album + MusicBrainz IDs once resolved, and a 3-strike failure counter) and a per-channel "last captured" marker. This does three things:
 
-- **Dedup** — a play is only sent to Lidarr the first time it's recorded. Since each poll backfills the full 6-hour window, two consecutive polls can legitimately overlap by a few minutes; the history table (keyed by the API's own play ID + artist) makes sure that overlap never produces a repeat import.
-- **Future feature** — this is also the data source for a planned "build a Plex playlist per station" feature, which needs the actual song-level play history (not just "have we seen this artist"), so it's kept independently of whatever Lidarr decides to do with the artist.
+- **Dedup** — a play is only recorded the first time its (play ID + artist) pair is seen, so overlapping ~2-hour capture windows never duplicate.
+- **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks become presentable to Lidarr for the next 25 hours.
+- **Future feature** — the play history is the data source for a planned "build a Plex playlist per station" feature, so it's kept independently of whatever Lidarr decides to do with the artist.
 
-Play rows older than 90 days are pruned automatically on each poll. Successful album resolutions are kept for the same 90 days; failed ones are retried after 7 days.
+Play rows older than **180 days** are pruned by the background worker, along with tracks whose plays have fallen out of the window. The database runs in WAL mode so the worker can write while the import lists read (the lists fetch in parallel).
 
 The database uses `System.Data.SQLite` — the same SQLite provider Lidarr itself ships with — referenced from `lib/` the same way as the other host DLLs, so no new native binary is bundled with the plugin (see [Building From Source](#building-from-source)).
 
 ## Multiple Lists & API Limiting
 
-Each list hits `/api/station/{channel}` for its own channel — one request per poll, plus any backfill pages needed to cover the 6-hour window (capped at 50 pages). If you run multiple lists against the same channel, they share an in-process response cache keyed by URL (3-minute lifetime), so overlapping polls don't double the request count.
+The background worker downloads `/api/station/{channel}` for each configured channel — one request per channel per capture, plus any backfill pages needed to cover the ~2-hour window (capped at 50 pages). Multiple lists for the same channel share an in-process response cache keyed by URL (3-minute lifetime), so overlapping captures don't double the request count. Album resolution runs at MusicBrainz's 1 request/second limit regardless of how many channels or lists are configured.
 
 ## Building From Source
 
@@ -107,22 +110,24 @@ lidarr.plugin.xmplaylist/
 ├── src/XmPlaylist/
 │   ├── XmPlaylist.csproj                   # References lib/*.dll (Reference, Private=false)
 │   ├── ILRepack.targets                    # Merges plugin into single DLL
-│   ├── Plugin.cs                            # IPlugin entry point
+│   ├── Plugin.cs                            # IPlugin entry point; hosts the background worker
 │   ├── PluginInfo.cs                        # Plugin metadata constants
 │   ├── PluginInfo.targets                   # Version/build metadata properties
 │   ├── PreBuild.targets                     # Lidarr submodule init (IDE only)
 │   └── ImportLists/
-│       ├── XmPlaylistImport.cs                # HttpImportListBase<TSettings>
+│       ├── XmPlaylistImport.cs                # thin HttpImportListBase; Fetch() queries the DB
 │       ├── XmPlaylistImportSettings.cs        # [FieldDefinition] + validation
+│       ├── XmPlaylistWorker.cs                # background worker: capture + resolve + prune
 │       ├── XmPlaylistRequestGenerator.cs      # /api/station/{channel} request builder
 │       ├── XmPlaylistRequestBuilder.cs        # shared HttpRequest construction (headers)
-│       ├── XmPlaylistStationBackfill.cs       # cursor pagination to cover the 6h poll window
-│       ├── XmPlaylistParser.cs               # xmplaylist JSON → ImportListItemInfo
-│       ├── XmPlaylistHistoryStore.cs          # SQLite play history + dedup + album/channel cache
+│       ├── XmPlaylistStationBackfill.cs       # cursor pagination to cover the capture window
+│       ├── XmPlaylistFeed.cs                  # xmplaylist feed JSON models
+│       ├── XmPlaylistHistoryStore.cs          # SQLite: plays, tracks, channel state (WAL)
 │       ├── XmPlaylistAlbumResolver.cs         # Deezer/MusicBrainz/Apple album lookup
+│       ├── XmPlaylistRefreshScheduler.cs      # RefreshArtistCommand after newly-monitored albums
 │       ├── XmPlaylistChannelDirectory.cs      # /api/station channel list lookup
 │       └── XmPlaylistFeedCache.cs            # shared in-process HTTP cache (limits API hits)
-├── tests/XmPlaylist.Tests/                    # parser, backfill-cursor, history-store, and album-resolver tests
+├── tests/XmPlaylist.Tests/                    # worker, history-store, backfill, resolver, and scheduler tests
 ├── Submodules/Lidarr/                         # Lidarr source (git submodule)
 └── XmPlaylist.sln
 ```
@@ -131,7 +136,7 @@ lidarr.plugin.xmplaylist/
 
 - The xmplaylist `/api/station/{channel}` endpoint is **free and requires no authentication**
 - A `User-Agent` header is required per the API guidelines
-- Each page covers only a few minutes of history (~24 plays), which is why the plugin walks the `next` cursor to backfill the full 6-hour poll window instead of relying on a single page
+- Each page covers only a few minutes of history (~24 plays), which is why the plugin walks the `next` cursor to backfill the ~2-hour poll window instead of relying on a single page
 - Lidarr matches artists (and unresolved albums) by name, so accuracy depends on consistent naming
 - Deezer's API (`api.deezer.com`), Apple's iTunes Lookup API (`itunes.apple.com`), and MusicBrainz's web service (`musicbrainz.org/ws/2`) are all free and require no authentication either — see [Album Resolution](#album-resolution)
 - `/api/station` (no channel suffix) is a separate endpoint from `/api/station/{channel}` — it lists every channel instead of that channel's plays — see [Channel List](#channel-list)

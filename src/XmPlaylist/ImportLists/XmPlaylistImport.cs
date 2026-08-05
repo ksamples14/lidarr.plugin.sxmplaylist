@@ -9,22 +9,30 @@ using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
 using NzbDrone.Core.ImportLists;
+using NzbDrone.Core.Messaging.Commands;
+using NzbDrone.Core.Music;
 using NzbDrone.Core.Parser;
+using NzbDrone.Core.Parser.Model;
 
 namespace XmPlaylist.ImportLists
 {
+    // Thin import-list shell. All downloading, recording and album resolution happens in the
+    // background XmPlaylistWorker; Fetch() is just a DB query for this channel's resolved tracks
+    // within the presentation window. Lidarr's import-list processing is idempotent, so returning
+    // the same resolved track across hourly fetches is harmless.
     public class XmPlaylistImport : HttpImportListBase<XmPlaylistImportSettings>
     {
         private static readonly TimeSpan ChannelCacheLifetime = TimeSpan.FromHours(24);
+        private const int MaxItemsPerFetch = 20;
 
         private readonly XmPlaylistHistoryStore _historyStore;
-        private readonly XmPlaylistAlbumResolver _albumResolver;
+        private readonly XmPlaylistRefreshScheduler _refreshScheduler;
 
         public override string Name => "XM Playlist";
 
         public override ImportListType ListType => ImportListType.Other;
 
-        public override TimeSpan MinRefreshInterval => TimeSpan.FromHours(6);
+        public override TimeSpan MinRefreshInterval => TimeSpan.FromHours(1);
 
         public override int PageSize => 1000;
 
@@ -34,11 +42,52 @@ namespace XmPlaylist.ImportLists
             IConfigService configService,
             IParsingService parsingService,
             IAppFolderInfo appFolderInfo,
+            IArtistService artistService,
+            IAlbumService albumService,
+            IManageCommandQueue commandQueueManager,
             Logger logger)
             : base(httpClient, importListStatusService, configService, parsingService, logger)
         {
             _historyStore = new XmPlaylistHistoryStore(appFolderInfo);
-            _albumResolver = new XmPlaylistAlbumResolver(httpClient, logger);
+            _refreshScheduler = new XmPlaylistRefreshScheduler(artistService, albumService, commandQueueManager, logger);
+        }
+
+        public override IList<ImportListItemInfo> Fetch()
+        {
+            var channel = Settings?.Channel ?? "";
+            if (channel.IsNullOrWhiteSpace())
+            {
+                return new List<ImportListItemInfo>();
+            }
+
+            var since = DateTime.UtcNow - XmPlaylistHistoryStore.PresentationWindow;
+            var presentable = _historyStore.GetPresentableTracks(channel, since, MaxItemsPerFetch);
+
+            var items = new List<ImportListItemInfo>();
+            foreach (var track in presentable)
+            {
+                foreach (var artist in track.Artists)
+                {
+                    var item = new ImportListItemInfo
+                    {
+                        Artist = artist,
+                        Album = track.Album ?? "",
+                        AlbumMusicBrainzId = track.AlbumMusicBrainzId ?? "",
+                        ReleaseDate = track.TimestampUtc
+                    };
+
+                    if (track.Artists.Count == 1)
+                    {
+                        item.ArtistMusicBrainzId = track.ArtistMusicBrainzId ?? "";
+                    }
+
+                    items.Add(item);
+                }
+            }
+
+            _refreshScheduler.Schedule(items);
+
+            return items;
         }
 
         public override IImportListRequestGenerator GetRequestGenerator()
@@ -49,28 +98,14 @@ namespace XmPlaylist.ImportLists
             };
         }
 
+        // The parser is retired from the emit path - the background worker owns feed parsing now.
         public override IParseImportListResponse GetParser()
         {
-            return new XmPlaylistParser
-            {
-                Settings = Settings,
-                HistoryStore = _historyStore,
-                AlbumResolver = _albumResolver
-            };
+            return null!;
         }
 
-        protected override ImportListResponse FetchImportListResponse(ImportListRequest request)
-        {
-            _historyStore.PruneOldPlays();
-            return XmPlaylistStationBackfill.Fetch(request, MinRefreshInterval, r => XmPlaylistFeedCache.Get(_httpClient, r));
-        }
-
-        // Lidarr's default TestConnection() calls FetchPage(), which goes through our overridden
-        // FetchImportListResponse (the full 6-hour cursor backfill) and the full parser (album
-        // resolution against Deezer/MusicBrainz/Apple for every newly-seen song). For a first-ever
-        // Test against a busy channel that's a lot of work behind one click. Test only needs to
-        // confirm the endpoint is reachable and returning data - a single un-backfilled page, with
-        // no parsing, does that far faster.
+        // Lidarr's default TestConnection() fetches the feed directly. Keep it a lightweight
+        // connectivity check: a single un-backfilled page, no parsing, no album resolution.
         protected override ValidationFailure TestConnection()
         {
             try

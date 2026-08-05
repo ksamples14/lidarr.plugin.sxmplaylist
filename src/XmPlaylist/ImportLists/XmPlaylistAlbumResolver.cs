@@ -33,8 +33,12 @@ namespace XmPlaylist.ImportLists
         private static readonly Regex AppleAlbumId = new(@"/album/[^/]+/(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly TimeSpan MusicBrainzMinInterval = TimeSpan.FromSeconds(1.1);
+        private static readonly int MusicBrainzMaxRetries = 2;
         private static readonly SemaphoreSlim MusicBrainzGate = new(1, 1);
         private static DateTime _lastMusicBrainzCallUtc = DateTime.MinValue;
+
+        // Only touched when a retry fires; small enough to keep tests fast.
+        internal static TimeSpan MusicBrainzRetryBackoff = TimeSpan.FromSeconds(2);
 
         private const string UserAgent = "XmPlaylist-Lidarr-Plugin/1.0 (https://github.com/ksamples14/lidarr.plugin.xmplaylist)";
 
@@ -188,14 +192,32 @@ namespace XmPlaylist.ImportLists
             var request = new HttpRequest(url, HttpAccept.Json);
             request.Headers.Add("User-Agent", UserAgent);
 
-            var response = _httpClient.Get(request);
-
-            if (response.StatusCode != System.Net.HttpStatusCode.OK || response.Content.IsNullOrWhiteSpace())
+            for (var attempt = 0; ; attempt++)
             {
-                return null;
-            }
+                var response = _httpClient.Get(request);
 
-            return JToken.Parse(response.Content);
+                if (response.StatusCode == System.Net.HttpStatusCode.OK && response.Content.IsNotNullOrWhiteSpace())
+                {
+                    return JToken.Parse(response.Content);
+                }
+
+                // MusicBrainz's 503 "server busy" responses are transient (rate/load throttling).
+                // Retry a couple of times with a short backoff rather than falling through to a
+                // fuzzier source; the retries stay within the 1 req/s pacing already enforced.
+                var retriable = musicBrainz
+                    && attempt < MusicBrainzMaxRetries
+                    && (response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable
+                        || response.StatusCode == System.Net.HttpStatusCode.TooManyRequests);
+
+                if (!retriable)
+                {
+                    return null;
+                }
+
+                var backoff = MusicBrainzRetryBackoff * (attempt + 1);
+                _logger.Debug("MusicBrainz returned {0}, retrying in {1}ms", response.StatusCode, backoff.TotalMilliseconds);
+                Thread.Sleep(backoff);
+            }
         }
 
         private static void ThrottleMusicBrainz()
