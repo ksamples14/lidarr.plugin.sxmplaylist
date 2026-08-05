@@ -36,6 +36,7 @@ internal static class Program
         TestAlbumResolutionFallsBackToDeezerTitle();
         TestAlbumResolutionFallsBackToAppleMusic();
         TestAlbumResolutionSkipsVariousArtistsCompilations();
+        TestAlbumResolutionPrefersSingleOverEpOverAlbum();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
 
@@ -314,6 +315,47 @@ internal static class Program
 
         Assert("falls back to Deezer title when only VA releases exist", resolution2.Album == "No Code");
         Assert("no compilation MBID used", resolution2.AlbumMusicBrainzId == null);
+    }
+
+    private static void TestAlbumResolutionPrefersSingleOverEpOverAlbum()
+    {
+        Console.WriteLine("\n[Test] Album resolution prefers Single over EP over Album for the artist's own releases");
+
+        // Single + EP + Album by the same artist -> the Single wins.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"ep-mbid\",\"title\":\"The EP\",\"primary-type\":\"EP\",\"first-release-date\":\"1996-07-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}]}");
+
+        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("single preferred over EP and album", resolution.Album == "The Single");
+        Assert("single MBID used", resolution.AlbumMusicBrainzId == "single-mbid");
+
+        // EP + Album only (no single) -> the EP wins.
+        var httpClient2 = new FakeHttpClient();
+        httpClient2.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient2.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-2\"}]}");
+        httpClient2.Respond("musicbrainz.org/ws/2/recording/rec-2",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"ep-mbid\",\"title\":\"The EP\",\"primary-type\":\"EP\",\"first-release-date\":\"1996-07-01\"}}]}");
+        var resolver2 = new XmPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
+        var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("EP preferred over album when no single exists", resolution2.Album == "The EP");
     }
 
     private static void TestMusicBrainzBusyIsRetried()

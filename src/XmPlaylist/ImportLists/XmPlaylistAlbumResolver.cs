@@ -179,10 +179,23 @@ namespace XmPlaylist.ImportLists
             return candidates
                 .OrderByDescending(r => recordingArtistId.IsNotNullOrWhiteSpace() && MatchesRecordingArtist(r, recordingArtistId))
                 .ThenByDescending(r => string.Equals(r["status"]?.Value<string>(), "Official", StringComparison.OrdinalIgnoreCase))
-                .ThenByDescending(r => string.Equals(r["release-group"]?["primary-type"]?.Value<string>(), "Album", StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(r => PrimaryTypeRank(r["release-group"]))
                 .ThenBy(r => r["release-group"]?["first-release-date"]?.Value<string>() ?? "9999")
                 .Select(r => r["release-group"])
                 .FirstOrDefault();
+        }
+
+        // For a played track, the release that most directly corresponds to it is the single, then
+        // the EP, then the studio album - so rank primary types in that order.
+        private static int PrimaryTypeRank(JToken? releaseGroup)
+        {
+            return (releaseGroup?["primary-type"]?.Value<string>()) switch
+            {
+                "Single" => 2,
+                "EP" => 1,
+                "Album" => 0,
+                _ => -1
+            };
         }
 
         private static bool IsVariousArtistsRelease(JToken release)
