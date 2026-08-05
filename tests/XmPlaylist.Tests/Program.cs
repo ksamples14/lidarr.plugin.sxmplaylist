@@ -191,6 +191,19 @@ internal static class Program
         scheduler.Schedule(new List<ImportListItemInfo> { item("", "") });
         Assert($"no refresh when MBIDs are missing (pushed {queue.Pushed.Count})", queue.Pushed.Count == 1);
 
+        // Artist refreshed within the last day -> throttled, no refresh (full discography pulls are heavy).
+        artists.Add(new Artist { Id = 9, Name = "Incubus", ForeignArtistId = "artist-mbid-9", LastInfoSync = DateTime.UtcNow });
+        albums.Add(new Album { ForeignAlbumId = "album-mbid-9", Monitored = false });
+        scheduler.Schedule(new List<ImportListItemInfo> { item("artist-mbid-9", "album-mbid-9") });
+        Assert($"no refresh for an artist refreshed within the last day (pushed {queue.Pushed.Count})", queue.Pushed.Count == 1);
+
+        // Artist last refreshed more than a day ago -> refresh fires.
+        artists.Add(new Artist { Id = 10, Name = "Nirvana", ForeignArtistId = "artist-mbid-10", LastInfoSync = DateTime.UtcNow.AddDays(-2) });
+        albums.Add(new Album { ForeignAlbumId = "album-mbid-10", Monitored = false });
+        scheduler.Schedule(new List<ImportListItemInfo> { item("artist-mbid-10", "album-mbid-10") });
+        Assert($"refresh fires for an artist not refreshed in a day (pushed {queue.Pushed.Count})", queue.Pushed.Count == 2);
+        Assert("targets the stale artist", queue.Pushed[1].ArtistIds.SequenceEqual(new List<int> { 10 }));
+
         artists.Add(new Artist { Id = 5, Name = "Phoenix", ForeignArtistId = "artist-mbid-5" });
         albums.Add(new Album { ForeignAlbumId = "album-mbid-5", Monitored = false });
         scheduler.Schedule(new List<ImportListItemInfo>
@@ -198,11 +211,11 @@ internal static class Program
             item("artist-mbid-1", "album-mbid-1"),
             item("artist-mbid-5", "album-mbid-5")
         });
-        Assert($"second batch pushed one more command (pushed {queue.Pushed.Count})", queue.Pushed.Count == 2);
-        Assert("batches distinct artist ids", queue.Pushed[1].ArtistIds.SequenceEqual(new List<int> { 1, 5 }));
+        Assert($"second batch pushed one more command (pushed {queue.Pushed.Count})", queue.Pushed.Count == 3);
+        Assert("batches distinct artist ids", queue.Pushed[2].ArtistIds.SequenceEqual(new List<int> { 1, 5 }));
 
         scheduler.Schedule(null);
-        Assert($"no command for an empty batch (pushed {queue.Pushed.Count})", queue.Pushed.Count == 2);
+        Assert($"no command for an empty batch (pushed {queue.Pushed.Count})", queue.Pushed.Count == 3);
     }
 
     private static Dictionary<string, string> Links(params (string Site, string Url)[] links)

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using NLog;
@@ -19,8 +20,15 @@ namespace XmPlaylist.ImportLists
     // It runs from within the plugin's Fetch(), which executes inside the ImportListSync command, so
     // the refresh is queued and runs after the sync completes - by which point the album is already
     // monitored, and the refresh + scan picks up that state.
+    //
+    // Full artist refreshes are heavy (they pull the whole MusicBrainz discography), so they're
+    // throttled to at most one per artist per day using Lidarr's own LastInfoSync stamp - set on
+    // every successful artist refresh, including the ones Lidarr's sync already triggers for added
+    // albums.
     public class XmPlaylistRefreshScheduler
     {
+        private static readonly TimeSpan RefreshCooldown = TimeSpan.FromDays(1);
+
         private const string VariousArtistsName = "Various Artists";
 
         private readonly IArtistService _artistService;
@@ -64,6 +72,13 @@ namespace XmPlaylist.ImportLists
 
                 var album = _albumService.FindById(item.AlbumMusicBrainzId);
                 if (album == null || album.Monitored)
+                {
+                    continue;
+                }
+
+                // Skip artists refreshed within the cooldown (including refreshes Lidarr itself
+                // triggered for added albums) so a busy artist isn't refreshed every hour.
+                if (artist.LastInfoSync.HasValue && DateTime.UtcNow - artist.LastInfoSync.Value < RefreshCooldown)
                 {
                     continue;
                 }
