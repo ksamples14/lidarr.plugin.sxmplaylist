@@ -85,9 +85,14 @@ namespace XmPlaylist.ImportLists
                 }
             }
 
-            _refreshScheduler.Schedule(items);
+            // The base-class fetch pipeline normally stamps each item with the list id (and dedupes);
+            // our overridden Fetch() bypasses it, so do it here or ImportListSyncService can't match
+            // the items back to this list.
+            var result = CleanupListItems(items);
 
-            return items;
+            _refreshScheduler.Schedule(result);
+
+            return result;
         }
 
         public override IImportListRequestGenerator GetRequestGenerator()
