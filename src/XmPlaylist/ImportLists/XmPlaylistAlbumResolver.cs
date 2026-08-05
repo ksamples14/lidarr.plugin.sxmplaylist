@@ -32,6 +32,11 @@ namespace XmPlaylist.ImportLists
         private static readonly Regex DeezerTrackId = new(@"deezer\.com/track/(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex AppleAlbumId = new(@"/album/[^/]+/(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // MusicBrainz's entity for the "Various Artists" pseudo-artist that every compilation is
+        // credited to. Compilations are useless for our purpose - a played track should resolve to
+        // the artist's own release, not whichever "Summer Hits" compilation it also appears on.
+        private const string VariousArtistsMbid = "89ad4ac3-39f7-470e-963a-56509c546377";
+
         private static readonly TimeSpan MusicBrainzMinInterval = TimeSpan.FromSeconds(1.1);
         private static readonly int MusicBrainzMaxRetries = 2;
         private static readonly SemaphoreSlim MusicBrainzGate = new(1, 1);
@@ -131,7 +136,10 @@ namespace XmPlaylist.ImportLists
                 $"https://musicbrainz.org/ws/2/recording/{recordingId}?inc=releases+release-groups+artist-credits&fmt=json",
                 musicBrainz: true);
 
-            var releaseGroup = SelectBestReleaseGroup(recording);
+            var artistCredits = recording?["artist-credit"] as JArray;
+            string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
+
+            var releaseGroup = SelectBestReleaseGroup(recording, artistMbid);
             if (releaseGroup == null)
             {
                 return null;
@@ -145,13 +153,10 @@ namespace XmPlaylist.ImportLists
                 return null;
             }
 
-            var artistCredits = recording?["artist-credit"] as JArray;
-            string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
-
             return new AlbumResolution(true, albumTitle, artistMbid, albumMbid);
         }
 
-        private static JToken? SelectBestReleaseGroup(JToken? recording)
+        private static JToken? SelectBestReleaseGroup(JToken? recording, string? recordingArtistId)
         {
             var releases = recording?["releases"] as JArray;
             if (releases == null || releases.Count == 0)
@@ -159,13 +164,64 @@ namespace XmPlaylist.ImportLists
                 return null;
             }
 
-            return releases
+            // Drop compilations outright - a compilation's release-group belongs to Various Artists,
+            // and handing Lidarr that album just attaches the play to VA instead of the real artist.
+            var candidates = releases
                 .Where(r => r["release-group"] != null)
-                .OrderByDescending(r => string.Equals(r["status"]?.Value<string>(), "Official", StringComparison.OrdinalIgnoreCase))
+                .Where(r => !IsVariousArtistsRelease(r))
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            return candidates
+                .OrderByDescending(r => recordingArtistId.IsNotNullOrWhiteSpace() && MatchesRecordingArtist(r, recordingArtistId))
+                .ThenByDescending(r => string.Equals(r["status"]?.Value<string>(), "Official", StringComparison.OrdinalIgnoreCase))
                 .ThenByDescending(r => string.Equals(r["release-group"]?["primary-type"]?.Value<string>(), "Album", StringComparison.OrdinalIgnoreCase))
                 .ThenBy(r => r["release-group"]?["first-release-date"]?.Value<string>() ?? "9999")
                 .Select(r => r["release-group"])
                 .FirstOrDefault();
+        }
+
+        private static bool IsVariousArtistsRelease(JToken release)
+        {
+            var artist = FirstCreditedArtist(release);
+            if (artist == null)
+            {
+                return false;
+            }
+
+            var name = artist["name"]?.Value<string>();
+            var id = artist["id"]?.Value<string>();
+
+            return string.Equals(name, "Various Artists", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(id, VariousArtistsMbid, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool MatchesRecordingArtist(JToken release, string recordingArtistId)
+        {
+            var artist = FirstCreditedArtist(release);
+            return artist != null
+                && string.Equals(artist["id"]?.Value<string>(), recordingArtistId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static JToken? FirstCreditedArtist(JToken release)
+        {
+            var credit = release["artist-credit"] as JArray;
+            if (credit == null || credit.Count == 0)
+            {
+                // Some responses only carry artist info on the release-group itself.
+                credit = release["release-group"]?["artist-credit"] as JArray;
+            }
+
+            if (credit == null || credit.Count == 0)
+            {
+                return null;
+            }
+
+            return credit[0]["artist"];
         }
 
         private AlbumResolution? ResolveViaAppleMusic(IReadOnlyDictionary<string, string> links)

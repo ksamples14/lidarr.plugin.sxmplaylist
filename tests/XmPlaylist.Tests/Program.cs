@@ -35,6 +35,7 @@ internal static class Program
         TestAlbumResolutionViaDeezerAndMusicBrainz();
         TestAlbumResolutionFallsBackToDeezerTitle();
         TestAlbumResolutionFallsBackToAppleMusic();
+        TestAlbumResolutionSkipsVariousArtistsCompilations();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
 
@@ -276,6 +277,43 @@ internal static class Program
 
         Assert("resolved via Apple fallback", resolution.Album == "No Code");
         Assert("no album MBID (Apple path doesn't have one)", resolution.AlbumMusicBrainzId == null);
+    }
+
+    private static void TestAlbumResolutionSkipsVariousArtistsCompilations()
+    {
+        Console.WriteLine("\n[Test] Album resolution skips Various Artists compilations and prefers the artist's own release");
+
+        // Case 1: a VA compilation (Album type) plus the artist's own single -> the artist's own wins.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"va-mbid\",\"name\":\"Various Artists\"}}]," +
+            "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"Summer Hits 2026\",\"primary-type\":\"Album\",\"first-release-date\":\"2026-01-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("artist's own single preferred over VA compilation", resolution.Album == "No Code");
+        Assert("compilation MBID not used", resolution.AlbumMusicBrainzId == "album-mbid-1");
+
+        // Case 2: only VA releases exist -> MusicBrainz path falls through to Deezer's own title.
+        var httpClient2 = new FakeHttpClient();
+        httpClient2.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"No Code\"}}");
+        httpClient2.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-2\"}]}");
+        httpClient2.Respond("musicbrainz.org/ws/2/recording/rec-2",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"va-mbid\",\"name\":\"Various Artists\"}}]," +
+            "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"Summer Hits 2026\",\"primary-type\":\"Album\",\"first-release-date\":\"2026-01-01\"}}]}");
+        var resolver2 = new XmPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
+        var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("falls back to Deezer title when only VA releases exist", resolution2.Album == "No Code");
+        Assert("no compilation MBID used", resolution2.AlbumMusicBrainzId == null);
     }
 
     private static void TestMusicBrainzBusyIsRetried()
