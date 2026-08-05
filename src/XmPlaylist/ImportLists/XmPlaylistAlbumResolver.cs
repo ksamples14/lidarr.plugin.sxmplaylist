@@ -164,11 +164,13 @@ namespace XmPlaylist.ImportLists
                 return null;
             }
 
-            // Drop compilations outright - a compilation's release-group belongs to Various Artists,
-            // and handing Lidarr that album just attaches the play to VA instead of the real artist.
+            // Drop compilations outright - a compilation's release-group belongs to Various Artists
+            // (or a curator/DJ credited as the artist), and handing Lidarr that album just attaches
+            // the play to the wrong artist. Also drop release-groups explicitly typed as compilations.
             var candidates = releases
                 .Where(r => r["release-group"] != null)
                 .Where(r => !IsVariousArtistsRelease(r))
+                .Where(r => !IsCompilationRelease(r))
                 .ToList();
 
             if (candidates.Count == 0)
@@ -183,6 +185,17 @@ namespace XmPlaylist.ImportLists
                 .ThenBy(r => r["release-group"]?["first-release-date"]?.Value<string>() ?? "9999")
                 .Select(r => r["release-group"])
                 .FirstOrDefault();
+        }
+
+        private static bool IsCompilationRelease(JToken release)
+        {
+            var secondaryTypes = release["release-group"]?["secondary-types"] as JArray;
+            if (secondaryTypes == null || secondaryTypes.Count == 0)
+            {
+                return false;
+            }
+
+            return secondaryTypes.Any(t => string.Equals(t.Value<string>(), "Compilation", StringComparison.OrdinalIgnoreCase));
         }
 
         // For a played track, the release that most directly corresponds to it is the single, then
