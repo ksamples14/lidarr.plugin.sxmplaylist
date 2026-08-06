@@ -3,9 +3,9 @@ using System.Collections.Concurrent;
 using System.Threading;
 using NzbDrone.Common.Http;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    public static class XmPlaylistFeedCache
+    public static class SXMPlaylistFeedCache
     {
         private static readonly ConcurrentDictionary<string, CachedResponse> Cache = new(StringComparer.OrdinalIgnoreCase);
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> Locks = new(StringComparer.OrdinalIgnoreCase);

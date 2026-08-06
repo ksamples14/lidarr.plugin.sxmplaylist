@@ -6,11 +6,11 @@ using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Lifecycle;
 using NzbDrone.Core.Messaging.Events;
 using NzbDrone.Core.Plugins;
-using XmPlaylist.ImportLists;
+using SXMPlaylist.ImportLists;
 
-namespace XmPlaylist
+namespace SXMPlaylist
 {
-    public class XmPlaylistPlugin : Plugin,
+    public class SXMPlaylistPlugin : Plugin,
         IHandle<ApplicationStartingEvent>,
         IHandle<ApplicationStartedEvent>,
         IHandle<ApplicationShutdownRequested>
@@ -19,17 +19,17 @@ namespace XmPlaylist
         public override string Owner => PluginInfo.Author;
         public override string GithubUrl => PluginInfo.RepoUrl;
 
-        private readonly XmPlaylistWorker _worker;
+        private readonly SXMPlaylistWorker _worker;
 
         // Constructor injection into the plugin class is the established pattern (see Tubifarry):
         // DryIoc auto-registers every concrete plugin type and resolves it with its dependencies.
-        public XmPlaylistPlugin(
+        public SXMPlaylistPlugin(
             IHttpClient httpClient,
             IAppFolderInfo appFolderInfo,
             IImportListFactory importListFactory,
             Logger logger)
         {
-            _worker = new XmPlaylistWorker(httpClient, appFolderInfo, importListFactory, logger);
+            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, logger);
         }
 
         public void Handle(ApplicationStartingEvent message)
@@ -37,7 +37,7 @@ namespace XmPlaylist
             var config = LogManager.Configuration;
             if (config != null)
             {
-                var rule = new LoggingRule($"XmPlaylist.*", LogLevel.Debug, config.FindTargetByName("file"));
+                var rule = new LoggingRule($"SXMPlaylist.*", LogLevel.Debug, config.FindTargetByName("file"));
                 if (!config.LoggingRules.Contains(rule))
                 {
                     config.LoggingRules.Add(rule);

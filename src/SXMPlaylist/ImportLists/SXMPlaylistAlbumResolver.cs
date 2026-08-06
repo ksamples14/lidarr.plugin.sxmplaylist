@@ -8,26 +8,28 @@ using NLog;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    // xmplaylist only gives a song title, never a real album name. Every play's `links` block
-    // includes per-service URLs for that same track, some of which point at real, free, unauthenticated
-    // catalog data we can use to find the actual album:
-    //
-    //   1. Deezer link -> Deezer's public API, which returns both an ISRC and Deezer's own album
-    //      title in the same call:
-    //        1a. ISRC -> MusicBrainz's exact ISRC lookup -> a real MusicBrainz release-group. This is
-    //            the precise path: an ISRC identifies one specific recording, not a fuzzy text match,
-    //            so we can hand Lidarr real MusicBrainz IDs directly.
-    //        1b. If that MusicBrainz path doesn't pan out (no ISRC, no MB match, no release-group),
-    //            fall back to Deezer's own album title - we already paid for that API call, no reason
-    //            to throw its answer away and spend a second call on Apple before trying it.
-    //   2. Apple Music link -> iTunes Lookup API -> a real album title (no MusicBrainz ID). Used only
-    //      when there's no Deezer link at all, or Deezer's track has no album title either.
-    //
-    // Results are cached by the caller (XmPlaylistHistoryStore, keyed by track id) since the same
-    // song replays constantly on a rotation-heavy station and its album never changes between plays.
-    public class XmPlaylistAlbumResolver
+    /// <summary>
+    /// xmplaylist only gives a song title, never a real album name. Every play's `links` block
+    /// includes per-service URLs for that same track, some of which point at real, free, unauthenticated
+    /// catalog data we can use to find the actual album:
+    /// 
+    /// 1. Deezer link -> Deezer's public API, which returns both an ISRC and Deezer's own album
+    /// title in the same call:
+    /// 1a. ISRC -> MusicBrainz's exact ISRC lookup -> a real MusicBrainz release-group. This is
+    /// the precise path: an ISRC identifies one specific recording, not a fuzzy text match,
+    /// so we can hand Lidarr real MusicBrainz IDs directly.
+    /// 1b. If that MusicBrainz path doesn't pan out (no ISRC, no MB match, no release-group),
+    /// fall back to Deezer's own album title - we already paid for that API call, no reason
+    /// to throw its answer away and spend a second call on Apple before trying it.
+    /// 2. Apple Music link -> iTunes Lookup API -> a real album title (no MusicBrainz ID). Used only
+    /// when there's no Deezer link at all, or Deezer's track has no album title either.
+    /// 
+    /// Results are cached by the caller (SXMPlaylistHistoryStore, keyed by track id) since the same
+    /// song replays constantly on a rotation-heavy station and its album never changes between plays.
+    /// </summary>
+    public class SXMPlaylistAlbumResolver
     {
         private static readonly Regex DeezerTrackId = new(@"deezer\.com/track/(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex AppleAlbumId = new(@"/album/[^/]+/(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -45,12 +47,12 @@ namespace XmPlaylist.ImportLists
         // Only touched when a retry fires; small enough to keep tests fast.
         internal static TimeSpan MusicBrainzRetryBackoff = TimeSpan.FromSeconds(2);
 
-        private const string UserAgent = "XmPlaylist-Lidarr-Plugin/1.0 (https://github.com/ksamples14/lidarr.plugin.xmplaylist)";
+        private const string UserAgent = "SXMPlaylist-Lidarr-Plugin/1.0 (https://github.com/ksamples14/lidarr.plugin.xmplaylist)";
 
         private readonly IHttpClient _httpClient;
         private readonly Logger _logger;
 
-        public XmPlaylistAlbumResolver(IHttpClient httpClient, Logger logger)
+        public SXMPlaylistAlbumResolver(IHttpClient httpClient, Logger logger)
         {
             _httpClient = httpClient;
             _logger = logger;
@@ -226,8 +228,13 @@ namespace XmPlaylist.ImportLists
                 || string.Equals(id, VariousArtistsMbid, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static bool MatchesRecordingArtist(JToken release, string recordingArtistId)
+        private static bool MatchesRecordingArtist(JToken release, string? recordingArtistId)
         {
+            if (recordingArtistId.IsNullOrWhiteSpace())
+            {
+                return false;
+            }
+
             var artist = FirstCreditedArtist(release);
             return artist != null
                 && string.Equals(artist["id"]?.Value<string>(), recordingArtistId, StringComparison.OrdinalIgnoreCase);

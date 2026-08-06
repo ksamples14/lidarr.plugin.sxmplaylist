@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore SXMPlaylist.sln
+
+      - name: Build
+        run: dotnet build SXMPlaylist.sln -c Release -p:EnableAnalyzers=false
+
+      - name: Test
+        run: dotnet run --project tests/SXMPlaylist.Tests/SXMPlaylist.Tests.csproj

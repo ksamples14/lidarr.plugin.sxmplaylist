@@ -6,12 +6,14 @@ using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.ImportLists;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    // xmplaylist's station endpoint only returns ~24 plays per page (a few minutes of history),
-    // far short of the 6-hour poll interval. Walk its `next` cursor backwards until the page's
-    // oldest play crosses the poll window, then hand the parser one merged result set.
-    public static class XmPlaylistStationBackfill
+    /// <summary>
+    /// xmplaylist's station endpoint only returns ~24 plays per page (a few minutes of history),
+    /// far short of the 6-hour poll interval. Walk its `next` cursor backwards until the page's
+    /// oldest play crosses the poll window, then hand the parser one merged result set.
+    /// </summary>
+    public static class SXMPlaylistStationBackfill
     {
         public const int MaxPages = 50;
 
@@ -47,7 +49,7 @@ namespace XmPlaylist.ImportLists
                     break;
                 }
 
-                currentRequest = XmPlaylistRequestBuilder.Build(nextUrl!);
+                currentRequest = SXMPlaylistRequestBuilder.Build(nextUrl!);
             }
 
             var mergedContent = new JObject

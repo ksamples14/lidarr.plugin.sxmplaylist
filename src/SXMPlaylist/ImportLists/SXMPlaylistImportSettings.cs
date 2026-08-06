@@ -3,11 +3,11 @@ using NzbDrone.Core.Annotations;
 using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Validation;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    public class XmPlaylistImportSettingsValidator : AbstractValidator<XmPlaylistImportSettings>
+    public class SXMPlaylistImportSettingsValidator : AbstractValidator<SXMPlaylistImportSettings>
     {
-        public XmPlaylistImportSettingsValidator()
+        public SXMPlaylistImportSettingsValidator()
         {
             RuleFor(c => c.Channel)
                 .NotEmpty()
@@ -15,11 +15,13 @@ namespace XmPlaylist.ImportLists
         }
     }
 
-    public class XmPlaylistImportSettings : IImportListSettings
+    public class SXMPlaylistImportSettings : IImportListSettings
     {
-        private static readonly XmPlaylistImportSettingsValidator Validator = new();
+        private static readonly SXMPlaylistImportSettingsValidator Validator = new();
 
-        public XmPlaylistImportSettings()
+        public const string PluginName = "SXM Playlist";
+
+        public SXMPlaylistImportSettings()
         {
             BaseUrl = "https://xmplaylist.com";
             Channel = "";

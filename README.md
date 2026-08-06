@@ -1,15 +1,15 @@
-# Lidarr.Plugin.XmPlaylist
+# Lidarr.Plugin.SXMPlaylist
 
 A Lidarr import list plugin that discovers artists from the [xmplaylist.com](https://xmplaylist.com) SiriusXM radio play feed and adds them to your Lidarr library.
 
 ## How It Works
 
-The plugin is split into a background worker and a thin import-list shell. The worker runs continuously from Lidarr startup, watches Lidarr's import-list definitions for XM Playlist channels, and does all the downloading and album resolution. The import lists only query the local database for what's ready and hand it to Lidarr.
+The plugin is split into a background worker and a thin import-list shell. The worker runs continuously from Lidarr startup, watches Lidarr's import-list definitions for SXM Playlist channels, and does all the downloading and album resolution. The import lists only query the local database for what's ready and hand it to Lidarr.
 
 1. **Capture (hourly, per channel).** The worker downloads `https://xmplaylist.com/api/station/{channel}` for every configured channel that hasn't been captured in the last hour. The endpoint only returns ~24 plays (a few minutes of history) per page, so each capture walks the API's `next` cursor backwards, merging pages until it has covered a ~2-hour window (slightly wider than the hourly cadence to absorb a missed poll; capped at 50 pages).
 2. **Record.** Every play is appended to a local SQLite history database (artist, song, channel, timestamp) — see [Play History](#play-history) below. Exact duplicates are ignored. Each new play also registers a per-track row holding the resolution inputs (artist, song, Deezer/Apple links).
 3. **Resolve (background).** The worker resolves due tracks' albums against Deezer/MusicBrainz/Apple (see [Album Resolution](#album-resolution) below), retrying each track up to 3 times before giving up. This runs in the background at MusicBrainz's 1 req/s, decoupled from any import-list fetch.
-4. **Present (hourly).** Each XM Playlist import list's `Fetch()` is a pure DB query: resolved tracks for its channel that fell within the last 25 hours, capped at 20 per fetch. It returns those to Lidarr, which resolves the artists/albums and adds them to your library. Lidarr's import-list processing is idempotent, so the same track being returned across a few hourly fetches is harmless.
+4. **Present (hourly).** Each SXM Playlist import list's `Fetch()` is a pure DB query: resolved tracks for its channel that fell within the last 25 hours, capped at 20 per fetch. It returns those to Lidarr, which resolves the artists/albums and adds them to your library. Lidarr's import-list processing is idempotent, so the same track being returned across a few hourly fetches is harmless.
 5. When an album is added or newly monitored for an artist already in your library, the plugin queues a Lidarr **Refresh & Scan** for that artist so the change is picked up immediately (Lidarr already refresh-scans brand-new artists on its own).
 
 ## Album Resolution
@@ -40,7 +40,7 @@ Resolution runs entirely in the background worker, so there is no per-fetch time
 ### After Installation
 
 1. Go to **Settings → Import Lists → Add (+)**
-2. Select **XM Playlist** from the list
+2. Select **SXM Playlist** from the list
 3. The import list modal shows three sections:
    - **General Import List Settings** — name, enable, etc. (provided by Lidarr)
    - **Added Artist Settings** — monitor, search, quality/metadata profile, root folder (provided by Lidarr)
@@ -67,7 +67,7 @@ The fetched list is cached (in the same history database) rather than re-fetched
 
 ## Play History
 
-The plugin keeps a local SQLite database (`Lidarr/AppData/XmPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album + MusicBrainz IDs once resolved, and a 3-strike failure counter) and a per-channel "last captured" marker. This does three things:
+The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album + MusicBrainz IDs once resolved, and a 3-strike failure counter) and a per-channel "last captured" marker. This does three things:
 
 - **Dedup** — a play is only recorded the first time its (play ID + artist) pair is seen, so overlapping ~2-hour capture windows never duplicate.
 - **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks become presentable to Lidarr for the next 25 hours.
@@ -88,9 +88,9 @@ The plugin references the **exact Lidarr DLLs from your running Lidarr instance*
 ```powershell
 git clone --recursive https://github.com/ksamples14/lidarr.plugin.xmplaylist.git
 cd lidarr.plugin.xmplaylist
-dotnet restore XmPlaylist.sln
-dotnet build XmPlaylist.sln -c Release -p:EnableAnalyzers=false
-dotnet run --project tests/XmPlaylist.Tests/XmPlaylist.Tests.csproj
+dotnet restore SXMPlaylist.sln
+dotnet build SXMPlaylist.sln -c Release -p:EnableAnalyzers=false
+dotnet run --project tests/SXMPlaylist.Tests/SXMPlaylist.Tests.csproj
 ```
 
 > `-p:EnableAnalyzers=false` avoids StyleCop/TreatWarningsAsErrors issues from Lidarr's build props.
@@ -100,36 +100,36 @@ dotnet run --project tests/XmPlaylist.Tests/XmPlaylist.Tests.csproj
 >
 > `lib/System.Data.SQLite.dll` is the one exception — it doesn't need to come from your container. Lidarr pins `System.Data.SQLite` version `2.0.3` (see `Submodules/Lidarr/src/NzbDrone.Common/Lidarr.Common.csproj`), a normal NuGet package, so you can pull the exact same file from your NuGet cache (`~/.nuget/packages/system.data.sqlite/2.0.3/lib/netstandard2.0/System.Data.SQLite.dll`) instead of extracting it from Docker. Only re-check this if Lidarr ever bumps that package version.
 
-Output: `src/XmPlaylist/bin/Release/net8.0/Lidarr.Plugin.XmPlaylist.dll` (single merged DLL via ILRepack)
+Output: `src/SXMPlaylist/bin/Release/net8.0/Lidarr.Plugin.SXMPlaylist.dll` (single merged DLL via ILRepack)
 
 ## Project Structure
 
 ```
 lidarr.plugin.xmplaylist/
 ├── lib/                                    # Lidarr DLLs from your running instance (version-matched)
-├── src/XmPlaylist/
-│   ├── XmPlaylist.csproj                   # References lib/*.dll (Reference, Private=false)
+├── src/SXMPlaylist/
+│   ├── SXMPlaylist.csproj                   # References lib/*.dll (Reference, Private=false)
 │   ├── ILRepack.targets                    # Merges plugin into single DLL
 │   ├── Plugin.cs                            # IPlugin entry point; hosts the background worker
 │   ├── PluginInfo.cs                        # Plugin metadata constants
 │   ├── PluginInfo.targets                   # Version/build metadata properties
 │   ├── PreBuild.targets                     # Lidarr submodule init (IDE only)
 │   └── ImportLists/
-│       ├── XmPlaylistImport.cs                # thin HttpImportListBase; Fetch() queries the DB
-│       ├── XmPlaylistImportSettings.cs        # [FieldDefinition] + validation
-│       ├── XmPlaylistWorker.cs                # background worker: capture + resolve + prune
-│       ├── XmPlaylistRequestGenerator.cs      # /api/station/{channel} request builder
-│       ├── XmPlaylistRequestBuilder.cs        # shared HttpRequest construction (headers)
-│       ├── XmPlaylistStationBackfill.cs       # cursor pagination to cover the capture window
-│       ├── XmPlaylistFeed.cs                  # xmplaylist feed JSON models
-│       ├── XmPlaylistHistoryStore.cs          # SQLite: plays, tracks, channel state (WAL)
-│       ├── XmPlaylistAlbumResolver.cs         # Deezer/MusicBrainz/Apple album lookup
-│       ├── XmPlaylistRefreshScheduler.cs      # RefreshArtistCommand after newly-monitored albums
-│       ├── XmPlaylistChannelDirectory.cs      # /api/station channel list lookup
-│       └── XmPlaylistFeedCache.cs            # shared in-process HTTP cache (limits API hits)
-├── tests/XmPlaylist.Tests/                    # worker, history-store, backfill, resolver, and scheduler tests
+│       ├── SXMPlaylistImport.cs                # thin HttpImportListBase; Fetch() queries the DB
+│       ├── SXMPlaylistImportSettings.cs        # [FieldDefinition] + validation
+│       ├── SXMPlaylistWorker.cs                # background worker: capture + resolve + prune
+│       ├── SXMPlaylistRequestGenerator.cs      # /api/station/{channel} request builder
+│       ├── SXMPlaylistRequestBuilder.cs        # shared HttpRequest construction (headers)
+│       ├── SXMPlaylistStationBackfill.cs       # cursor pagination to cover the capture window
+│       ├── SXMPlaylistFeed.cs                  # xmplaylist feed JSON models
+│       ├── SXMPlaylistHistoryStore.cs          # SQLite: plays, tracks, channel state (WAL)
+│       ├── SXMPlaylistAlbumResolver.cs         # Deezer/MusicBrainz/Apple album lookup
+│       ├── SXMPlaylistRefreshScheduler.cs      # RefreshArtistCommand after newly-monitored albums
+│       ├── SXMPlaylistChannelDirectory.cs      # /api/station channel list lookup
+│       └── SXMPlaylistFeedCache.cs            # shared in-process HTTP cache (limits API hits)
+├── tests/SXMPlaylist.Tests/                    # worker, history-store, backfill, resolver, and scheduler tests
 ├── Submodules/Lidarr/                         # Lidarr source (git submodule)
-└── XmPlaylist.sln
+└── SXMPlaylist.sln
 ```
 
 ## API Usage Notes

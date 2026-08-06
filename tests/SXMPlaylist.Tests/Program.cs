@@ -15,7 +15,7 @@ using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Music;
 using NzbDrone.Core.Music.Commands;
 using NzbDrone.Core.Parser.Model;
-using XmPlaylist.ImportLists;
+using SXMPlaylist.ImportLists;
 
 internal static class Program
 {
@@ -23,7 +23,7 @@ internal static class Program
 
     public static void Main()
     {
-        Console.WriteLine("=== XmPlaylist Tests ===");
+        Console.WriteLine("=== SXMPlaylist Tests ===");
 
         TestBackfillStopsAtCutoff();
         TestBackfillStopsAtMaxPages();
@@ -77,7 +77,7 @@ internal static class Program
         };
 
         var request = BuildRequest("https://xmplaylist.com/api/station/altnation");
-        var response = XmPlaylistStationBackfill.Fetch(request, TimeSpan.FromHours(6), fetchPage);
+        var response = SXMPlaylistStationBackfill.Fetch(request, TimeSpan.FromHours(6), fetchPage);
 
         Assert($"stops after page 2, not fetching page 3 (fetched {fetchCount} pages)", fetchCount == 2);
         Assert("merges results from both fetched pages", response.HttpResponse.Content.Contains("\"count\":4"));
@@ -96,9 +96,9 @@ internal static class Program
         };
 
         var request = BuildRequest("https://xmplaylist.com/api/station/altnation");
-        XmPlaylistStationBackfill.Fetch(request, TimeSpan.FromDays(30), fetchPage);
+        SXMPlaylistStationBackfill.Fetch(request, TimeSpan.FromDays(30), fetchPage);
 
-        Assert($"never exceeds MaxPages (fetched {fetchCount}, cap {XmPlaylistStationBackfill.MaxPages})", fetchCount == XmPlaylistStationBackfill.MaxPages);
+        Assert($"never exceeds MaxPages (fetched {fetchCount}, cap {SXMPlaylistStationBackfill.MaxPages})", fetchCount == SXMPlaylistStationBackfill.MaxPages);
     }
 
     private static void TestChannelDirectoryFetchesAndParses()
@@ -110,7 +110,7 @@ internal static class Program
             "{\"deeplink\":\"altnation\",\"name\":\"Alt Nation\",\"number\":\"36\"}," +
             "{\"deeplink\":\"thespectrum\",\"name\":\"The Spectrum\",\"number\":\"28\"}]}");
 
-        var channels = XmPlaylistChannelDirectory.Fetch(httpClient, "https://xmplaylist.com");
+        var channels = SXMPlaylistChannelDirectory.Fetch(httpClient, "https://xmplaylist.com");
 
         Assert($"parses both channels (got {channels.Count})", channels.Count == 2);
         Assert("has altnation with the right name/number", channels.Any(c => c.Deeplink == "altnation" && c.Name == "Alt Nation" && c.Number == "36"));
@@ -143,8 +143,8 @@ internal static class Program
     {
         Console.WriteLine("\n[Test] Settings validation requires a channel to be selected");
 
-        var none = new XmPlaylistImportSettings { Channel = "" };
-        var one = new XmPlaylistImportSettings { Channel = "altnation" };
+        var none = new SXMPlaylistImportSettings { Channel = "" };
+        var one = new SXMPlaylistImportSettings { Channel = "altnation" };
 
         Assert("empty channel fails validation", !none.Validate().IsValid);
         Assert("a selected channel passes validation", one.Validate().IsValid);
@@ -157,7 +157,7 @@ internal static class Program
         var artists = new FakeArtistService();
         var albums = new FakeAlbumService();
         var queue = new FakeCommandQueue();
-        var scheduler = new XmPlaylistRefreshScheduler(artists, albums, queue, LogManager.GetLogger("Test"));
+        var scheduler = new SXMPlaylistRefreshScheduler(artists, albums, queue, LogManager.GetLogger("Test"));
 
         artists.Add(new Artist { Id = 1, Name = "Kid Sistr", ForeignArtistId = "artist-mbid-1" });
         artists.Add(new Artist { Id = 2, Name = "Various Artists", ForeignArtistId = "va-mbid" });
@@ -242,7 +242,7 @@ internal static class Program
             "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
 
-        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
         var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("resolved to a real title", resolution.Album == "No Code");
@@ -258,7 +258,7 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         httpClient.Respond("api.deezer.com/track/624510", "{\"album\":{\"title\":\"No Code\"}}");
 
-        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
         var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("falls back to Deezer's own album title", resolution.Album == "No Code");
@@ -273,7 +273,7 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"No Code\"}]}");
 
-        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
         var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507")));
 
         Assert("resolved via Apple fallback", resolution.Album == "No Code");
@@ -296,7 +296,7 @@ internal static class Program
             "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
             "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-08-14\"}}]}");
 
-        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
         var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("artist's own single preferred over VA compilation", resolution.Album == "No Code");
@@ -310,7 +310,7 @@ internal static class Program
             "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
             "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"va-mbid\",\"name\":\"Various Artists\"}}]," +
             "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"Summer Hits 2026\",\"primary-type\":\"Album\",\"first-release-date\":\"2026-01-01\"}}]}");
-        var resolver2 = new XmPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
+        var resolver2 = new SXMPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
         var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("falls back to Deezer title when only VA releases exist", resolution2.Album == "No Code");
@@ -335,7 +335,7 @@ internal static class Program
             "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
             "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}]}");
 
-        var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
         var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("single preferred over EP and album", resolution.Album == "The Single");
@@ -352,7 +352,7 @@ internal static class Program
             "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}," +
             "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
             "\"release-group\":{\"id\":\"ep-mbid\",\"title\":\"The EP\",\"primary-type\":\"EP\",\"first-release-date\":\"1996-07-01\"}}]}");
-        var resolver2 = new XmPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
+        var resolver2 = new SXMPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
         var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("EP preferred over album when no single exists", resolution2.Album == "The EP");
@@ -371,11 +371,11 @@ internal static class Program
             "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
             "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
 
-        var originalBackoff = XmPlaylistAlbumResolver.MusicBrainzRetryBackoff;
-        XmPlaylistAlbumResolver.MusicBrainzRetryBackoff = TimeSpan.Zero;
+        var originalBackoff = SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff;
+        SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = TimeSpan.Zero;
         try
         {
-            var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+            var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
             var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
             Assert("album resolved after retrying the busy MusicBrainz response", resolution.Album == "No Code");
@@ -383,7 +383,7 @@ internal static class Program
         }
         finally
         {
-            XmPlaylistAlbumResolver.MusicBrainzRetryBackoff = originalBackoff;
+            SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = originalBackoff;
         }
     }
 
@@ -398,11 +398,11 @@ internal static class Program
             (HttpStatusCode.ServiceUnavailable, "{}"),
             (HttpStatusCode.ServiceUnavailable, "{}"));
 
-        var originalBackoff = XmPlaylistAlbumResolver.MusicBrainzRetryBackoff;
-        XmPlaylistAlbumResolver.MusicBrainzRetryBackoff = TimeSpan.Zero;
+        var originalBackoff = SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff;
+        SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = TimeSpan.Zero;
         try
         {
-            var resolver = new XmPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+            var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
             var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
             Assert("not resolved after repeated 503s", resolution.Album == null);
@@ -410,7 +410,7 @@ internal static class Program
         }
         finally
         {
-            XmPlaylistAlbumResolver.MusicBrainzRetryBackoff = originalBackoff;
+            SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = originalBackoff;
         }
     }
 
@@ -439,10 +439,10 @@ internal static class Program
 
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1"), now);
 
-        var presentable = store.GetPresentableTracks("altnation", now - XmPlaylistHistoryStore.PresentationWindow, 10);
+        var presentable = store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 10);
         Assert("resolved track is presentable", presentable.Count == 1 && presentable[0].Album == "No Code");
         Assert("artist MBID carried for single-artist track", presentable[0].ArtistMusicBrainzId == "artist-mbid-1");
-        Assert("not presentable for another channel", store.GetPresentableTracks("lithium", now - XmPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
+        Assert("not presentable for another channel", store.GetPresentableTracks("lithium", now - SXMPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
     }
 
     private static void TestStoreThreeStrikesExcludesTrack()
@@ -468,9 +468,9 @@ internal static class Program
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now - XmPlaylistHistoryStore.PresentationWindow - TimeSpan.FromMinutes(1));
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now - SXMPlaylistHistoryStore.PresentationWindow - TimeSpan.FromMinutes(1));
 
-        Assert("old resolution is no longer presentable", store.GetPresentableTracks("altnation", now - XmPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
+        Assert("old resolution is no longer presentable", store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
     }
 
     private static void TestStorePruneRemovesOldData()
@@ -478,7 +478,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Prune drops plays and tracks older than the retention window");
 
         var store = NewHistoryStore();
-        var old = DateTime.UtcNow - XmPlaylistHistoryStore.PlayRetention - TimeSpan.FromDays(1);
+        var old = DateTime.UtcNow - SXMPlaylistHistoryStore.PlayRetention - TimeSpan.FromDays(1);
         var fresh = DateTime.UtcNow;
 
         store.TryRecordPlay("oldPlay", "altnation", "Old Artist", "Old Song", old);
@@ -498,7 +498,7 @@ internal static class Program
     {
         Console.WriteLine("\n[Test] Worker captures a channel that has never been captured");
 
-        XmPlaylistFeedCache.Clear();
+        SXMPlaylistFeedCache.Clear();
         var folder = NewFolder();
         var httpClient = new FakeHttpClient();
         httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "Song A", Array.Empty<(string, string)>())));
@@ -506,10 +506,10 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new XmPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
-        var store = new XmPlaylistHistoryStore(folder);
+        var store = new SXMPlaylistHistoryStore(folder);
         Assert("play was recorded", store.GetPlays("altnation", DateTime.MinValue).Count == 1);
         Assert("last capture recorded", store.GetLastCaptureUtc("altnation") != null);
         Assert("one feed request made", httpClient.CallCount == 1);
@@ -519,7 +519,7 @@ internal static class Program
     {
         Console.WriteLine("\n[Test] Worker skips a channel whose capture is not due yet");
 
-        XmPlaylistFeedCache.Clear();
+        SXMPlaylistFeedCache.Clear();
         var folder = NewFolder();
         var httpClient = new FakeHttpClient();
         httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "Song A", Array.Empty<(string, string)>())));
@@ -527,7 +527,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new XmPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
         var callsAfterFirst = httpClient.CallCount;
         worker.RunOnce(CancellationToken.None);
@@ -539,7 +539,7 @@ internal static class Program
     {
         Console.WriteLine("\n[Test] Worker resolves captured tracks and they become presentable");
 
-        XmPlaylistFeedCache.Clear();
+        SXMPlaylistFeedCache.Clear();
         var folder = NewFolder();
         var httpClient = new FakeHttpClient();
         httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "I'm Open", new[] { ("deezer", "https://www.deezer.com/track/624510") })));
@@ -552,11 +552,11 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new XmPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
-        var store = new XmPlaylistHistoryStore(folder);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - XmPlaylistHistoryStore.PresentationWindow, 10);
+        var store = new SXMPlaylistHistoryStore(folder);
+        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10);
 
         Assert("captured + resolved track is presentable", presentable.Count == 1);
         Assert("correct album resolved", presentable[0].Album == "No Code");
@@ -568,16 +568,16 @@ internal static class Program
     {
         Console.WriteLine("\n[Test] Worker does nothing when no XM Playlist channels are configured");
 
-        XmPlaylistFeedCache.Clear();
+        SXMPlaylistFeedCache.Clear();
         var folder = NewFolder();
         var httpClient = new FakeHttpClient();
         var factory = new FakeImportListFactory();
 
-        var worker = new XmPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         Assert("no HTTP requests made", httpClient.CallCount == 0);
-        var store = new XmPlaylistHistoryStore(folder);
+        var store = new SXMPlaylistHistoryStore(folder);
         Assert("no plays recorded", store.GetPlays("altnation", DateTime.MinValue).Count == 0);
     }
 
@@ -596,9 +596,9 @@ internal static class Program
         return $"{{\"count\":{entries.Count},\"next\":null,\"previous\":null,\"results\":[{string.Join(",", entries)}]}}";
     }
 
-    private static XmPlaylistHistoryStore NewHistoryStore()
+    private static SXMPlaylistHistoryStore NewHistoryStore()
     {
-        return new XmPlaylistHistoryStore(NewFolder());
+        return new SXMPlaylistHistoryStore(NewFolder());
     }
 
     private static FakeAppFolderInfo NewFolder()
@@ -827,9 +827,9 @@ internal class FakeImportListFactory : IImportListFactory
     {
         _definitions.Add(new ImportListDefinition
         {
-            Implementation = "XmPlaylistImport",
+            Implementation = "SXMPlaylistImport",
             EnableAutomaticAdd = true,
-            Settings = new XmPlaylistImportSettings { Channel = channel }
+            Settings = new SXMPlaylistImportSettings { Channel = channel }
         });
     }
 

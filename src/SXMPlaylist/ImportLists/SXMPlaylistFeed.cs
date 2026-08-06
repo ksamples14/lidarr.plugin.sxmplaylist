@@ -2,10 +2,12 @@ using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    // xmplaylist's feed shape. Parsed by the background worker when it captures a channel; the
-    // import lists no longer touch the feed directly.
+    /// <summary>
+    /// xmplaylist's feed shape. Parsed by the background worker when it captures a channel; the
+    /// import lists no longer touch the feed directly.
+    /// </summary>
     internal class XmFeedResponse
     {
         public int Count { get; set; }

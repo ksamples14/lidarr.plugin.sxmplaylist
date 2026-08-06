@@ -4,17 +4,19 @@ using Newtonsoft.Json.Linq;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    // xmplaylist's own frontend derives its channel picker from `/api/station` (no channel
-    // suffix - distinct from the per-channel `/api/station/{channel}` play endpoint). It's the
-    // only place the full SiriusXM channel lineup (deeplink/name/number) is available; free,
-    // unauthenticated, same as the other endpoints this plugin uses.
-    public static class XmPlaylistChannelDirectory
+    /// <summary>
+    /// xmplaylist's own frontend derives its channel picker from `/api/station` (no channel
+    /// suffix - distinct from the per-channel `/api/station/{channel}` play endpoint). It's the
+    /// only place the full SiriusXM channel lineup (deeplink/name/number) is available; free,
+    /// unauthenticated, same as the other endpoints this plugin uses.
+    /// </summary>
+    public static class SXMPlaylistChannelDirectory
     {
         public static IReadOnlyList<ChannelInfo> Fetch(IHttpClient httpClient, string baseUrl)
         {
-            var request = XmPlaylistRequestBuilder.Build($"{baseUrl.TrimEnd('/')}/api/station");
+            var request = SXMPlaylistRequestBuilder.Build($"{baseUrl.TrimEnd('/')}/api/station");
             var response = httpClient.Get(request);
 
             if (response.StatusCode != System.Net.HttpStatusCode.OK || response.Content.IsNullOrWhiteSpace())

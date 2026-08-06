@@ -2,8 +2,9 @@
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <TargetFramework>net8.0</TargetFramework>
-    <RootNamespace>XmPlaylist</RootNamespace>
-    <AssemblyName>Lidarr.Plugin.XmPlaylist</AssemblyName>
+    <RootNamespace>SXMPlaylist</RootNamespace>
+    <AssemblyName>Lidarr.Plugin.SXMPlaylist</AssemblyName>
+    <Nullable>enable</Nullable>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <InformationalVersion>1.0.0</InformationalVersion>

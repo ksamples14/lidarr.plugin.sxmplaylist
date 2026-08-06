@@ -5,22 +5,24 @@ using System.IO;
 using Newtonsoft.Json;
 using NzbDrone.Common.EnvironmentInfo;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    // Persistent play history, shared across all XmPlaylist lists in this Lidarr instance.
-    // Backed by SQLite via the same System.Data.SQLite assembly Lidarr itself ships (see lib/),
-    // so no extra native binary is bundled with the plugin.
-    //
-    // The DB is the source of truth for the whole plugin:
-    //   - Plays: a rolling record of every play seen, deduped by (PlayId, Artist). Kept for the
-    //     retention window as the history source (and future Plex-playlist feature).
-    //   - Tracks: one row per xmplaylist track id, holding the resolution inputs (artist(s), song,
-    //     Deezer/Apple links), the resolution result (album + MusicBrainz IDs) once resolved, a
-    //     strike counter (3 failures = give up), and the resolve time (drives the presentation
-    //     time-window).
-    //   - ChannelState: when each channel was last captured, so the background worker knows when a
-    //     channel is due for its hourly download.
-    public class XmPlaylistHistoryStore
+    /// <summary>
+    /// Persistent play history, shared across all SXMPlaylist lists in this Lidarr instance.
+    /// Backed by SQLite via the same System.Data.SQLite assembly Lidarr itself ships (see lib/),
+    /// so no extra native binary is bundled with the plugin.
+    /// 
+    /// The DB is the source of truth for the whole plugin:
+    /// - Plays: a rolling record of every play seen, deduped by (PlayId, Artist). Kept for the
+    /// retention window as the history source (and future Plex-playlist feature).
+    /// - Tracks: one row per xmplaylist track id, holding the resolution inputs (artist(s), song,
+    /// Deezer/Apple links), the resolution result (album + MusicBrainz IDs) once resolved, a
+    /// strike counter (3 failures = give up), and the resolve time (drives the presentation
+    /// time-window).
+    /// - ChannelState: when each channel was last captured, so the background worker knows when a
+    /// channel is due for its hourly download.
+    /// </summary>
+    public class SXMPlaylistHistoryStore
     {
         public static readonly TimeSpan PlayRetention = TimeSpan.FromDays(180);
         public static readonly TimeSpan CaptureInterval = TimeSpan.FromHours(1);
@@ -29,9 +31,9 @@ namespace XmPlaylist.ImportLists
 
         private readonly string _connectionString;
 
-        public XmPlaylistHistoryStore(IAppFolderInfo appFolderInfo)
+        public SXMPlaylistHistoryStore(IAppFolderInfo appFolderInfo)
         {
-            var folder = Path.Combine(appFolderInfo.AppDataFolder, "XmPlaylist");
+            var folder = Path.Combine(appFolderInfo.AppDataFolder, "SXMPlaylist");
             Directory.CreateDirectory(folder);
 
             var dbPath = Path.Combine(folder, "history.db");

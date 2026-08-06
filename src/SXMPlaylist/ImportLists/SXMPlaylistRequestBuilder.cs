@@ -1,13 +1,13 @@
 using NzbDrone.Common.Http;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    internal static class XmPlaylistRequestBuilder
+    internal static class SXMPlaylistRequestBuilder
     {
         public static HttpRequest Build(string url)
         {
             var request = new HttpRequest(url, HttpAccept.Json);
-            request.Headers.Add("User-Agent", "XmPlaylist-Lidarr-Plugin/1.0");
+            request.Headers.Add("User-Agent", "SXMPlaylist-Lidarr-Plugin/1.0");
             return request;
         }
     }

@@ -13,22 +13,34 @@ using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Music;
 using NzbDrone.Core.Parser;
 using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.ThingiProvider;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    // Thin import-list shell. All downloading, recording and album resolution happens in the
-    // background XmPlaylistWorker; Fetch() is just a DB query for this channel's resolved tracks
-    // within the presentation window. Lidarr's import-list processing is idempotent, so returning
-    // the same resolved track across hourly fetches is harmless.
-    public class XmPlaylistImport : HttpImportListBase<XmPlaylistImportSettings>
+    /// <summary>
+    /// Import list that discovers artists from the xmplaylist.com SiriusXM play feed.
+    ///
+    /// This is a thin shell: all downloading, recording and album resolution happens in the
+    /// background <see cref="SXMPlaylistWorker"/>; <see cref="Fetch"/> is just a DB query for this
+    /// channel's resolved tracks within the presentation window. Lidarr's import-list processing is
+    /// idempotent, so returning the same resolved track across hourly fetches is harmless.
+    /// </summary>
+    public class SXMPlaylistImport : HttpImportListBase<SXMPlaylistImportSettings>
     {
         private static readonly TimeSpan ChannelCacheLifetime = TimeSpan.FromHours(24);
         private const int MaxItemsPerFetch = 20;
 
-        private readonly XmPlaylistHistoryStore _historyStore;
-        private readonly XmPlaylistRefreshScheduler _refreshScheduler;
+        private readonly SXMPlaylistHistoryStore _historyStore;
+        private readonly SXMPlaylistRefreshScheduler _refreshScheduler;
 
-        public override string Name => "XM Playlist";
+        public override string Name => "SXM Playlist";
+
+        public override ProviderMessage Message => new(
+            "Album resolution runs in the background and is throttled to MusicBrainz's " +
+            "1 request/second limit, so a brand-new channel populates gradually rather than " +
+            "all at once. See: https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting",
+            ProviderMessageType.Warning
+        );
 
         public override ImportListType ListType => ImportListType.Other;
 
@@ -36,7 +48,7 @@ namespace XmPlaylist.ImportLists
 
         public override int PageSize => 1000;
 
-        public XmPlaylistImport(
+        public SXMPlaylistImport(
             IHttpClient httpClient,
             IImportListStatusService importListStatusService,
             IConfigService configService,
@@ -48,8 +60,8 @@ namespace XmPlaylist.ImportLists
             Logger logger)
             : base(httpClient, importListStatusService, configService, parsingService, logger)
         {
-            _historyStore = new XmPlaylistHistoryStore(appFolderInfo);
-            _refreshScheduler = new XmPlaylistRefreshScheduler(artistService, albumService, commandQueueManager, logger);
+            _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
+            _refreshScheduler = new SXMPlaylistRefreshScheduler(artistService, albumService, commandQueueManager, logger);
         }
 
         public override IList<ImportListItemInfo> Fetch()
@@ -60,7 +72,7 @@ namespace XmPlaylist.ImportLists
                 return new List<ImportListItemInfo>();
             }
 
-            var since = DateTime.UtcNow - XmPlaylistHistoryStore.PresentationWindow;
+            var since = DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow;
             var presentable = _historyStore.GetPresentableTracks(channel, since, MaxItemsPerFetch);
 
             var items = new List<ImportListItemInfo>();
@@ -97,7 +109,7 @@ namespace XmPlaylist.ImportLists
 
         public override IImportListRequestGenerator GetRequestGenerator()
         {
-            return new XmPlaylistRequestGenerator
+            return new SXMPlaylistRequestGenerator
             {
                 Settings = Settings
             };
@@ -117,7 +129,7 @@ namespace XmPlaylist.ImportLists
             {
                 var generator = GetRequestGenerator();
                 var request = generator.GetListItems().GetAllTiers().First().First();
-                var response = XmPlaylistFeedCache.Get(_httpClient, request.HttpRequest);
+                var response = SXMPlaylistFeedCache.Get(_httpClient, request.HttpRequest);
 
                 if (response.StatusCode != System.Net.HttpStatusCode.OK)
                 {
@@ -156,7 +168,7 @@ namespace XmPlaylist.ImportLists
             {
                 try
                 {
-                    var fresh = XmPlaylistChannelDirectory.Fetch(_httpClient, Settings.BaseUrl);
+                    var fresh = SXMPlaylistChannelDirectory.Fetch(_httpClient, Settings.BaseUrl);
                     if (fresh.Count > 0)
                     {
                         _historyStore.SaveChannels(fresh);
@@ -182,5 +194,24 @@ namespace XmPlaylist.ImportLists
                     })
             };
         }
+
+        // A handful of ready-made presets so a channel list can be added in one click.
+        public override IEnumerable<ProviderDefinition> DefaultDefinitions
+        {
+            get
+            {
+                yield return GetPreset("Alt Nation", "altnation");
+                yield return GetPreset("Lithium", "lithium");
+                yield return GetPreset("PopRocks", "poprocks");
+            }
+        }
+
+        private static ImportListDefinition GetPreset(string name, string channel) => new()
+        {
+            EnableAutomaticAdd = true,
+            Name = $"{name} ({SXMPlaylistImportSettings.PluginName})",
+            Implementation = nameof(SXMPlaylistImport),
+            Settings = new SXMPlaylistImportSettings { Channel = channel }
+        };
     }
 }

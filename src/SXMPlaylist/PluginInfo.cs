@@ -1,8 +1,8 @@
-namespace XmPlaylist
+namespace SXMPlaylist
 {
     public static class PluginInfo
     {
-        public const string Name = "XmPlaylist";
+        public const string Name = "SXMPlaylist";
         public const string Author = "ksamples14";
         public const string RepoUrl = "https://github.com/ksamples14/lidarr.plugin.xmplaylist";
         public const string Version = "1.0.0";

@@ -1,16 +1,16 @@
 using System.Collections.Generic;
 using NzbDrone.Core.ImportLists;
 
-namespace XmPlaylist.ImportLists
+namespace SXMPlaylist.ImportLists
 {
-    public class XmPlaylistRequestGenerator : IImportListRequestGenerator
+    public class SXMPlaylistRequestGenerator : IImportListRequestGenerator
     {
-        public XmPlaylistImportSettings? Settings { get; set; }
+        public SXMPlaylistImportSettings? Settings { get; set; }
 
         public int MaxPages { get; set; }
         public int PageSize { get; set; }
 
-        public XmPlaylistRequestGenerator()
+        public SXMPlaylistRequestGenerator()
         {
             MaxPages = 1;
             PageSize = 1000;
@@ -28,7 +28,7 @@ namespace XmPlaylist.ImportLists
             var settings = Settings!;
             var baseUrl = settings.BaseUrl.TrimEnd('/');
 
-            yield return new ImportListRequest(XmPlaylistRequestBuilder.Build($"{baseUrl}/api/station/{settings.Channel}"));
+            yield return new ImportListRequest(SXMPlaylistRequestBuilder.Build($"{baseUrl}/api/station/{settings.Channel}"));
         }
     }
 }
