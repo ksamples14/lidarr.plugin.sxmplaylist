@@ -1,27 +1,22 @@
 # Lidarr.Plugin.SXMPlaylist
 
-A Lidarr import list plugin that discovers artists from the [xmplaylist.com](https://xmplaylist.com) SiriusXM radio play feed and adds them to your Lidarr library.
+**SXM Playlist** monitors SiriusXM channel play feeds via [xmplaylist.com](https://xmplaylist.com) and automatically adds the played artists to your Lidarr library. You create one import list per channel; the plugin handles discovery, album matching, and deduplication in the background.
 
-## How It Works
+> A Lidarr **nightly** branch is required — plugins are not supported on stable.
 
-The plugin is split into a background worker and a thin import-list shell. The worker runs continuously from Lidarr startup, watches Lidarr's import-list definitions for SXM Playlist channels, and does all the downloading and album resolution. The import lists only query the local database for what's ready and hand it to Lidarr.
+## Table of Contents
 
-1. **Capture (hourly, per channel).** The worker downloads `https://xmplaylist.com/api/station/{channel}` for every configured channel that hasn't been captured in the last hour. The endpoint only returns ~24 plays (a few minutes of history) per page, so each capture walks the API's `next` cursor backwards, merging pages until it has covered a ~2-hour window (slightly wider than the hourly cadence to absorb a missed poll; capped at 50 pages).
-2. **Record.** Every play is appended to a local SQLite history database (artist, song, channel, timestamp) — see [Play History](#play-history) below. Exact duplicates are ignored. Each new play also registers a per-track row holding the resolution inputs (artist, song, Deezer/Apple links).
-3. **Resolve (background).** The worker resolves due tracks' albums against Deezer/MusicBrainz/Apple (see [Album Resolution](#album-resolution) below), retrying each track up to 3 times before giving up. This runs in the background at MusicBrainz's 1 req/s, decoupled from any import-list fetch.
-4. **Present (hourly).** Each SXM Playlist import list's `Fetch()` is a pure DB query: resolved tracks for its channel that fell within the last 25 hours, capped at 20 per fetch. It returns those to Lidarr, which resolves the artists/albums and adds them to your library. Lidarr's import-list processing is idempotent, so the same track being returned across a few hourly fetches is harmless.
-5. When an album is added or newly monitored for an artist already in your library, the plugin queues a Lidarr **Refresh & Scan** for that artist so the change is picked up immediately (Lidarr already refresh-scans brand-new artists on its own).
-
-## Album Resolution
-
-xmplaylist itself only ever gives a song/track title, never a real album name. Each play does include links to the same track on other services, though, and some of those are free public catalog data the plugin can use to find the actual album — no API keys, no login, nothing to configure:
-
-1. **Deezer → MusicBrainz (preferred).** If the play has a Deezer link, the plugin looks up that track on Deezer's public API, which returns both the track's ISRC (a unique code identifying that specific recording) and Deezer's own album title in one call. The ISRC is looked up on MusicBrainz — an exact match, not a fuzzy text search — and when that succeeds, the plugin hands Lidarr the real album title *and* its MusicBrainz IDs directly, so Lidarr trusts those outright and skips its own search.
-2. **Deezer's own title (fallback within the same call).** If the MusicBrainz step doesn't pan out (no ISRC, no match, or nothing usable), the plugin falls back to the album title Deezer already returned — no extra network call, since that response was already fetched for the ISRC.
-3. **Apple Music (last-resort fallback).** Only used when there's no Deezer link at all, or Deezer's response had no album title either. Uses Apple's iTunes Lookup API via the Apple Music link's album ID. Real album title, no MusicBrainz ID — Lidarr resolves it the normal way via its own built-in fuzzy album search.
-4. **Skip (final fallback).** If nothing resolves, the track is not imported at all. The plugin never hands Lidarr an artist without a MusicBrainz ID — Lidarr would otherwise fall back to a name-only search, which can pick the wrong artist (e.g. a different band sharing the same name) and create a duplicate. Each track gets up to 3 resolution attempts across worker passes; if all fail it stops being retried (it only returns if the song airs again with new links).
-
-Resolution runs entirely in the background worker, so there is no per-fetch time budget. MusicBrainz's API is rate-limited to 1 request/second per their usage policy; the plugin throttles to that automatically and retries transient 503 "server busy" responses a couple of times with a short backoff. Results are stored per track (a rotation-heavy station replays the same song constantly and its album never changes between plays), so only genuinely new tracks ever hit the catalogs.
+1. [Installation](#installation)
+2. [Import List Specific Settings](#import-list-specific-settings)
+3. [How It Works](#how-it-works)
+4. [Album Resolution](#album-resolution)
+5. [Channel List](#channel-list)
+6. [Play History](#play-history)
+7. [Multiple Lists & API Limiting](#multiple-lists--api-limiting)
+8. [Troubleshooting](#troubleshooting)
+9. [Building From Source](#building-from-source)
+10. [API Usage Notes](#api-usage-notes)
+11. [Roadmap](#roadmap)
 
 ## Installation
 
@@ -53,9 +48,36 @@ Resolution runs entirely in the background worker, so there is no per-fetch time
 |---------|---------|-------------|
 | Channel | *(empty, required)* | A dropdown of every SiriusXM channel xmplaylist tracks (e.g. "36 - Alt Nation"). One list = one channel — add one import list per channel you want to monitor. |
 
-The Channel dropdown populates itself automatically whenever you open the Add/Edit dialog — no separate button to press. Behind the scenes it's backed by a small cache (see [Channel List](#channel-list) below) so opening the dialog doesn't hit xmplaylist.com every time.
+The Channel dropdown populates itself automatically whenever you open the Add/Edit dialog — no separate button to press. It's backed by a small cache (see [Channel List](#channel-list) below) so opening the dialog doesn't hit xmplaylist.com every time.
 
 > The background worker captures each channel roughly every **1 hour**, and the import lists present resolved tracks to Lidarr hourly (capped at 20 per fetch). Resolution happens in the background, so imports arrive spread across the day rather than in bursts. Artist monitoring, quality profile, and root folder are configured in Lidarr's own **Added Artist Settings** section of the import list modal, not by this plugin. Whether a previously-unmonitored artist gets re-monitored when it shows up in the feed again is controlled by Lidarr's own **Monitor Existing** setting on the list — not by this plugin.
+
+## How It Works
+
+SXM Playlist runs a background worker that checks each configured channel about once an hour, resolves played songs to albums via Deezer/MusicBrainz (with an Apple Music fallback), and makes the resolved tracks available to Lidarr's import system. New artists typically appear in your library within a few hours of first airing.
+
+1. **Capture.** The worker checks each channel's play feed every hour and records the plays it hasn't seen before.
+2. **Resolve.** Each new track's album is looked up in the background, retried up to 3 times before giving up.
+3. **Present.** Lidarr polls each import list hourly; the list returns resolved tracks from the last 25 hours, which Lidarr adds to your library. Duplicate plays are skipped.
+
+<details>
+<summary>How the feed is captured (technical detail)</summary>
+
+The channel endpoint only returns a few minutes of history per page, so each capture pages backwards through the API to cover approximately the last 2 hours — slightly wider than the hourly cadence so a missed poll doesn't lose plays (capped at 50 pages).
+</details>
+
+## Album Resolution
+
+Most tracks resolve to a specific album automatically. The plugin only imports artists it can resolve to a MusicBrainz ID — this prevents Lidarr from creating duplicates via name-only matching. A small number of tracks (those with no Deezer or Apple Music link in the play data) may not resolve and won't be imported.
+
+xmplaylist itself only ever gives a song title, never a real album name. Each play does include links to the same track on other services, though, and some of those are free public catalog data the plugin can use to find the actual album — no API keys, no login, nothing to configure:
+
+1. **Deezer → MusicBrainz (preferred).** If the play has a Deezer link, the plugin looks up that track on Deezer's public API, which returns the track's ISRC (a unique code identifying that specific recording) and Deezer's own album title in one call. The ISRC is looked up on MusicBrainz — an exact match, not a fuzzy text search. When that succeeds, the plugin hands Lidarr the real album title and its MusicBrainz IDs, so Lidarr can add the album directly without a separate search.
+2. **Deezer's own title (fallback within the same call).** If the MusicBrainz lookup returns no match, the plugin falls back to the album title Deezer already returned — no extra network call, since that response was already fetched for the ISRC.
+3. **Apple Music (last-resort fallback).** Used only when there's no Deezer link at all, or Deezer's response had no album title either. Uses Apple's iTunes Lookup API via the Apple Music link's album ID. Real album title, no MusicBrainz ID — Lidarr resolves it the normal way via its own built-in fuzzy album search.
+4. **Skip (final fallback).** If nothing resolves, the track is not imported. Each track gets up to 3 resolution attempts across worker passes; if all fail it stops being retried (it only returns if the song airs again with new links).
+
+Resolution runs entirely in the background, at MusicBrainz's 1 request/second limit. MusicBrainz's API is rate-limited per their usage policy; the plugin throttles to that automatically and retries transient 503 "server busy" responses a couple of times with a short backoff. Results are stored per track (stations replay the same songs frequently and a track's album never changes between plays), so only genuinely new tracks ever hit the catalogs.
 
 ## Channel List
 
@@ -63,17 +85,15 @@ xmplaylist's own frontend derives its channel picker from `/api/station` (distin
 
 The fetched list is cached (in the same history database) rather than re-fetched every time the Add/Edit dialog opens. It's treated as stale after 24 hours — SiriusXM's lineup doesn't change often — at which point the next dialog open refreshes it automatically before serving the dropdown. If that refresh fails (network hiccup, xmplaylist down), the plugin falls back to whatever was cached rather than leaving the dropdown empty.
 
-> Lidarr's plugin settings framework doesn't support a standalone clickable button for this kind of thing — `FieldType.Action` exists in Lidarr's own code but isn't wired to anything in its frontend. The dropdown-refreshes-on-open behavior above is the closest available mechanism.
-
 ## Play History
 
-The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album + MusicBrainz IDs once resolved, and a 3-strike failure counter) and a per-channel "last captured" marker. This does three things:
+The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album and MusicBrainz IDs once resolved, plus a 3-strike failure counter) and a per-channel "last captured" marker. This serves three purposes:
 
-- **Dedup** — a play is only recorded the first time its (play ID + artist) pair is seen, so overlapping ~2-hour capture windows never duplicate.
+- **Dedup** — duplicate plays are skipped, so overlapping capture windows never duplicate an import.
 - **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks become presentable to Lidarr for the next 25 hours.
-- **Future feature** — the play history is the data source for a planned "build a Plex playlist per station" feature, so it's kept independently of whatever Lidarr decides to do with the artist.
+- **Future feature** — the play history will power a planned per-station Plex playlist feature, so it's kept independently of whatever Lidarr decides to do with the artist.
 
-Play rows older than **180 days** are pruned by the background worker, along with tracks whose plays have fallen out of the window. The database runs in WAL mode so the worker can write while the import lists read (the lists fetch in parallel).
+Play rows older than **180 days** are pruned by the background worker, along with tracks whose plays have fallen out of the window.
 
 The database uses `System.Data.SQLite` — the same SQLite provider Lidarr itself ships with — referenced from `lib/` the same way as the other host DLLs, so no new native binary is bundled with the plugin (see [Building From Source](#building-from-source)).
 
@@ -81,13 +101,20 @@ The database uses `System.Data.SQLite` — the same SQLite provider Lidarr itsel
 
 The background worker downloads `/api/station/{channel}` for each configured channel — one request per channel per capture, plus any backfill pages needed to cover the ~2-hour window (capped at 50 pages). Multiple lists for the same channel share an in-process response cache keyed by URL (3-minute lifetime), so overlapping captures don't double the request count. Album resolution runs at MusicBrainz's 1 request/second limit regardless of how many channels or lists are configured.
 
+## Troubleshooting
+
+- **No artists are appearing.** A brand-new channel populates gradually — album resolution runs in the background at MusicBrainz's 1 request/second limit, so give it a few hours. Make sure the list is enabled and "Automatic Add" is on.
+- **Some tracks never import.** Tracks with no Deezer or Apple Music link in the play data can't be resolved to an album and are skipped by design.
+- **The wrong artist or album shows up occasionally.** When a track can't be resolved to a MusicBrainz album ID, Lidarr falls back to its own name-based search, which can rarely pick a different artist sharing the same name.
+- **The plugin isn't listed in Lidarr.** Plugins require the **nightly** branch; they aren't supported on stable.
+
 ## Building From Source
 
 The plugin references the **exact Lidarr DLLs from your running Lidarr instance** (in `lib/`), not the source submodule. This ensures the compiled assembly versions match the host, which is required for the plugin's isolated load context to resolve them.
 
 ```powershell
 git clone --recursive https://github.com/ksamples14/lidarr.plugin.sxmplaylist.git
-cd lidarr.plugin.xmplaylist
+cd lidarr.plugin.sxmplaylist
 dotnet restore SXMPlaylist.sln
 dotnet build SXMPlaylist.sln -c Release -p:EnableAnalyzers=false
 dotnet run --project tests/SXMPlaylist.Tests/SXMPlaylist.Tests.csproj
@@ -105,7 +132,7 @@ Output: `src/SXMPlaylist/bin/Release/net8.0/Lidarr.Plugin.SXMPlaylist.dll` (sing
 ## Project Structure
 
 ```
-lidarr.plugin.xmplaylist/
+lidarr.plugin.sxmplaylist/
 ├── lib/                                    # Lidarr DLLs from your running instance (version-matched)
 ├── src/SXMPlaylist/
 │   ├── SXMPlaylist.csproj                   # References lib/*.dll (Reference, Private=false)
@@ -136,15 +163,15 @@ lidarr.plugin.xmplaylist/
 
 - The xmplaylist `/api/station/{channel}` endpoint is **free and requires no authentication**
 - A `User-Agent` header is required per the API guidelines
-- Each page covers only a few minutes of history (~24 plays), which is why the plugin walks the `next` cursor to backfill the ~2-hour poll window instead of relying on a single page
+- Each page covers only a few minutes of history (~24 plays), which is why the plugin pages backwards to backfill the ~2-hour capture window instead of relying on a single page
 - Lidarr matches artists (and unresolved albums) by name, so accuracy depends on consistent naming
 - Deezer's API (`api.deezer.com`), Apple's iTunes Lookup API (`itunes.apple.com`), and MusicBrainz's web service (`musicbrainz.org/ws/2`) are all free and require no authentication either — see [Album Resolution](#album-resolution)
 - `/api/station` (no channel suffix) is a separate endpoint from `/api/station/{channel}` — it lists every channel instead of that channel's plays — see [Channel List](#channel-list)
 
 ## Roadmap
 
-- **Plex playlist per station.** The play-history database already records every song, artist, channel, and timestamp specifically to support this — build a playlist per SiriusXM channel from that history so what's playing on a station in Lidarr's library can be listened to as a Plex playlist.
-- **Additional metadata providers, following Tubifarry's pattern.** Tubifarry (the other Lidarr plugin already running alongside this one, see `Metadata/Proxy/MetadataProvider/`) has working, precedented integrations with Last.fm, Discogs, and a "mixed" proxy that layers multiple sources together. Album resolution here currently only tries Deezer/MusicBrainz then Apple; adding more sources the same way would catch tracks neither of those has, especially lesser-known or non-mainstream artists.
+- **Plex playlist per station.** Build a per-station Plex playlist from play history, so what's playing on a channel in Lidarr's library can be listened to as a Plex playlist.
+- **Additional metadata providers (Last.fm, Discogs).** Album resolution currently tries Deezer/MusicBrainz then Apple. Adding more sources would catch tracks neither of those has, especially lesser-known or non-mainstream artists.
 
 ## License
 
