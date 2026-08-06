@@ -47,7 +47,7 @@ namespace SXMPlaylist.ImportLists
         // Only touched when a retry fires; small enough to keep tests fast.
         internal static TimeSpan MusicBrainzRetryBackoff = TimeSpan.FromSeconds(2);
 
-        private const string UserAgent = "SXMPlaylist-Lidarr-Plugin/1.0 (https://github.com/ksamples14/lidarr.plugin.xmplaylist)";
+        private const string UserAgent = "SXMPlaylist-Lidarr-Plugin/1.0 (https://github.com/ksamples14/lidarr.plugin.sxmplaylist)";
 
         private readonly IHttpClient _httpClient;
         private readonly Logger _logger;

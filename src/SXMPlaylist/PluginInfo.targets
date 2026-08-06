@@ -2,7 +2,7 @@
   <PropertyGroup>
     <PluginName>SXMPlaylist</PluginName>
     <PluginAuthor>ksamples14</PluginAuthor>
-    <PluginRepositoryUrl>https://github.com/ksamples14/lidarr.plugin.xmplaylist</PluginRepositoryUrl>
+    <PluginRepositoryUrl>https://github.com/ksamples14/lidarr.plugin.sxmplaylist</PluginRepositoryUrl>
     <PluginVersion>1.0.0</PluginVersion>
     <PluginBranch>master</PluginBranch>
     <PluginMinLidarrVersion>3.0.0.4855</PluginMinLidarrVersion>

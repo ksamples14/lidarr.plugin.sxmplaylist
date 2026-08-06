@@ -33,7 +33,7 @@ Resolution runs entirely in the background worker, so there is no per-fetch time
 ### From GitHub Releases
 
 1. In Lidarr, go to **Settings → Plugins**
-2. Paste `https://github.com/ksamples14/lidarr.plugin.xmplaylist` into the GitHub URL box
+2. Paste `https://github.com/ksamples14/lidarr.plugin.sxmplaylist` into the GitHub URL box
 3. Click **Install**
 4. **Restart Lidarr**
 
@@ -86,7 +86,7 @@ The background worker downloads `/api/station/{channel}` for each configured cha
 The plugin references the **exact Lidarr DLLs from your running Lidarr instance** (in `lib/`), not the source submodule. This ensures the compiled assembly versions match the host, which is required for the plugin's isolated load context to resolve them.
 
 ```powershell
-git clone --recursive https://github.com/ksamples14/lidarr.plugin.xmplaylist.git
+git clone --recursive https://github.com/ksamples14/lidarr.plugin.sxmplaylist.git
 cd lidarr.plugin.xmplaylist
 dotnet restore SXMPlaylist.sln
 dotnet build SXMPlaylist.sln -c Release -p:EnableAnalyzers=false
