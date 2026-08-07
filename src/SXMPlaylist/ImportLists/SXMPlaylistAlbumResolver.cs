@@ -58,11 +58,13 @@ namespace SXMPlaylist.ImportLists
             _logger = logger;
         }
 
-        public AlbumResolution Resolve(string artist, string song, IReadOnlyDictionary<string, string> links)
+        public AlbumResolution Resolve(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null)
         {
+            var effectiveFilter = filter ?? AlbumTypeFilter.Unrestricted;
+
             try
             {
-                var viaDeezer = ResolveViaDeezerAndMusicBrainz(links);
+                var viaDeezer = ResolveViaDeezerAndMusicBrainz(artist, links, effectiveFilter);
                 if (viaDeezer != null)
                 {
                     return viaDeezer;
@@ -75,7 +77,7 @@ namespace SXMPlaylist.ImportLists
 
             try
             {
-                var viaApple = ResolveViaAppleMusic(links);
+                var viaApple = ResolveViaAppleMusic(artist, links, effectiveFilter);
                 if (viaApple != null)
                 {
                     return viaApple;
@@ -89,7 +91,7 @@ namespace SXMPlaylist.ImportLists
             return AlbumResolution.NotFound;
         }
 
-        private AlbumResolution? ResolveViaDeezerAndMusicBrainz(IReadOnlyDictionary<string, string> links)
+        private AlbumResolution? ResolveViaDeezerAndMusicBrainz(string artist, IReadOnlyDictionary<string, string> links, AlbumTypeFilter filter)
         {
             if (!links.TryGetValue("deezer", out var deezerUrl))
             {
@@ -105,10 +107,18 @@ namespace SXMPlaylist.ImportLists
             var track = GetJson($"https://api.deezer.com/track/{match.Groups[1].Value}");
             var deezerAlbumTitle = track?["album"]?["title"]?.Value<string>();
 
-            var viaMusicBrainz = ResolveViaMusicBrainz(track);
+            var viaMusicBrainz = ResolveViaMusicBrainz(track, filter);
             if (viaMusicBrainz != null)
             {
                 return viaMusicBrainz;
+            }
+
+            // ISRC->MB didn't pan out - try a release title search for a real MBID before falling
+            // back to Deezer's raw title.
+            var viaTitleSearch = ResolveViaMusicBrainzTitleSearch(artist, deezerAlbumTitle, filter);
+            if (viaTitleSearch != null)
+            {
+                return viaTitleSearch;
             }
 
             // MusicBrainz didn't pan out - Deezer's own title is still a real album name, just
@@ -116,7 +126,7 @@ namespace SXMPlaylist.ImportLists
             return deezerAlbumTitle.IsNotNullOrWhiteSpace() ? new AlbumResolution(true, deezerAlbumTitle, null, null) : null;
         }
 
-        private AlbumResolution? ResolveViaMusicBrainz(JToken? track)
+        private AlbumResolution? ResolveViaMusicBrainz(JToken? track, AlbumTypeFilter filter)
         {
             var isrc = track?["isrc"]?.Value<string>();
             if (isrc.IsNullOrWhiteSpace())
@@ -141,7 +151,7 @@ namespace SXMPlaylist.ImportLists
             var artistCredits = recording?["artist-credit"] as JArray;
             string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
 
-            var releaseGroup = SelectBestReleaseGroup(recording, artistMbid);
+            var releaseGroup = SelectBestReleaseGroup(recording, artistMbid, filter);
             if (releaseGroup == null)
             {
                 return null;
@@ -158,7 +168,247 @@ namespace SXMPlaylist.ImportLists
             return new AlbumResolution(true, albumTitle, artistMbid, albumMbid);
         }
 
-        private static JToken? SelectBestReleaseGroup(JToken? recording, string? recordingArtistId)
+        // Fallback after the exact ISRC path misses: search MusicBrainz release-groups by the
+        // artist + the album title we already got (from Deezer or Apple), gated by a fuzzy
+        // artist-credit match and a title-similarity threshold so a same-titled album by a
+        // different artist can't be attached. Returns a real MBID when a match is confident.
+        private AlbumResolution? ResolveViaMusicBrainzTitleSearch(string artist, string? albumTitle, AlbumTypeFilter filter)
+        {
+            if (artist.IsNullOrWhiteSpace() || albumTitle.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var query = BuildTitleSearchQuery(artist, albumTitle!);
+            ThrottleMusicBrainz();
+            var result = GetJson($"https://musicbrainz.org/ws/2/release?query={Uri.EscapeDataString(query)}&fmt=json&limit=10", musicBrainz: true);
+
+            var releases = result?["releases"] as JArray;
+            if (releases == null || releases.Count == 0)
+            {
+                return null;
+            }
+
+            var candidates = new JArray();
+            foreach (var release in releases)
+            {
+                var rg = release["release-group"];
+                if (rg == null)
+                {
+                    continue;
+                }
+
+                // Artist gate: the release's credited artist must plausibly be the played artist.
+                if (!ArtistCreditMatches(release, artist))
+                {
+                    continue;
+                }
+
+                // Title gate: release-group title must be similar enough to the Deezer/Apple title.
+                var rgTitle = rg["title"]?.Value<string>();
+                if (rgTitle.IsNullOrWhiteSpace() || TitleSimilarity(rgTitle!, albumTitle!) < TitleMatchThreshold)
+                {
+                    continue;
+                }
+
+                candidates.Add(release);
+            }
+
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            // Reuse the approved ranking (status > primary > secondary > date, VA excluded).
+            var syntheticRecording = new JObject { ["releases"] = candidates };
+            var selectedReleaseGroup = SelectBestReleaseGroup(syntheticRecording, null, filter);
+            if (selectedReleaseGroup == null)
+            {
+                return null;
+            }
+
+            var finalTitle = selectedReleaseGroup["title"]?.Value<string>();
+            var finalAlbumMbid = selectedReleaseGroup["id"]?.Value<string>();
+
+            // Artist MBID: release-search results carry artist-credit on the release, not the
+            // release-group. Take the credited artist's id from the release that owns the
+            // selected release-group, when a single artist is credited.
+            var selectedRelease = candidates
+                .Cast<JToken>()
+                .FirstOrDefault(r => string.Equals(r["release-group"]?["id"]?.Value<string>(), finalAlbumMbid, StringComparison.OrdinalIgnoreCase));
+
+            var artistCredits = selectedRelease?["artist-credit"] as JArray;
+            string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
+
+            if (finalTitle.IsNullOrWhiteSpace() || finalAlbumMbid.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            return new AlbumResolution(true, finalTitle, artistMbid, finalAlbumMbid);
+        }
+
+        // Boosted-OR form (DroppedNeedle pattern): phrase boost the title, fall back to unquoted
+        // tokens, all AND'd against the artist so recall stays high while precision lives in code.
+        // The edition suffix is stripped from the query too - a "Three Cheers (Deluxe Edition)"
+        // phrase won't match MusicBrainz's clean "Three Cheers for Sweet Revenge" otherwise.
+        private static string BuildTitleSearchQuery(string artist, string albumTitle)
+        {
+            var stripped = EditionSuffixPattern.Replace(albumTitle, " ").Trim();
+            var title = EscapeLucene(stripped);
+            var artistQuery = EscapeLucene(artist);
+            return $"(releasegroup:\"{title}\"^3 OR release:\"{title}\"^2 OR {title}) AND artist:\"{artistQuery}\"";
+        }
+
+        // Escapes MusicBrainz Lucene special characters before interpolation.
+        private static string EscapeLucene(string value)
+        {
+            var sb = new System.Text.StringBuilder(value.Length);
+            foreach (var c in value)
+            {
+                if ("+-&&||!(){}[]^\"~*?:\\/".IndexOf(c) >= 0)
+                {
+                    sb.Append('\\');
+                }
+
+                sb.Append(c);
+            }
+
+            return sb.ToString();
+        }
+
+        // True when any credited artist on the release plausibly matches the played artist name.
+        private static bool ArtistCreditMatches(JToken release, string playedArtist)
+        {
+            var credit = release["artist-credit"] as JArray;
+            if (credit == null || credit.Count == 0)
+            {
+                return true;
+            }
+
+            foreach (var entry in credit)
+            {
+                var name = entry["artist"]?["name"]?.Value<string>();
+                if (name.IsNotNullOrWhiteSpace() && ArtistSimilarity(name!, playedArtist) >= ArtistMatchFloor)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private const double TitleMatchThreshold = 0.85;
+        private const double ArtistMatchFloor = 0.6;
+
+        // Edition qualifiers stripped before scoring/querying so "Three Cheers (Deluxe)" matches
+        // MusicBrainz's clean "Three Cheers for Sweet Revenge".
+        private static readonly Regex EditionSuffixPattern = new(
+            @"[\(\[\{]\s*(deluxe|remaster(ed)?|edition|anniversary|special|expanded|bonus|complete|acoustic|live|demo|radio edit|extended|instrumental|mono|stereo|explicit|clean|version|single|promo)\b[^\)\]\}]*[\)\]\}]",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static string NormalizeForMatch(string value)
+        {
+            value = EditionSuffixPattern.Replace(value, " ");
+
+            // Strip diacritics (Beyoncé -> Beyonce, Mötley Crüe -> Motley Crue).
+            var normalized = value.Normalize(System.Text.NormalizationForm.FormD);
+            var sb = new System.Text.StringBuilder(normalized.Length);
+            foreach (var c in normalized)
+            {
+                if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.NonSpacingMark)
+                {
+                    if (char.IsLetterOrDigit(c))
+                    {
+                        sb.Append(char.ToLowerInvariant(c));
+                    }
+                    else
+                    {
+                        sb.Append(' ');
+                    }
+                }
+            }
+
+            return string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+        }
+
+        // Max of token-set overlap (word-order invariant, handles reordering), normalized edit
+        // distance (catches near-identical strings), and token containment (handles subset titles
+        // like "Best Of" vs "The Best Of", mirroring token_set_ratio's tolerance). 0..1.
+        private static double TitleSimilarity(string a, string b)
+        {
+            var na = NormalizeForMatch(a);
+            var nb = NormalizeForMatch(b);
+            if (string.IsNullOrEmpty(na) || string.IsNullOrEmpty(nb))
+            {
+                return 0.0;
+            }
+
+            var tokensA = na.Split(' ').ToHashSet();
+            var tokensB = nb.Split(' ').ToHashSet();
+            var intersection = tokensA.Intersect(tokensB).Count();
+            var union = tokensA.Union(tokensB).Count();
+            var tokenScore = union == 0 ? 0.0 : (double)intersection / union;
+
+            // Containment: the fraction of the smaller token set present in the larger, so
+            // "best of" ⊂ "the best of" scores highly like token_set_ratio.
+            var smaller = Math.Min(tokensA.Count, tokensB.Count);
+            var containment = smaller == 0 ? 0.0 : (double)intersection / smaller;
+
+            var editScore = 1.0 - (double)LevenshteinDistance(na, nb) / Math.Max(na.Length, nb.Length);
+
+            return Math.Max(Math.Max(tokenScore, containment), editScore);
+        }
+
+        // Similarity of two artist names against a looser floor (display names vary more than
+        // album titles). Uses containment of the shorter name in the longer as a token-set proxy.
+        private static double ArtistSimilarity(string a, string b)
+        {
+            var na = NormalizeForMatch(a);
+            var nb = NormalizeForMatch(b);
+            if (string.IsNullOrEmpty(na) || string.IsNullOrEmpty(nb))
+            {
+                return 0.0;
+            }
+
+            if (na == nb)
+            {
+                return 1.0;
+            }
+
+            var tokensA = na.Split(' ').ToHashSet();
+            var tokensB = nb.Split(' ').ToHashSet();
+            var intersection = tokensA.Intersect(tokensB).Count();
+            var union = tokensA.Union(tokensB).Count();
+            return union == 0 ? 0.0 : (double)intersection / union;
+        }
+
+        private static int LevenshteinDistance(string a, string b)
+        {
+            var dp = new int[a.Length + 1, b.Length + 1];
+            for (var i = 0; i <= a.Length; i++)
+            {
+                dp[i, 0] = i;
+            }
+
+            for (var j = 0; j <= b.Length; j++)
+            {
+                dp[0, j] = j;
+            }
+
+            for (var i = 1; i <= a.Length; i++)
+            {
+                for (var j = 1; j <= b.Length; j++)
+                {
+                    var cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    dp[i, j] = Math.Min(Math.Min(dp[i - 1, j] + 1, dp[i, j - 1] + 1), dp[i - 1, j - 1] + cost);
+                }
+            }
+
+            return dp[a.Length, b.Length];
+        }
+
+        private static JToken? SelectBestReleaseGroup(JToken? recording, string? recordingArtistId, AlbumTypeFilter filter)
         {
             var releases = recording?["releases"] as JArray;
             if (releases == null || releases.Count == 0)
@@ -166,13 +416,18 @@ namespace SXMPlaylist.ImportLists
                 return null;
             }
 
-            // Drop compilations outright - a compilation's release-group belongs to Various Artists
-            // (or a curator/DJ credited as the artist), and handing Lidarr that album just attaches
-            // the play to the wrong artist. Also drop release-groups explicitly typed as compilations.
+            // Various Artists releases are hard-excluded - a compilation's release-group belongs
+            // to Various Artists (or a curator/DJ credited as the artist), and handing Lidarr that
+            // album just attaches the play to the wrong artist. Compilation-typed releases are no
+            // longer dropped here: they rank lowest in the secondary-type ladder and are only
+            // selected when nothing higher ranks. Then filter to the types/status the list's
+            // metadata profile allows.
             var candidates = releases
                 .Where(r => r["release-group"] != null)
                 .Where(r => !IsVariousArtistsRelease(r))
-                .Where(r => !IsCompilationRelease(r))
+                .Where(r => filter.PrimaryTypes.Contains(r["release-group"]?["primary-type"]?.Value<string>() ?? ""))
+                .Where(r => SecondaryTypesAllowed(r["release-group"], filter.SecondaryTypes))
+                .Where(r => filter.Statuses.Contains(r["status"]?.Value<string>() ?? ""))
                 .ToList();
 
             if (candidates.Count == 0)
@@ -180,24 +435,43 @@ namespace SXMPlaylist.ImportLists
                 return null;
             }
 
+            // Approved lexicographic ranking (PLAN §6.6): artist-credit match, then release
+            // status, then primary type, then secondary type, then earliest release date.
             return candidates
-                .OrderByDescending(r => recordingArtistId.IsNotNullOrWhiteSpace() && MatchesRecordingArtist(r, recordingArtistId))
-                .ThenByDescending(r => string.Equals(r["status"]?.Value<string>(), "Official", StringComparison.OrdinalIgnoreCase))
-                .ThenByDescending(r => PrimaryTypeRank(r["release-group"]))
+                .OrderBy(r => recordingArtistId.IsNotNullOrWhiteSpace() && MatchesRecordingArtist(r, recordingArtistId) ? 0 : 1)
+                .ThenBy(r => ReleaseStatusRank(r["status"]?.Value<string>()))
+                .ThenBy(r => PrimaryTypeRank(r["release-group"]))
+                .ThenBy(r => SecondaryTypeRank(r["release-group"]))
                 .ThenBy(r => r["release-group"]?["first-release-date"]?.Value<string>() ?? "9999")
                 .Select(r => r["release-group"])
                 .FirstOrDefault();
         }
 
-        private static bool IsCompilationRelease(JToken release)
+        // Mirrors Lidarr's SkyHookProxy.FilterAlbums rule: no secondary types means "Studio", so
+        // it's allowed only when the profile permits Studio; a release-group with secondary types
+        // is allowed when ANY of them is in the profile's allowed set.
+        private static bool SecondaryTypesAllowed(JToken? releaseGroup, HashSet<string> allowedSecondaryTypes)
         {
-            var secondaryTypes = release["release-group"]?["secondary-types"] as JArray;
+            var secondaryTypes = releaseGroup?["secondary-types"] as JArray;
             if (secondaryTypes == null || secondaryTypes.Count == 0)
             {
-                return false;
+                return allowedSecondaryTypes.Contains("Studio");
             }
 
-            return secondaryTypes.Any(t => string.Equals(t.Value<string>(), "Compilation", StringComparison.OrdinalIgnoreCase));
+            return secondaryTypes.Any(t => allowedSecondaryTypes.Contains(t.Value<string>() ?? ""));
+        }
+
+        // Approved ranking ladder (PLAN §6.6): lower = better.
+        private static int ReleaseStatusRank(string? status)
+        {
+            return status switch
+            {
+                "Official" => 0,
+                "Promotion" => 1,
+                "Bootleg" => 2,
+                "Pseudo-Release" => 3,
+                _ => 4
+            };
         }
 
         // For a played track, the release that most directly corresponds to it is the single, then
@@ -206,10 +480,42 @@ namespace SXMPlaylist.ImportLists
         {
             return (releaseGroup?["primary-type"]?.Value<string>()) switch
             {
-                "Single" => 2,
+                "Single" => 0,
                 "EP" => 1,
-                "Album" => 0,
-                _ => -1
+                "Album" => 2,
+                "Broadcast" => 3,
+                "Other" => 4,
+                _ => 5
+            };
+        }
+
+        // Secondary-type ladder (PLAN §6.6): Studio first, Compilation strictly last.
+        private static int SecondaryTypeRank(JToken? releaseGroup)
+        {
+            var secondaryTypes = releaseGroup?["secondary-types"] as JArray;
+            if (secondaryTypes == null || secondaryTypes.Count == 0)
+            {
+                return 0;
+            }
+
+            return secondaryTypes
+                .Select(t => t.Value<string>())
+                .Where(t => t.IsNotNullOrWhiteSpace())
+                .Select(t => SecondaryTypeRank(t!))
+                .DefaultIfEmpty(0)
+                .Max();
+        }
+
+        private static int SecondaryTypeRank(string type)
+        {
+            return type switch
+            {
+                "Studio" => 0,
+                "Soundtrack" => 1,
+                "Remix" => 2,
+                "DJ-mix" => 3,
+                "Compilation" => 4,
+                _ => 5
             };
         }
 
@@ -257,7 +563,7 @@ namespace SXMPlaylist.ImportLists
             return credit[0]["artist"];
         }
 
-        private AlbumResolution? ResolveViaAppleMusic(IReadOnlyDictionary<string, string> links)
+        private AlbumResolution? ResolveViaAppleMusic(string artist, IReadOnlyDictionary<string, string> links, AlbumTypeFilter filter)
         {
             if (!links.TryGetValue("appleMusic", out var appleUrl))
             {
@@ -272,6 +578,13 @@ namespace SXMPlaylist.ImportLists
 
             var lookup = GetJson($"https://itunes.apple.com/lookup?id={match.Groups[1].Value}");
             var albumTitle = lookup?["results"]?.FirstOrDefault()?["collectionName"]?.Value<string>();
+
+            // Try to upgrade the Apple title to a real MBID before falling back to the raw title.
+            var viaTitleSearch = ResolveViaMusicBrainzTitleSearch(artist, albumTitle, filter);
+            if (viaTitleSearch != null)
+            {
+                return viaTitleSearch;
+            }
 
             return albumTitle.IsNotNullOrWhiteSpace() ? new AlbumResolution(true, albumTitle, null, null) : null;
         }
@@ -327,5 +640,30 @@ namespace SXMPlaylist.ImportLists
                 MusicBrainzGate.Release();
             }
         }
+    }
+
+    /// <summary>
+    /// The set of release-group attributes the importing list's metadata profile allows. Candidates
+    /// outside these sets are filtered out before ranking (mirroring Lidarr's own
+    /// <c>SkyHookProxy.FilterAlbums</c>), so a profile that only allows Official/Studio/Single/EP/Album
+    /// never returns a Bootleg or Live release just because it ranks last.
+    /// </summary>
+    public class AlbumTypeFilter
+    {
+        public static readonly AlbumTypeFilter Unrestricted = new(
+            new HashSet<string> { "Single", "EP", "Album", "Broadcast", "Other" },
+            new HashSet<string> { "Studio", "Compilation", "Soundtrack", "Spokenword", "Interview", "Audiobook", "Live", "Remix", "DJ-mix", "Mixtape/Street", "Demo", "Audio drama" },
+            new HashSet<string> { "Official", "Promotion", "Bootleg", "Pseudo-Release" });
+
+        public AlbumTypeFilter(HashSet<string> primaryTypes, HashSet<string> secondaryTypes, HashSet<string> statuses)
+        {
+            PrimaryTypes = primaryTypes;
+            SecondaryTypes = secondaryTypes;
+            Statuses = statuses;
+        }
+
+        public HashSet<string> PrimaryTypes { get; }
+        public HashSet<string> SecondaryTypes { get; }
+        public HashSet<string> Statuses { get; }
     }
 }

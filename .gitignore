@@ -6,3 +6,9 @@ _plugins/
 *.suo
 .vs/
 *.DotSettings.user
+
+# Private project plan - NOT for GitHub
+PLAN.md
+PLAN-consult.md
+PLAN-todo-consult.md
+PLAN-titlesearch-consult.md

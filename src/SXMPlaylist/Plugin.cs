@@ -6,6 +6,7 @@ using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Lifecycle;
 using NzbDrone.Core.Messaging.Events;
 using NzbDrone.Core.Plugins;
+using NzbDrone.Core.Profiles.Metadata;
 using SXMPlaylist.ImportLists;
 
 namespace SXMPlaylist
@@ -27,9 +28,10 @@ namespace SXMPlaylist
             IHttpClient httpClient,
             IAppFolderInfo appFolderInfo,
             IImportListFactory importListFactory,
+            IMetadataProfileService metadataProfileService,
             Logger logger)
         {
-            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, logger);
+            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, metadataProfileService, logger);
         }
 
         public void Handle(ApplicationStartingEvent message)

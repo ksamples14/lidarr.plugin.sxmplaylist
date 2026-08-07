@@ -15,6 +15,7 @@ using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Music;
 using NzbDrone.Core.Music.Commands;
 using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.Profiles.Metadata;
 using SXMPlaylist.ImportLists;
 
 internal static class Program
@@ -37,6 +38,13 @@ internal static class Program
         TestAlbumResolutionFallsBackToAppleMusic();
         TestAlbumResolutionSkipsVariousArtistsCompilations();
         TestAlbumResolutionPrefersSingleOverEpOverAlbum();
+        TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss();
+        TestAlbumResolutionTitleSearchRejectsWrongArtist();
+        TestAlbumResolutionTitleSearchViaApple();
+        TestAlbumResolutionRanksCompilationLast();
+        TestAlbumResolutionRanksMultiTagCompilationLast();
+        TestAlbumResolutionTitleSearchStripsEditionSuffixInQuery();
+        TestAlbumResolutionFilterExcludesDisallowedRelease();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
 
@@ -45,10 +53,17 @@ internal static class Program
         TestStoreThreeStrikesExcludesTrack();
         TestStorePresentableWindowExpires();
         TestStorePruneRemovesOldData();
+        TestStoreSchedulesRetryForNoMbidTrack();
+        TestStoreRetryGivesUpAfterMaxAttempts();
+        TestStoreRetrySuccessClearsRetryState();
+        TestStoreNewPlayResetsRetryClock();
+        TestStoreRetryFailureRenewsPresentationWindow();
+        TestStoreMigrationAddsRetryColumnsIdempotently();
 
         TestWorkerCapturesDueChannel();
         TestWorkerSkipsCaptureWhenNotDue();
         TestWorkerResolvesDueTracks();
+        TestWorkerUsesListMetadataProfileForResolution();
         TestWorkerIdlesWithNoChannels();
 
         Console.WriteLine();
@@ -263,7 +278,7 @@ internal static class Program
 
         Assert("falls back to Deezer's own album title", resolution.Album == "No Code");
         Assert("no album MBID (no MusicBrainz match)", resolution.AlbumMusicBrainzId == null);
-        Assert($"only the single Deezer call was made (calls: {httpClient.CallCount})", httpClient.CallCount == 1);
+        Assert("Deezer call plus one MB title-search attempt (calls: " + httpClient.CallCount + ")", httpClient.CallCount == 2);
     }
 
     private static void TestAlbumResolutionFallsBackToAppleMusic()
@@ -356,6 +371,171 @@ internal static class Program
         var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
         Assert("EP preferred over album when no single exists", resolution2.Album == "The EP");
+    }
+
+    private static void TestAlbumResolutionFilterExcludesDisallowedRelease()
+    {
+        Console.WriteLine("\n[Test] A metadata profile filter drops release-groups of disallowed type/status");
+
+        // Only Official/Studio/Album allowed: a Bootleg single exists but must be filtered out in
+        // favor of the allowed Official album.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Bootleg\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"bootleg-single\",\"title\":\"Rare Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1990-01-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"official-album\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var filter = new AlbumTypeFilter(
+            new HashSet<string> { "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")), filter);
+
+        Assert("Bootleg single filtered out, Official album selected", resolution.Album == "The Album");
+        Assert("selected MBID is the allowed album", resolution.AlbumMusicBrainzId == "official-album");
+
+        // A filter that excludes everything -> falls through to Deezer title floor.
+        var httpClient2 = new FakeHttpClient();
+        httpClient2.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"No Code\"}}");
+        httpClient2.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient2.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var noMatch = new AlbumTypeFilter(
+            new HashSet<string> { "Single" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver2 = new SXMPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
+        var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")), noMatch);
+
+        Assert("all-filtered-out falls through to Deezer title", resolution2.Album == "No Code");
+        Assert("no MBID when everything filtered out", resolution2.AlbumMusicBrainzId == null);
+    }
+
+    private static void TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss()
+    {
+        Console.WriteLine("\n[Test] After ISRC misses, a release title search recovers a real MBID");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"Three Cheers for Sweet Revenge\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"mcr-mbid\",\"name\":\"My Chemical Romance\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"Three Cheers for Sweet Revenge\",\"primary-type\":\"Album\",\"first-release-date\":\"2004-06-08\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("My Chemical Romance", "I'm Not Okay (I Promise)", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("title search recovered the album", resolution.Album == "Three Cheers for Sweet Revenge");
+        Assert("album MBID attached", resolution.AlbumMusicBrainzId == "album-mbid-1");
+        Assert("artist MBID attached", resolution.ArtistMusicBrainzId == "mcr-mbid");
+    }
+
+    private static void TestAlbumResolutionTitleSearchRejectsWrongArtist()
+    {
+        Console.WriteLine("\n[Test] Title search rejects a high-score hit when the credited artist doesn't match");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"Blind\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        // Same-titled album but credited to a different artist ("Wild Horses / Blind" case).
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"wrong-mbid\",\"name\":\"Chuck Hammer\"}}]," +
+            "\"release-group\":{\"id\":\"wrong-album-mbid\",\"title\":\"Blind on Blind\",\"primary-type\":\"Album\",\"first-release-date\":\"1976-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Sundays", "Wild Horses", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("wrong-artist release not attached", resolution.AlbumMusicBrainzId == null);
+        Assert("falls through to Deezer title floor", resolution.Album == "Blind");
+    }
+
+    private static void TestAlbumResolutionTitleSearchViaApple()
+    {
+        Console.WriteLine("\n[Test] Title search upgrades an Apple Music title to a real MBID");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"No Code\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507")));
+
+        Assert("Apple title upgraded to MBID", resolution.Album == "No Code");
+        Assert("album MBID attached", resolution.AlbumMusicBrainzId == "album-mbid-1");
+    }
+
+    private static void TestAlbumResolutionRanksCompilationLast()
+    {
+        Console.WriteLine("\n[Test] Compilation-typed releases rank below studio albums in title-search selection");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"Greatest Hits\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        // Same artist: a compilation and a studio release both titled to match.
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"Greatest Hits\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2000-01-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"Greatest Hits\",\"primary-type\":\"Album\",\"first-release-date\":\"1990-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "Some Song", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("studio release preferred over compilation", resolution.AlbumMusicBrainzId == "album-mbid-1");
+    }
+
+    private static void TestAlbumResolutionRanksMultiTagCompilationLast()
+    {
+        Console.WriteLine("\n[Test] A compilation carrying an extra secondary type still ranks last (not escaped)");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"Greatest Hits\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        // Same artist, same title: a clean studio release vs a Compilation+Soundtrack tagged release.
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"Greatest Hits\",\"primary-type\":\"Album\",\"secondary-types\":[\"Soundtrack\",\"Compilation\"],\"first-release-date\":\"2000-01-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"Greatest Hits\",\"primary-type\":\"Album\",\"first-release-date\":\"1990-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "Some Song", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("studio release preferred even when compilation carries Soundtrack too", resolution.AlbumMusicBrainzId == "album-mbid-1");
+    }
+
+    private static void TestAlbumResolutionTitleSearchStripsEditionSuffixInQuery()
+    {
+        Console.WriteLine("\n[Test] Edition suffix in the Deezer title is stripped from the search query");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"Three Cheers for Sweet Revenge (Deluxe Edition)\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        // Verify the query sent to MB does NOT contain the suffix - FakeHttpClient captures the URL.
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"mcr-mbid\",\"name\":\"My Chemical Romance\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"Three Cheers for Sweet Revenge\",\"primary-type\":\"Album\",\"first-release-date\":\"2004-06-08\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("My Chemical Romance", "I'm Not Okay (I Promise)", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("resolved despite the suffix in the source title", resolution.AlbumMusicBrainzId == "album-mbid-1");
+        Assert("query did not contain the literal suffix", !httpClient.LastRequestUrl.Contains("Deluxe"));
     }
 
     private static void TestMusicBrainzBusyIsRetried()
@@ -494,10 +674,137 @@ internal static class Program
         Assert("fresh track kept", store.GetDueTracks(100).Any(t => t.TrackId == "newTrack"));
     }
 
+    private static void TestStoreSchedulesRetryForNoMbidTrack()
+    {
+        Console.WriteLine("\n[Test] A no-MBID resolution schedules a retry 12h out, not immediately");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
+
+        Assert("not due yet within the 12h window", store.GetDueRetries(10, now).Count == 0);
+        Assert("due after the retry interval", store.GetDueRetries(10, now + SXMPlaylistHistoryStore.RetryInterval + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "track1"));
+    }
+
+    private static void TestStoreRetryGivesUpAfterMaxAttempts()
+    {
+        Console.WriteLine("\n[Test] no-MBID retry stops after exhausting the attempt budget");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
+
+        for (var i = 0; i < SXMPlaylistHistoryStore.MaxRetryAttempts; i++)
+        {
+            store.RecordRetryFailure("track1", now);
+        }
+
+        Assert("excluded once attempts exhausted", !store.GetDueRetries(10, now + TimeSpan.FromDays(10)).Any(t => t.TrackId == "track1"));
+    }
+
+    private static void TestStoreRetrySuccessClearsRetryState()
+    {
+        Console.WriteLine("\n[Test] A successful retry that finds an MBID clears the retry schedule");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
+        store.RecordRetryFailure("track1", now);
+
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1"), now + TimeSpan.FromHours(1));
+
+        Assert("MBID track no longer due for retry", !store.GetDueRetries(10, now + TimeSpan.FromDays(1)).Any(t => t.TrackId == "track1"));
+        Assert("still presentable after renewal", store.GetPresentableTracks("altnation", now + TimeSpan.FromHours(1) - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
+    }
+
+    private static void TestStoreNewPlayResetsRetryClock()
+    {
+        Console.WriteLine("\n[Test] A fresh play of a no-MBID track resets its retry clock");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
+        store.RecordRetryFailure("track1", now);
+
+        // A later replay re-inserts the track: retry clock resets, immediately due again.
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now + TimeSpan.FromHours(1));
+
+        Assert("replay makes it due again immediately", store.GetDueRetries(10, now + TimeSpan.FromHours(1) + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "track1"));
+    }
+
+    private static void TestStoreRetryFailureRenewsPresentationWindow()
+    {
+        Console.WriteLine("\n[Test] A failed retry renews ResolvedUtc so the track stays presentable");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
+
+        // Fail a retry past the 25h presentation window; the track must remain presentable.
+        store.RecordRetryFailure("track1", now + SXMPlaylistHistoryStore.PresentationWindow + TimeSpan.FromHours(1));
+
+        Assert("track still presentable after failed retry renewed the window", store.GetPresentableTracks("altnation", now, 10).Any(t => t.TrackId == "track1"));
+    }
+
+    private static void TestStoreMigrationAddsRetryColumnsIdempotently()
+    {
+        Console.WriteLine("\n[Test] Creating the store on an old-schema DB adds the retry columns without error");
+
+        var folder = NewFolder();
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        Directory.CreateDirectory(Path.Combine(folder.AppDataFolder, "SXMPlaylist"));
+
+        // Build an old-schema Tracks table manually (no NextRetryUtc / RetryAttempts), with an
+        // existing no-MBID row that pre-dates the feature.
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var command = new System.Data.SQLite.SQLiteCommand(
+                "CREATE TABLE Tracks (TrackId TEXT PRIMARY KEY, Channel TEXT NOT NULL, ArtistsJson TEXT NOT NULL, " +
+                "Song TEXT NOT NULL, DeezerUrl TEXT, AppleMusicUrl TEXT, TimestampUtc TEXT NOT NULL, " +
+                "Resolved INTEGER NOT NULL DEFAULT 0, Failures INTEGER NOT NULL DEFAULT 0, Album TEXT, " +
+                "ArtistMusicBrainzId TEXT, AlbumMusicBrainzId TEXT, ResolvedUtc TEXT)",
+                connection);
+            command.ExecuteNonQuery();
+
+            using var insert = new System.Data.SQLite.SQLiteCommand(
+                "INSERT INTO Tracks (TrackId, Channel, ArtistsJson, Song, TimestampUtc, Resolved, Album, ResolvedUtc) " +
+                "VALUES ('legacy', 'altnation', '[\"Old Artist\"]', 'Old Song', @ts, 1, 'Old Album', @ts)",
+                connection);
+            insert.Parameters.AddWithValue("@ts", DateTime.UtcNow.AddDays(-3).ToString("O"));
+            insert.ExecuteNonQuery();
+        }
+
+        var store = new SXMPlaylistHistoryStore(folder);
+
+        // The migration backfill must stagger the legacy no-MBID row out by a full retry interval
+        // (not make it immediately due), so a rollout doesn't flood MusicBrainz.
+        Assert("legacy no-MBID row not immediately due after migration", !store.GetDueRetries(10, DateTime.UtcNow).Any(t => t.TrackId == "legacy"));
+        Assert("legacy no-MBID row due after one interval", store.GetDueRetries(10, DateTime.UtcNow + SXMPlaylistHistoryStore.RetryInterval + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "legacy"));
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, DateTime.UtcNow);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), DateTime.UtcNow);
+
+        Assert("retry columns usable on migrated DB", store.GetDueRetries(10, DateTime.UtcNow + SXMPlaylistHistoryStore.RetryInterval).Any(t => t.TrackId == "track1"));
+
+        // Constructing the store again (every start) must not throw, and must not re-stagger rows.
+        var store2 = new SXMPlaylistHistoryStore(folder);
+        Assert("second initialize is idempotent", store2.GetDueTracks(10).Count == 0);
+    }
+
     private static void TestWorkerCapturesDueChannel()
     {
         Console.WriteLine("\n[Test] Worker captures a channel that has never been captured");
-
         SXMPlaylistFeedCache.Clear();
         var folder = NewFolder();
         var httpClient = new FakeHttpClient();
@@ -506,7 +813,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -527,7 +834,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
         var callsAfterFirst = httpClient.CallCount;
         worker.RunOnce(CancellationToken.None);
@@ -552,7 +859,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -564,6 +871,55 @@ internal static class Program
         Assert("artist MBID attached (single-artist)", presentable[0].ArtistMusicBrainzId == "artist-mbid-1");
     }
 
+    private static void TestWorkerUsesListMetadataProfileForResolution()
+    {
+        Console.WriteLine("\n[Test] Worker applies the channel's list metadata profile when resolving");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "I'm Open", new[] { ("deezer", "https://www.deezer.com/track/624510") })));
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"No Code\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var factory = new FakeImportListFactory();
+        factory.AddChannel("altnation", metadataProfileId: 42);
+
+        // Profile 42 only allows Singles - the Official Album candidate must be filtered out, so the
+        // track falls through to the Deezer-title floor with no MBID.
+        var singlesOnly = new MetadataProfile
+        {
+            Id = 42,
+            PrimaryAlbumTypes = new List<ProfilePrimaryAlbumTypeItem>
+            {
+                new() { Allowed = true, PrimaryAlbumType = PrimaryAlbumType.Single },
+                new() { Allowed = false, PrimaryAlbumType = PrimaryAlbumType.Album }
+            },
+            SecondaryAlbumTypes = new List<ProfileSecondaryAlbumTypeItem>
+            {
+                new() { Allowed = true, SecondaryAlbumType = SecondaryAlbumType.Studio }
+            },
+            ReleaseStatuses = new List<ProfileReleaseStatusItem>
+            {
+                new() { Allowed = true, ReleaseStatus = ReleaseStatus.Official }
+            }
+        };
+
+        var profiles = new FakeMetadataProfileService(singlesOnly);
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10);
+
+        Assert("track still resolved via Deezer title fallback", presentable.Count == 1);
+        Assert("album title kept from Deezer", presentable[0].Album == "No Code");
+        Assert("no MBID because profile excluded the only MB candidate", presentable[0].AlbumMusicBrainzId == null);
+    }
+
     private static void TestWorkerIdlesWithNoChannels()
     {
         Console.WriteLine("\n[Test] Worker does nothing when no XM Playlist channels are configured");
@@ -573,7 +929,7 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         var factory = new FakeImportListFactory();
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         Assert("no HTTP requests made", httpClient.CallCount == 0);
@@ -643,6 +999,7 @@ internal class FakeHttpClient : IHttpClient
     private readonly Dictionary<string, Queue<(HttpStatusCode Status, string Content)>> _sequencesByUrlFragment = new();
 
     public int CallCount { get; private set; }
+    public string LastRequestUrl { get; private set; } = "";
 
     public void Respond(string urlFragment, string jsonContent)
     {
@@ -663,6 +1020,7 @@ internal class FakeHttpClient : IHttpClient
     public HttpResponse Get(HttpRequest request)
     {
         CallCount++;
+        LastRequestUrl = request.Url.FullUri;
 
         foreach (var pair in _sequencesByUrlFragment)
         {
@@ -823,12 +1181,13 @@ internal class FakeImportListFactory : IImportListFactory
 {
     private readonly List<ImportListDefinition> _definitions = new();
 
-    public void AddChannel(string channel)
+    public void AddChannel(string channel, int metadataProfileId = 0)
     {
         _definitions.Add(new ImportListDefinition
         {
             Implementation = "SXMPlaylistImport",
             EnableAutomaticAdd = true,
+            MetadataProfileId = metadataProfileId,
             Settings = new SXMPlaylistImportSettings { Channel = channel }
         });
     }
@@ -854,4 +1213,36 @@ internal class FakeImportListFactory : IImportListFactory
     public ValidationResult Test(ImportListDefinition definition) => throw new NotSupportedException();
     public object RequestAction(ImportListDefinition definition, string action, IDictionary<string, string> query) => throw new NotSupportedException();
     public List<ImportListDefinition> AllForTag(int tagId) => throw new NotSupportedException();
+}
+
+internal class FakeMetadataProfileService : IMetadataProfileService
+{
+    private readonly Dictionary<int, MetadataProfile> _profiles = new();
+    private MetadataProfile? _defaultProfile;
+
+    public FakeMetadataProfileService()
+    {
+    }
+
+    public FakeMetadataProfileService(params MetadataProfile[] profiles)
+    {
+        foreach (var profile in profiles)
+        {
+            _profiles[profile.Id] = profile;
+        }
+    }
+
+    public void SetDefault(MetadataProfile profile) => _defaultProfile = profile;
+
+    public MetadataProfile Add(MetadataProfile profile)
+    {
+        _profiles[profile.Id] = profile;
+        return profile;
+    }
+
+    public void Update(MetadataProfile profile) => _profiles[profile.Id] = profile;
+    public void Delete(int id) => _profiles.Remove(id);
+    public List<MetadataProfile> All() => _profiles.Values.ToList();
+    public MetadataProfile Get(int id) => _profiles.TryGetValue(id, out var p) ? p : _defaultProfile ?? throw new NotSupportedException();
+    public bool Exists(int id) => _profiles.ContainsKey(id);
 }

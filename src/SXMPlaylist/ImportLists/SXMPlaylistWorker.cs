@@ -9,6 +9,7 @@ using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.ImportLists;
+using NzbDrone.Core.Profiles.Metadata;
 
 namespace SXMPlaylist.ImportLists
 {
@@ -30,12 +31,14 @@ namespace SXMPlaylist.ImportLists
         private static readonly TimeSpan BackfillWindow = TimeSpan.FromHours(2);
         private static readonly TimeSpan LoopInterval = TimeSpan.FromSeconds(60);
         private const int ResolutionBatchSize = 50;
+        private const int RetryBatchSize = 15;
 
         private const string BaseUrl = "https://xmplaylist.com";
         private const string ImplementationName = "SXMPlaylistImport";
 
         private readonly IHttpClient _httpClient;
         private readonly IImportListFactory _importListFactory;
+        private readonly IMetadataProfileService _metadataProfileService;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistAlbumResolver _albumResolver;
         private readonly Logger _logger;
@@ -44,10 +47,16 @@ namespace SXMPlaylist.ImportLists
         private CancellationTokenSource? _cancellationTokenSource;
         private Task? _loopTask;
 
-        public SXMPlaylistWorker(IHttpClient httpClient, IAppFolderInfo appFolderInfo, IImportListFactory importListFactory, Logger logger)
+        public SXMPlaylistWorker(
+            IHttpClient httpClient,
+            IAppFolderInfo appFolderInfo,
+            IImportListFactory importListFactory,
+            IMetadataProfileService metadataProfileService,
+            Logger logger)
         {
             _httpClient = httpClient;
             _importListFactory = importListFactory;
+            _metadataProfileService = metadataProfileService;
             _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
             _albumResolver = new SXMPlaylistAlbumResolver(httpClient, logger);
             _logger = logger;
@@ -233,39 +242,119 @@ namespace SXMPlaylist.ImportLists
 
         private void ResolveDueTracks(CancellationToken token)
         {
-            var due = _historyStore.GetDueTracks(ResolutionBatchSize);
-            if (due.Count == 0)
-            {
-                return;
-            }
+            var filtersByChannel = BuildFiltersByChannel();
 
+            // Phase 1: first-time resolution gets the full budget and runs first, so the retry
+            // backlog can never starve fresh tracks.
+            var due = _historyStore.GetDueTracks(ResolutionBatchSize);
             foreach (var track in due)
             {
                 token.ThrowIfCancellationRequested();
+                ResolveTrack(track, filtersByChannel, isRetry: false, token);
+            }
 
-                var links = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                if (track.DeezerUrl.IsNotNullOrWhiteSpace())
+            // Phase 2: no-MBID tracks due for a re-attempt, on a much smaller budget.
+            var dueRetries = _historyStore.GetDueRetries(RetryBatchSize, DateTime.UtcNow);
+            foreach (var track in dueRetries)
+            {
+                token.ThrowIfCancellationRequested();
+                ResolveTrack(track, filtersByChannel, isRetry: true, token);
+            }
+        }
+
+        private void ResolveTrack(PendingTrack track, Dictionary<string, AlbumTypeFilter> filtersByChannel, bool isRetry, CancellationToken token)
+        {
+            var links = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (track.DeezerUrl.IsNotNullOrWhiteSpace())
+            {
+                links["deezer"] = track.DeezerUrl!;
+            }
+
+            if (track.AppleMusicUrl.IsNotNullOrWhiteSpace())
+            {
+                links["appleMusic"] = track.AppleMusicUrl!;
+            }
+
+            var artist = track.Artists.FirstOrDefault() ?? "";
+            var filter = filtersByChannel.TryGetValue(track.Channel, out var f) ? f : AlbumTypeFilter.Unrestricted;
+            var resolution = _albumResolver.Resolve(artist, track.Song, links, filter);
+
+            // First-time resolution succeeds with any resolved album (a title floor result is fine -
+            // it makes the track presentable). A retry only counts as success if it actually found
+            // the missing MusicBrainz album ID; a title-only floor result means the retry failed,
+            // so the attempt counter advances and the give-up can eventually trigger.
+            var isSuccess = isRetry
+                ? resolution.Resolved && resolution.AlbumMusicBrainzId.IsNotNullOrWhiteSpace()
+                : resolution.Resolved;
+
+            if (isSuccess)
+            {
+                _historyStore.MarkTrackResolved(track.TrackId, resolution);
+                _logger.Debug("Resolved album for {0} - {1}", artist, track.Song);
+            }
+            else if (isRetry)
+            {
+                _historyStore.RecordRetryFailure(track.TrackId, DateTime.UtcNow);
+                _logger.Debug("Retry {0} - {1} failed, will retry later", artist, track.Song);
+            }
+            else
+            {
+                _historyStore.RecordTrackFailure(track.TrackId);
+            }
+        }
+
+        // Map each configured channel to the album-type filter derived from that channel's list(s)
+        // metadata profile. Multiple lists on the same channel share a profile here; when two lists
+        // disagree, the first enabled list wins (same accepted rule as PLAN §6.2). Falls back to
+        // unrestricted when no list/profile is available.
+        private Dictionary<string, AlbumTypeFilter> BuildFiltersByChannel()
+        {
+            var result = new Dictionary<string, AlbumTypeFilter>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                foreach (var definition in _importListFactory.All()
+                    .Where(d => string.Equals(d.Implementation, ImplementationName, StringComparison.OrdinalIgnoreCase) && d.EnableAutomaticAdd))
                 {
-                    links["deezer"] = track.DeezerUrl!;
+                    var channel = (definition.Settings as SXMPlaylistImportSettings)?.Channel;
+                    if (channel.IsNullOrWhiteSpace() || result.ContainsKey(channel!))
+                    {
+                        continue;
+                    }
+
+                    result[channel!] = GetFilterForProfileId(definition.MetadataProfileId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not read metadata profiles for SXM Playlist channels");
+            }
+
+            return result;
+        }
+
+        private AlbumTypeFilter GetFilterForProfileId(int metadataProfileId)
+        {
+            try
+            {
+                var profile = _metadataProfileService.Exists(metadataProfileId)
+                    ? _metadataProfileService.Get(metadataProfileId)
+                    : _metadataProfileService.All().FirstOrDefault();
+
+                if (profile == null)
+                {
+                    return AlbumTypeFilter.Unrestricted;
                 }
 
-                if (track.AppleMusicUrl.IsNotNullOrWhiteSpace())
-                {
-                    links["appleMusic"] = track.AppleMusicUrl!;
-                }
-
-                var artist = track.Artists.FirstOrDefault() ?? "";
-                var resolution = _albumResolver.Resolve(artist, track.Song, links);
-
-                if (resolution.Resolved)
-                {
-                    _historyStore.MarkTrackResolved(track.TrackId, resolution);
-                    _logger.Debug("Resolved album for {0} - {1}", artist, track.Song);
-                }
-                else
-                {
-                    _historyStore.RecordTrackFailure(track.TrackId);
-                }
+                return new AlbumTypeFilter(
+                    new HashSet<string>(profile.PrimaryAlbumTypes.Where(p => p.Allowed).Select(p => p.PrimaryAlbumType.Name), StringComparer.OrdinalIgnoreCase),
+                    new HashSet<string>(profile.SecondaryAlbumTypes.Where(p => p.Allowed).Select(p => p.SecondaryAlbumType.Name), StringComparer.OrdinalIgnoreCase),
+                    new HashSet<string>(profile.ReleaseStatuses.Where(p => p.Allowed).Select(p => p.ReleaseStatus.Name), StringComparer.OrdinalIgnoreCase));
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not read metadata profile {0}, using unrestricted filter", metadataProfileId);
+                return AlbumTypeFilter.Unrestricted;
             }
         }
     }
