@@ -28,8 +28,6 @@ namespace SXMPlaylist.ImportLists
     public class SXMPlaylistImport : HttpImportListBase<SXMPlaylistImportSettings>
     {
         private static readonly TimeSpan ChannelCacheLifetime = TimeSpan.FromHours(24);
-        private const int MaxItemsPerFetch = 20;
-
         private readonly IImportListRepository _importListRepository;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistRefreshScheduler _refreshScheduler;
@@ -75,10 +73,19 @@ namespace SXMPlaylist.ImportLists
                 return new List<ImportListItemInfo>();
             }
 
-            var since = DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow;
+            var now = DateTime.UtcNow;
+            var presentationSince = now - SXMPlaylistHistoryStore.PresentationWindow;
+            var retainedSince = now - GetHistoryRetention(Settings);
             var show = Settings?.Show ?? SXMPlaylistShowSchedule.ChannelValue;
             var windows = GetShowWindows(channel, show);
-            var presentable = _historyStore.GetPresentableTracks(channel, since, MaxItemsPerFetch, windows);
+            var presentable = _historyStore.GetPresentableTracks(
+                channel,
+                presentationSince,
+                retainedSince,
+                GetAlbumsPerHour(Settings),
+                windows,
+                Settings?.RequireMusicBrainzId ?? false,
+                GetMinimumPlays(Settings));
 
             var items = new List<ImportListItemInfo>();
             foreach (var track in presentable)
@@ -327,6 +334,23 @@ namespace SXMPlaylist.ImportLists
         private static string NormalizeShow(string? show)
         {
             return show.IsNullOrWhiteSpace() ? SXMPlaylistShowSchedule.ChannelValue : show!;
+        }
+
+        private static int GetAlbumsPerHour(SXMPlaylistImportSettings? settings)
+        {
+            var value = settings?.AlbumsPerHour ?? 20;
+            return value <= 0 ? 20 : Math.Clamp(value, 1, 100);
+        }
+
+        private static int GetMinimumPlays(SXMPlaylistImportSettings? settings)
+        {
+            return Math.Max(settings?.MinimumPlays ?? 1, 1);
+        }
+
+        private static TimeSpan GetHistoryRetention(SXMPlaylistImportSettings? settings)
+        {
+            var value = settings?.HistoryRetentionDays ?? (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays;
+            return TimeSpan.FromDays(value <= 0 ? SXMPlaylistHistoryStore.PlayRetention.TotalDays : Math.Clamp(value, 1, (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays));
         }
     }
 }

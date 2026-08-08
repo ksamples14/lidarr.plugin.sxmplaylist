@@ -12,6 +12,15 @@ namespace SXMPlaylist.ImportLists
             RuleFor(c => c.Channel)
                 .NotEmpty()
                 .WithMessage("Channel is required");
+
+            RuleFor(c => c.MinimumPlays)
+                .GreaterThanOrEqualTo(1);
+
+            RuleFor(c => c.HistoryRetentionDays)
+                .InclusiveBetween(1, (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays);
+
+            RuleFor(c => c.AlbumsPerHour)
+                .InclusiveBetween(1, 100);
         }
     }
 
@@ -26,6 +35,10 @@ namespace SXMPlaylist.ImportLists
             BaseUrl = "https://xmplaylist.com";
             Channel = "";
             Show = SXMPlaylistShowSchedule.ChannelValue;
+            MinimumPlays = 1;
+            HistoryRetentionDays = (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays;
+            AlbumsPerHour = 20;
+            RequireMusicBrainzId = false;
         }
 
         // Lidarr's dynamic Select field renders as a multi-select checklist or a single dropdown
@@ -46,6 +59,18 @@ namespace SXMPlaylist.ImportLists
 
         [FieldDefinition(1, Label = "Show", Type = FieldType.Select, SelectOptionsProviderAction = "getShows", HelpText = "Optional SiriusXM show filter from the official EPG schedule. Channel imports the whole channel.")]
         public string Show { get; set; }
+
+        [FieldDefinition(2, Label = "Require MusicBrainz ID", Type = FieldType.Checkbox, HelpText = "Only import albums with a MusicBrainz album ID. Title-only matches can still appear later if background retries find an ID.")]
+        public bool RequireMusicBrainzId { get; set; }
+
+        [FieldDefinition(3, Label = "Minimum Plays", Type = FieldType.Number, HelpText = "Minimum number of times a song must appear in the retained channel history before it is imported.")]
+        public int MinimumPlays { get; set; }
+
+        [FieldDefinition(4, Label = "History Retention Days", Type = FieldType.Number, HelpText = "How many days of captured plays to keep and consider for this list.")]
+        public int HistoryRetentionDays { get; set; }
+
+        [FieldDefinition(5, Label = "Albums Per Hour", Type = FieldType.Number, HelpText = "Maximum albums this list presents each hourly import-list sync.")]
+        public int AlbumsPerHour { get; set; }
 
         public string BaseUrl { get; set; }
 

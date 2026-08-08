@@ -61,7 +61,11 @@ internal static class Program
         TestStoreUpsertsTrackAndResolvesToPresentable();
         TestStoreThreeStrikesExcludesTrack();
         TestStorePresentableWindowExpires();
+        TestStoreRequireMbidFiltersBeforeLimit();
+        TestStoreMinimumPlaysFiltersBeforeLimit();
+        TestStoreAlbumsPerHourLimitsPresentation();
         TestStorePruneRemovesOldData();
+        TestStoreHistoryRetentionFiltersQueryOnly();
         TestStoreSchedulesRetryForNoMbidTrack();
         TestStoreRetryGivesUpAfterMaxAttempts();
         TestStoreRetrySuccessClearsRetryState();
@@ -852,6 +856,72 @@ internal static class Program
         Assert("old resolution is no longer presentable", store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
     }
 
+    private static void TestStoreRequireMbidFiltersBeforeLimit()
+    {
+        Console.WriteLine("\n[Test] Require MusicBrainz ID filters before the presentation limit");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        for (var i = 0; i < 25; i++)
+        {
+            var trackId = "titleOnly" + i;
+            store.UpsertTrack(trackId, "altnation", new[] { "Artist" }, "Title Only " + i, null, null, now.AddMinutes(i));
+            store.MarkTrackResolved(trackId, new AlbumResolution(true, "Title Album", null, null), now.AddMinutes(i));
+        }
+
+        store.UpsertTrack("mbidTrack", "altnation", new[] { "Artist" }, "MBID Song", null, null, now.AddMinutes(-5));
+        store.MarkTrackResolved("mbidTrack", new AlbumResolution(true, "MBID Album", null, "album-mbid"), now.AddMinutes(-5));
+
+        var strict = store.GetPresentableTracks("altnation", now.AddHours(-1), 20, requireMusicBrainzId: true);
+
+        Assert("older MBID row is returned even when newer title-only rows exceed limit", strict.Count == 1 && strict[0].TrackId == "mbidTrack");
+    }
+
+    private static void TestStoreMinimumPlaysFiltersBeforeLimit()
+    {
+        Console.WriteLine("\n[Test] Minimum Plays filters before the presentation limit");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        for (var i = 0; i < 25; i++)
+        {
+            var trackId = "singlePlay" + i;
+            store.TryRecordPlay("singlePlay" + i, "altnation", "Artist", "Single Play " + i, now.AddMinutes(i));
+            store.UpsertTrack(trackId, "altnation", new[] { "Artist" }, "Single Play " + i, null, null, now.AddMinutes(i));
+            store.MarkTrackResolved(trackId, new AlbumResolution(true, "Single Album", null, "single-mbid" + i), now.AddMinutes(i));
+        }
+
+        store.TryRecordPlay("repeat1", "altnation", "Artist", "Repeat Song", now.AddMinutes(-10));
+        store.TryRecordPlay("repeat2", "altnation", "Artist", "Repeat Song", now.AddMinutes(-9));
+        store.UpsertTrack("repeatTrack", "altnation", new[] { "Artist" }, "Repeat Song", null, null, now.AddMinutes(-10));
+        store.MarkTrackResolved("repeatTrack", new AlbumResolution(true, "Repeat Album", null, "repeat-mbid"), now.AddMinutes(-10));
+
+        var presentable = store.GetPresentableTracks("altnation", now.AddHours(-1), 20, minimumPlays: 2);
+
+        Assert("older repeated row is returned while newer single-play rows are hidden", presentable.Count == 1 && presentable[0].TrackId == "repeatTrack");
+    }
+
+    private static void TestStoreAlbumsPerHourLimitsPresentation()
+    {
+        Console.WriteLine("\n[Test] Albums Per Hour limits the presented row count");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        for (var i = 0; i < 5; i++)
+        {
+            var trackId = "track" + i;
+            store.UpsertTrack(trackId, "altnation", new[] { "Artist" }, "Song " + i, null, null, now.AddMinutes(i));
+            store.MarkTrackResolved(trackId, new AlbumResolution(true, "Album " + i, null, "album-mbid" + i), now.AddMinutes(i));
+        }
+
+        var presentable = store.GetPresentableTracks("altnation", now.AddHours(-1), 3);
+
+        Assert($"presentation is limited to 3 rows (got {presentable.Count})", presentable.Count == 3);
+    }
+
     private static void TestStorePruneRemovesOldData()
     {
         Console.WriteLine("\n[Test] Prune drops plays and tracks older than the retention window");
@@ -871,6 +941,27 @@ internal static class Program
         Assert("fresh play kept", store.GetPlays("altnation", DateTime.MinValue).Any(p => p.Song == "New Song"));
         Assert("old track pruned", store.GetDueTracks(100).All(t => t.TrackId != "oldTrack"));
         Assert("fresh track kept", store.GetDueTracks(100).Any(t => t.TrackId == "newTrack"));
+    }
+
+    private static void TestStoreHistoryRetentionFiltersQueryOnly()
+    {
+        Console.WriteLine("\n[Test] History retention days filters query results only");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+        var twoDaysOld = now.AddDays(-2);
+
+        store.TryRecordPlay("oldPlay", "altnation", "Artist", "Old Song", twoDaysOld);
+        store.UpsertTrack("oldTrack", "altnation", new[] { "Artist" }, "Old Song", null, null, twoDaysOld);
+        store.MarkTrackResolved("oldTrack", new AlbumResolution(true, "Old Album", null, "old-mbid"), now);
+
+        var oneDayList = store.GetPresentableTracks("altnation", now.AddHours(-1), now.AddDays(-1), 10);
+        var threeDayList = store.GetPresentableTracks("altnation", now.AddHours(-1), now.AddDays(-3), 10);
+        store.Prune();
+
+        Assert("one-day query hides the old play", oneDayList.Count == 0);
+        Assert("three-day query includes the old play", threeDayList.Any(t => t.TrackId == "oldTrack"));
+        Assert("global 180-day prune keeps the old play", store.GetPlays("altnation", DateTime.MinValue).Count == 1);
     }
 
     private static void TestStoreSchedulesRetryForNoMbidTrack()

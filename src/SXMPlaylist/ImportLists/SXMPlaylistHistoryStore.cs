@@ -346,10 +346,42 @@ namespace SXMPlaylist.ImportLists
         // Tracks resolved within the presentation window, for this channel - i.e. what the import
         // list hands to Lidarr. Resolved tracks stay presentable for the window; Lidarr's own
         // import-list processing is idempotent, so re-presentation is harmless.
-        public IReadOnlyList<PresentableTrack> GetPresentableTracks(string channel, DateTime resolvedSinceUtc, int limit, IReadOnlyList<ShowWindow>? windows = null)
+        public IReadOnlyList<PresentableTrack> GetPresentableTracks(
+            string channel,
+            DateTime resolvedSinceUtc,
+            int limit,
+            IReadOnlyList<ShowWindow>? windows = null,
+            bool requireMusicBrainzId = false,
+            int minimumPlays = 1)
+        {
+            return GetPresentableTracks(
+                channel,
+                resolvedSinceUtc,
+                DateTime.UtcNow - PlayRetention,
+                limit,
+                windows,
+                requireMusicBrainzId,
+                minimumPlays);
+        }
+
+        public IReadOnlyList<PresentableTrack> GetPresentableTracks(
+            string channel,
+            DateTime resolvedSinceUtc,
+            DateTime retainedSinceUtc,
+            int limit,
+            IReadOnlyList<ShowWindow>? windows = null,
+            bool requireMusicBrainzId = false,
+            int minimumPlays = 1)
         {
             var results = new List<PresentableTrack>();
             var windowFilter = "";
+            var mbidFilter = requireMusicBrainzId ? " AND AlbumMusicBrainzId IS NOT NULL AND AlbumMusicBrainzId <> ''" : "";
+            var minimumPlaysFilter = minimumPlays > 1
+                ? " AND EXISTS (SELECT 1 FROM Plays p WHERE p.Channel = Tracks.Channel " +
+                  "AND lower(trim(p.Song)) = lower(trim(Tracks.Song)) " +
+                  "AND instr(lower(Tracks.ArtistsJson), '\"' || lower(trim(p.Artist)) || '\"') > 0 " +
+                  "GROUP BY lower(trim(p.Artist)), lower(trim(p.Song)) HAVING COUNT(DISTINCT p.PlayId) >= @minimumPlays)"
+                : "";
             if (windows != null)
             {
                 if (windows.Count == 0)
@@ -363,12 +395,14 @@ namespace SXMPlaylist.ImportLists
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
                 "SELECT TrackId, ArtistsJson, Song, Album, ArtistMusicBrainzId, AlbumMusicBrainzId, TimestampUtc FROM Tracks " +
-                "WHERE Channel = @channel AND Resolved = 1 AND ResolvedUtc >= @since" + windowFilter + " ORDER BY ResolvedUtc DESC LIMIT @limit",
+                "WHERE Channel = @channel AND Resolved = 1 AND ResolvedUtc >= @resolvedSince AND TimestampUtc >= @retainedSince" + mbidFilter + minimumPlaysFilter + windowFilter + " ORDER BY ResolvedUtc DESC LIMIT @limit",
                 connection);
 
             command.Parameters.AddWithValue("@channel", channel);
-            command.Parameters.AddWithValue("@since", resolvedSinceUtc.ToString("O"));
+            command.Parameters.AddWithValue("@resolvedSince", resolvedSinceUtc.ToString("O"));
+            command.Parameters.AddWithValue("@retainedSince", retainedSinceUtc.ToString("O"));
             command.Parameters.AddWithValue("@limit", limit);
+            command.Parameters.AddWithValue("@minimumPlays", Math.Max(minimumPlays, 1));
             if (windows != null)
             {
                 for (var i = 0; i < windows.Count; i++)
