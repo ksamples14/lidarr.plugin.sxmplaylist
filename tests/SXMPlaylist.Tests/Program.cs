@@ -33,6 +33,7 @@ internal static class Program
         TestChannelDirectoryFetchesAndParses();
         TestChannelCacheStoresAndReuses();
         TestSettingsRequireNonEmptyChannel();
+        TestSettingsApiPathMirrorsChannelForUiRefresh();
         TestShowScheduleParsesOfficialEpgShape();
         TestStoreFiltersPresentableTracksByShowWindow();
         TestImportAllowsSameChannelDifferentShows();
@@ -171,6 +172,17 @@ internal static class Program
 
         Assert("empty channel fails validation", !none.Validate().IsValid);
         Assert("a selected channel passes validation", one.Validate().IsValid);
+    }
+
+    private static void TestSettingsApiPathMirrorsChannelForUiRefresh()
+    {
+        Console.WriteLine("\n[Test] Settings apiPath mirrors Channel for Lidarr dynamic option refresh");
+
+        var settings = new SXMPlaylistImportSettings { Channel = "altnation" };
+        Assert("apiPath getter exposes the selected channel", settings.ApiPath == "altnation");
+
+        settings.ApiPath = "alt2k";
+        Assert("apiPath setter updates backend Channel", settings.Channel == "alt2k");
     }
 
     private static void TestShowScheduleParsesOfficialEpgShape()
