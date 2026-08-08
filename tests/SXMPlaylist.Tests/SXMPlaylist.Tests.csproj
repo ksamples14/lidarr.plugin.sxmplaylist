@@ -28,11 +28,14 @@
 
   <ItemGroup>
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistImportSettings.cs" Link="SXMPlaylistImportSettings.cs" />
+    <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistImport.cs" Link="SXMPlaylistImport.cs" />
+    <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistRequestGenerator.cs" Link="SXMPlaylistRequestGenerator.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistRequestBuilder.cs" Link="SXMPlaylistRequestBuilder.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistStationBackfill.cs" Link="SXMPlaylistStationBackfill.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistHistoryStore.cs" Link="SXMPlaylistHistoryStore.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistAlbumResolver.cs" Link="SXMPlaylistAlbumResolver.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistChannelDirectory.cs" Link="SXMPlaylistChannelDirectory.cs" />
+    <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistShowSchedule.cs" Link="SXMPlaylistShowSchedule.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistRefreshScheduler.cs" Link="SXMPlaylistRefreshScheduler.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistFeed.cs" Link="SXMPlaylistFeed.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistFeedCache.cs" Link="SXMPlaylistFeedCache.cs" />

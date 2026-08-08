@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Linq.Expressions;
 using System.Threading;
 using FluentValidation.Results;
 using NLog;
@@ -16,6 +17,7 @@ using NzbDrone.Core.Music;
 using NzbDrone.Core.Music.Commands;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Profiles.Metadata;
+using NzbDrone.Core.ThingiProvider;
 using SXMPlaylist.ImportLists;
 
 internal static class Program
@@ -31,15 +33,21 @@ internal static class Program
         TestChannelDirectoryFetchesAndParses();
         TestChannelCacheStoresAndReuses();
         TestSettingsRequireNonEmptyChannel();
+        TestShowScheduleParsesOfficialEpgShape();
+        TestStoreFiltersPresentableTracksByShowWindow();
+        TestImportAllowsSameChannelDifferentShows();
+        TestImportBlocksSecondListWhenDefaultExists();
         TestRefreshSchedulerPushesRefreshForNewlyMonitoredAlbum();
 
         TestAlbumResolutionViaDeezerAndMusicBrainz();
         TestAlbumResolutionFallsBackToDeezerTitle();
         TestAlbumResolutionFallsBackToAppleMusic();
         TestAlbumResolutionSkipsVariousArtistsCompilations();
+        TestAlbumResolutionRejectsDifferentAlbumArtist();
         TestAlbumResolutionPrefersSingleOverEpOverAlbum();
         TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss();
         TestAlbumResolutionTitleSearchRejectsWrongArtist();
+        TestAlbumResolutionTitleSearchRejectsOneTokenContainment();
         TestAlbumResolutionTitleSearchViaApple();
         TestAlbumResolutionRanksCompilationLast();
         TestAlbumResolutionRanksMultiTagCompilationLast();
@@ -163,6 +171,135 @@ internal static class Program
 
         Assert("empty channel fails validation", !none.Validate().IsValid);
         Assert("a selected channel passes validation", one.Validate().IsValid);
+    }
+
+    private static void TestShowScheduleParsesOfficialEpgShape()
+    {
+        Console.WriteLine("\n[Test] Show schedule parses SiriusXM EPG episode windows");
+
+        var json = "{\"chEpgInfo\":{\"dayChSchedules\":[{\"episode\":[" +
+                   "{\"pgid\":16824,\"pr\":{\"pName\":\"The Alt-18- Most Requested Countdown!\"},\"sc\":{\"sTimeStr\":\"08.08.2026 18:00 EDT\",\"eTimeStr\":\"08.08.2026 19:00 EDT\"}}," +
+                   "{\"pgid\":16606,\"pr\":{\"pName\":\"Alt Nation\"},\"sc\":{\"sTimeStr\":\"08.08.2026 19:00 EDT\",\"eTimeStr\":\"08.08.2026 20:00 EDT\"}}" +
+                   "]}],\"pg\":[]}}";
+
+        var shows = SXMPlaylistShowSchedule.Parse(json);
+        var alt18 = shows.SingleOrDefault(s => s.ProgramId == "16824");
+
+        Assert($"parses both scheduled shows (got {shows.Count})", shows.Count == 2);
+        Assert("uses program name from episode pr.pName", alt18?.Name == "The Alt-18- Most Requested Countdown!");
+        Assert("parses Eastern show window to UTC", alt18?.Windows.Count == 1 && alt18.Windows[0].Contains(new DateTime(2026, 8, 8, 22, 30, 0, DateTimeKind.Utc)));
+    }
+
+    private static void TestStoreFiltersPresentableTracksByShowWindow()
+    {
+        Console.WriteLine("\n[Test] Presentable tracks can be filtered by show windows before limit");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+        var showTime = now.AddHours(-2);
+        var otherTime = now.AddHours(-1);
+
+        for (var i = 0; i < 25; i++)
+        {
+            var trackId = "other" + i;
+            store.UpsertTrack(trackId, "altnation", new[] { "Other Artist" }, "Other Song", null, null, otherTime.AddMinutes(i));
+            store.MarkTrackResolved(trackId, new AlbumResolution(true, "Other Album", null, "other-album" + i), now.AddMinutes(i));
+        }
+
+        store.UpsertTrack("showTrack", "altnation", new[] { "Show Artist" }, "Show Song", null, null, showTime);
+        store.MarkTrackResolved("showTrack", new AlbumResolution(true, "Show Album", null, "show-album"), now.AddMinutes(-30));
+
+        var windows = new[] { new ShowWindow(showTime.AddMinutes(-5), showTime.AddMinutes(5)) };
+        var presentable = store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 20, windows);
+
+        Assert("show-window match is returned even when newer non-show rows exceed limit", presentable.Count == 1 && presentable[0].TrackId == "showTrack");
+        Assert("empty show windows return no tracks", store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 20, Array.Empty<ShowWindow>()).Count == 0);
+    }
+
+    private static void TestImportAllowsSameChannelDifferentShows()
+    {
+        Console.WriteLine("\n[Test] Import UI allows same channel with different unused shows");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.SaveChannels(new[] { new ChannelInfo("altnation", "Alt Nation", "36") });
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("sxmepg/epg.sxmchepginfo.xmc", BuildEpgJson());
+
+        var repo = new FakeImportListRepository();
+        repo.Add(1, "altnation", "16824");
+        var import = NewImport(httpClient, folder, repo, 0, "altnation", SXMPlaylistShowSchedule.ChannelValue);
+
+        var channels = GetOptionValues(import.RequestAction("getChannels", new Dictionary<string, string>()));
+        var shows = GetOptionValues(import.RequestAction("getShows", new Dictionary<string, string> { ["channel"] = "altnation" }));
+
+        Assert("channel remains selectable when only a show-specific list exists", channels.Contains("altnation"));
+        Assert("already-used show is removed", !shows.Contains("16824"));
+        Assert("another show remains selectable", shows.Contains("16606"));
+        Assert("default Channel option remains selectable when no default list exists", shows.Contains(SXMPlaylistShowSchedule.ChannelValue));
+    }
+
+    private static void TestImportBlocksSecondListWhenDefaultExists()
+    {
+        Console.WriteLine("\n[Test] Import UI blocks a second list when the channel default exists");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.SaveChannels(new[] { new ChannelInfo("altnation", "Alt Nation", "36") });
+
+        var repo = new FakeImportListRepository();
+        repo.Add(1, "altnation", SXMPlaylistShowSchedule.ChannelValue);
+        var import = NewImport(new FakeHttpClient(), folder, repo, 0, "", SXMPlaylistShowSchedule.ChannelValue);
+
+        var channels = GetOptionValues(import.RequestAction("getChannels", new Dictionary<string, string>()));
+
+        Assert("channel with an existing default list is hidden for new lists", !channels.Contains("altnation"));
+    }
+
+    private static SXMPlaylistImport NewImport(FakeHttpClient httpClient, FakeAppFolderInfo folder, FakeImportListRepository repo, int id, string channel, string show)
+    {
+        var import = new SXMPlaylistImport(
+            httpClient,
+            null!,
+            null!,
+            null!,
+            folder,
+            new FakeArtistService(),
+            new FakeAlbumService(),
+            new FakeCommandQueue(),
+            repo,
+            LogManager.GetLogger("Test"));
+
+        import.Definition = new ImportListDefinition
+        {
+            Id = id,
+            Implementation = nameof(SXMPlaylistImport),
+            Settings = new SXMPlaylistImportSettings { Channel = channel, Show = show }
+        };
+
+        return import;
+    }
+
+    private static HashSet<string> GetOptionValues(object response)
+    {
+        var options = (System.Collections.IEnumerable)response.GetType().GetProperty("options")!.GetValue(response)!;
+        var values = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var option in options)
+        {
+            values.Add((string)option.GetType().GetProperty("Value")!.GetValue(option)!);
+        }
+
+        return values;
+    }
+
+    private static string BuildEpgJson()
+    {
+        return "{\"chEpgInfo\":{\"dayChSchedules\":[{\"episode\":[" +
+               "{\"pgid\":16824,\"pr\":{\"pName\":\"The Alt-18- Most Requested Countdown!\"},\"sc\":{\"sTimeStr\":\"08.08.2026 18:00 EDT\",\"eTimeStr\":\"08.08.2026 19:00 EDT\"}}," +
+               "{\"pgid\":16606,\"pr\":{\"pName\":\"Alt Nation\"},\"sc\":{\"sTimeStr\":\"08.08.2026 19:00 EDT\",\"eTimeStr\":\"08.08.2026 20:00 EDT\"}}" +
+               "]}],\"pg\":[]}}";
     }
 
     private static void TestRefreshSchedulerPushesRefreshForNewlyMonitoredAlbum()
@@ -332,6 +469,26 @@ internal static class Program
         Assert("no compilation MBID used", resolution2.AlbumMusicBrainzId == null);
     }
 
+    private static void TestAlbumResolutionRejectsDifferentAlbumArtist()
+    {
+        Console.WriteLine("\n[Test] Exact MusicBrainz matches reject release-groups credited to a different artist");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"The Five Pennies\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"louis-armstrong-mbid\",\"name\":\"Louis Armstrong\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"danny-kaye-mbid\",\"name\":\"Danny Kaye\"}}]," +
+            "\"release-group\":{\"id\":\"soundtrack-mbid\",\"title\":\"The Five Pennies\",\"primary-type\":\"Album\",\"secondary-types\":[\"Soundtrack\"],\"first-release-date\":\"1959-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Louis Armstrong", "After You've Gone", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("different-artist soundtrack MBID not attached", resolution.AlbumMusicBrainzId == null);
+        Assert("different album artist MBID not attached", resolution.ArtistMusicBrainzId == null);
+        Assert("falls back to Deezer title", resolution.Album == "The Five Pennies");
+    }
+
     private static void TestAlbumResolutionPrefersSingleOverEpOverAlbum()
     {
         Console.WriteLine("\n[Test] Album resolution prefers Single over EP over Album for the artist's own releases");
@@ -458,6 +615,36 @@ internal static class Program
 
         Assert("wrong-artist release not attached", resolution.AlbumMusicBrainzId == null);
         Assert("falls through to Deezer title floor", resolution.Album == "Blind");
+    }
+
+    private static void TestAlbumResolutionTitleSearchRejectsOneTokenContainment()
+    {
+        Console.WriteLine("\n[Test] Title search rejects one-token self-titled matches inside longer provider titles");
+
+        var mozartHttp = new FakeHttpClient();
+        mozartHttp.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"Perahia & Mozart: Perfect Match\"}]}");
+        mozartHttp.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"wrong-mozart-artist\",\"name\":\"moZart\"}}]," +
+            "\"release-group\":{\"id\":\"wrong-mozart-album\",\"title\":\"moZart\",\"primary-type\":\"Album\",\"first-release-date\":\"1994-01-01\"}}]}");
+
+        var mozartResolver = new SXMPlaylistAlbumResolver(mozartHttp, LogManager.GetLogger("Test"));
+        var mozart = mozartResolver.Resolve("Mozart", "Piano Concerto No. 20 in D minor, K. 466", Links(("appleMusic", "https://geo.music.apple.com/us/album/_/1686922239?i=1686922505")));
+
+        Assert("moZart self-titled MBID not attached", mozart.AlbumMusicBrainzId == null);
+        Assert("falls through to the Apple album title", mozart.Album == "Perahia & Mozart: Perfect Match");
+
+        var cakeHttp = new FakeHttpClient();
+        cakeHttp.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM10100001\",\"album\":{\"title\":\"Cake: B-Sides and Rarities\"}}");
+        cakeHttp.Respond("musicbrainz.org/ws/2/isrc/USSM10100001", "{\"recordings\":[]}");
+        cakeHttp.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"wrong-cake-artist\",\"name\":\"Cake\"}}]," +
+            "\"release-group\":{\"id\":\"wrong-cake-album\",\"title\":\"Cake\",\"primary-type\":\"Album\",\"first-release-date\":\"1992-01-01\"}}]}");
+
+        var cakeResolver = new SXMPlaylistAlbumResolver(cakeHttp, LogManager.GetLogger("Test"));
+        var cake = cakeResolver.Resolve("Cake", "Short Skirt/Long Jacket", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("Cake self-titled MBID not attached", cake.AlbumMusicBrainzId == null);
+        Assert("falls through to the Deezer album title", cake.Album == "Cake: B-Sides and Rarities");
     }
 
     private static void TestAlbumResolutionTitleSearchViaApple()
@@ -1213,6 +1400,44 @@ internal class FakeImportListFactory : IImportListFactory
     public ValidationResult Test(ImportListDefinition definition) => throw new NotSupportedException();
     public object RequestAction(ImportListDefinition definition, string action, IDictionary<string, string> query) => throw new NotSupportedException();
     public List<ImportListDefinition> AllForTag(int tagId) => throw new NotSupportedException();
+}
+
+internal class FakeImportListRepository : IImportListRepository
+{
+    private readonly List<ImportListDefinition> _definitions = new();
+
+    public void Add(int id, string channel, string show)
+    {
+        _definitions.Add(new ImportListDefinition
+        {
+            Id = id,
+            Implementation = nameof(SXMPlaylistImport),
+            Settings = new SXMPlaylistImportSettings { Channel = channel, Show = show }
+        });
+    }
+
+    public IEnumerable<ImportListDefinition> All() => _definitions;
+    public int Count() => _definitions.Count;
+    public ImportListDefinition Find(int id) => _definitions.FirstOrDefault(d => d.Id == id)!;
+    public ImportListDefinition Get(int id) => _definitions.Single(d => d.Id == id);
+    public IEnumerable<ImportListDefinition> Get(IEnumerable<int> ids) => _definitions.Where(d => ids.Contains(d.Id));
+    public bool HasItems() => _definitions.Count > 0;
+    public ImportListDefinition Single() => _definitions.Single();
+    public ImportListDefinition SingleOrDefault() => _definitions.SingleOrDefault()!;
+    public void UpdateSettings(ImportListDefinition model) => throw new NotSupportedException();
+    public ImportListDefinition Insert(ImportListDefinition model) => throw new NotSupportedException();
+    public ImportListDefinition Update(ImportListDefinition model) => throw new NotSupportedException();
+    public ImportListDefinition Upsert(ImportListDefinition model) => throw new NotSupportedException();
+    public void SetFields(ImportListDefinition model, params Expression<Func<ImportListDefinition, object>>[] properties) => throw new NotSupportedException();
+    public void Delete(ImportListDefinition model) => throw new NotSupportedException();
+    public void Delete(int id) => throw new NotSupportedException();
+    public void InsertMany(IList<ImportListDefinition> model) => throw new NotSupportedException();
+    public void UpdateMany(IList<ImportListDefinition> model) => throw new NotSupportedException();
+    public void SetFields(IList<ImportListDefinition> models, params Expression<Func<ImportListDefinition, object>>[] properties) => throw new NotSupportedException();
+    public void DeleteMany(List<ImportListDefinition> model) => throw new NotSupportedException();
+    public void DeleteMany(IEnumerable<int> ids) => throw new NotSupportedException();
+    public void Purge(bool vacuum = false) => throw new NotSupportedException();
+    public PagingSpec<ImportListDefinition> GetPaged(PagingSpec<ImportListDefinition> pagingSpec) => throw new NotSupportedException();
 }
 
 internal class FakeMetadataProfileService : IMetadataProfileService

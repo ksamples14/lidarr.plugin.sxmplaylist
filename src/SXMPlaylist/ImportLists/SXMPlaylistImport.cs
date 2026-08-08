@@ -30,6 +30,7 @@ namespace SXMPlaylist.ImportLists
         private static readonly TimeSpan ChannelCacheLifetime = TimeSpan.FromHours(24);
         private const int MaxItemsPerFetch = 20;
 
+        private readonly IImportListRepository _importListRepository;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistRefreshScheduler _refreshScheduler;
 
@@ -57,9 +58,11 @@ namespace SXMPlaylist.ImportLists
             IArtistService artistService,
             IAlbumService albumService,
             IManageCommandQueue commandQueueManager,
+            IImportListRepository importListRepository,
             Logger logger)
             : base(httpClient, importListStatusService, configService, parsingService, logger)
         {
+            _importListRepository = importListRepository;
             _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
             _refreshScheduler = new SXMPlaylistRefreshScheduler(artistService, albumService, commandQueueManager, logger);
         }
@@ -73,7 +76,9 @@ namespace SXMPlaylist.ImportLists
             }
 
             var since = DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow;
-            var presentable = _historyStore.GetPresentableTracks(channel, since, MaxItemsPerFetch);
+            var show = Settings?.Show ?? SXMPlaylistShowSchedule.ChannelValue;
+            var windows = GetShowWindows(channel, show);
+            var presentable = _historyStore.GetPresentableTracks(channel, since, MaxItemsPerFetch, windows);
 
             var items = new List<ImportListItemInfo>();
             foreach (var track in presentable)
@@ -156,6 +161,38 @@ namespace SXMPlaylist.ImportLists
 
         public override object RequestAction(string action, IDictionary<string, string> query)
         {
+            if (action == "getShows")
+            {
+                var channel = Settings?.Channel ?? "";
+                if (query.TryGetValue("channel", out var queryChannel) && queryChannel.IsNotNullOrWhiteSpace())
+                {
+                    channel = queryChannel;
+                }
+
+                var shows = new List<ShowInfo>();
+                try
+                {
+                    shows = SXMPlaylistShowSchedule.Fetch(_httpClient, channel).ToList();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug(ex, "Failed to refresh SiriusXM EPG show list for channel {0}", channel);
+                }
+
+                var currentShow = Settings?.Show ?? SXMPlaylistShowSchedule.ChannelValue;
+                var usedShows = GetUsedShowsForChannel(channel);
+
+                return new
+                {
+                    options = new[]
+                        {
+                            new { Value = SXMPlaylistShowSchedule.ChannelValue, Name = "Channel" }
+                        }
+                        .Concat(shows.Select(s => new { Value = s.ProgramId, Name = s.Name }))
+                        .Where(s => !usedShows.Contains(NormalizeShow(s.Value)) || string.Equals(NormalizeShow(s.Value), NormalizeShow(currentShow), StringComparison.OrdinalIgnoreCase))
+                };
+            }
+
             if (action != "getChannels")
             {
                 return base.RequestAction(action, query);
@@ -181,10 +218,12 @@ namespace SXMPlaylist.ImportLists
             }
 
             var channels = _historyStore.GetCachedChannels();
+            var currentChannel = Settings?.Channel ?? "";
 
             return new
             {
                 options = channels
+                    .Where(c => !GetUsedShowsForChannel(c.Deeplink).Contains(SXMPlaylistShowSchedule.ChannelValue) || string.Equals(c.Deeplink, currentChannel, StringComparison.OrdinalIgnoreCase))
                     .OrderBy(c => int.TryParse(c.Number, out var n) ? n : int.MaxValue)
                     .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
                     .Select(c => new
@@ -200,9 +239,21 @@ namespace SXMPlaylist.ImportLists
         {
             get
             {
-                yield return GetPreset("Alt Nation", "altnation");
-                yield return GetPreset("Lithium", "lithium");
-                yield return GetPreset("PopRocks", "poprocks");
+                var presets = new[]
+                {
+                    GetPreset("Alt Nation", "altnation"),
+                    GetPreset("Lithium", "lithium"),
+                    GetPreset("PopRocks", "poprocks")
+                };
+
+                foreach (var preset in presets)
+                {
+                    var settings = (SXMPlaylistImportSettings)preset.Settings;
+                    if (!GetUsedShowsForChannel(settings.Channel).Contains(SXMPlaylistShowSchedule.ChannelValue))
+                    {
+                        yield return preset;
+                    }
+                }
             }
         }
 
@@ -213,5 +264,69 @@ namespace SXMPlaylist.ImportLists
             Implementation = nameof(SXMPlaylistImport),
             Settings = new SXMPlaylistImportSettings { Channel = channel }
         };
+
+        private IReadOnlyList<ShowWindow>? GetShowWindows(string channel, string show)
+        {
+            if (show.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            try
+            {
+                return SXMPlaylistShowSchedule.Fetch(_httpClient, channel)
+                    .FirstOrDefault(s => string.Equals(s.ProgramId, show, StringComparison.OrdinalIgnoreCase))
+                    ?.Windows ?? Array.Empty<ShowWindow>();
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Failed to refresh SiriusXM EPG for channel {0}, falling back to empty show window", channel);
+                return Array.Empty<ShowWindow>();
+            }
+        }
+
+        private HashSet<string> GetUsedShowsForChannel(string channel)
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (channel.IsNullOrWhiteSpace())
+            {
+                return result;
+            }
+
+            try
+            {
+                foreach (var definition in _importListRepository.All())
+                {
+                    if (!string.Equals(definition.Implementation, nameof(SXMPlaylistImport), StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (Definition != null && definition.Id == Definition.Id)
+                    {
+                        continue;
+                    }
+
+                    if (definition.Settings is not SXMPlaylistImportSettings settings ||
+                        !string.Equals(settings.Channel, channel, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    result.Add(NormalizeShow(settings.Show));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not read configured SXM Playlist show filters");
+            }
+
+            return result;
+        }
+
+        private static string NormalizeShow(string? show)
+        {
+            return show.IsNullOrWhiteSpace() ? SXMPlaylistShowSchedule.ChannelValue : show!;
+        }
     }
 }

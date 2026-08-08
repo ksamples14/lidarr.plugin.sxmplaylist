@@ -95,6 +95,7 @@ namespace SXMPlaylist.ImportLists
         {
             if (!links.TryGetValue("deezer", out var deezerUrl))
             {
+                _logger.Debug("No Deezer link for {0}; trying Apple Music fallback", artist);
                 return null;
             }
 
@@ -106,10 +107,12 @@ namespace SXMPlaylist.ImportLists
 
             var track = GetJson($"https://api.deezer.com/track/{match.Groups[1].Value}");
             var deezerAlbumTitle = track?["album"]?["title"]?.Value<string>();
+            _logger.Debug("Deezer lookup for {0} returned album title '{1}'", artist, deezerAlbumTitle ?? "<none>");
 
             var viaMusicBrainz = ResolveViaMusicBrainz(track, filter);
             if (viaMusicBrainz != null)
             {
+                _logger.Debug("Resolved {0} via Deezer ISRC to MusicBrainz album '{1}' ({2})", artist, viaMusicBrainz.Album, viaMusicBrainz.AlbumMusicBrainzId);
                 return viaMusicBrainz;
             }
 
@@ -118,6 +121,7 @@ namespace SXMPlaylist.ImportLists
             var viaTitleSearch = ResolveViaMusicBrainzTitleSearch(artist, deezerAlbumTitle, filter);
             if (viaTitleSearch != null)
             {
+                _logger.Debug("Resolved {0} via Deezer title search to MusicBrainz album '{1}' ({2})", artist, viaTitleSearch.Album, viaTitleSearch.AlbumMusicBrainzId);
                 return viaTitleSearch;
             }
 
@@ -131,6 +135,7 @@ namespace SXMPlaylist.ImportLists
             var isrc = track?["isrc"]?.Value<string>();
             if (isrc.IsNullOrWhiteSpace())
             {
+                _logger.Debug("Deezer track has no ISRC; cannot use exact MusicBrainz lookup");
                 return null;
             }
 
@@ -140,6 +145,7 @@ namespace SXMPlaylist.ImportLists
 
             if (recordingId.IsNullOrWhiteSpace())
             {
+                _logger.Debug("MusicBrainz ISRC lookup found no recording for ISRC {0}", isrc);
                 return null;
             }
 
@@ -151,9 +157,10 @@ namespace SXMPlaylist.ImportLists
             var artistCredits = recording?["artist-credit"] as JArray;
             string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
 
-            var releaseGroup = SelectBestReleaseGroup(recording, artistMbid, filter);
+            var releaseGroup = SelectBestReleaseGroup(recording, artistMbid, filter, _logger);
             if (releaseGroup == null)
             {
+                _logger.Debug("MusicBrainz recording {0} had no acceptable release-group for recording artist {1}", recordingId, artistMbid ?? "<none>");
                 return null;
             }
 
@@ -186,10 +193,13 @@ namespace SXMPlaylist.ImportLists
             var releases = result?["releases"] as JArray;
             if (releases == null || releases.Count == 0)
             {
+                _logger.Debug("MusicBrainz title search found no releases for {0} / '{1}'", artist, albumTitle);
                 return null;
             }
 
             var candidates = new JArray();
+            var artistRejected = 0;
+            var titleRejected = 0;
             foreach (var release in releases)
             {
                 var rg = release["release-group"];
@@ -201,6 +211,7 @@ namespace SXMPlaylist.ImportLists
                 // Artist gate: the release's credited artist must plausibly be the played artist.
                 if (!ArtistCreditMatches(release, artist))
                 {
+                    artistRejected++;
                     continue;
                 }
 
@@ -208,6 +219,7 @@ namespace SXMPlaylist.ImportLists
                 var rgTitle = rg["title"]?.Value<string>();
                 if (rgTitle.IsNullOrWhiteSpace() || TitleSimilarity(rgTitle!, albumTitle!) < TitleMatchThreshold)
                 {
+                    titleRejected++;
                     continue;
                 }
 
@@ -216,14 +228,31 @@ namespace SXMPlaylist.ImportLists
 
             if (candidates.Count == 0)
             {
+                _logger.Debug(
+                    "MusicBrainz title search rejected all {0} releases for {1} / '{2}' ({3} artist-credit, {4} title)",
+                    releases.Count,
+                    artist,
+                    albumTitle,
+                    artistRejected,
+                    titleRejected);
                 return null;
             }
 
+            _logger.Debug(
+                "MusicBrainz title search for {0} / '{1}' kept {2}/{3} releases ({4} artist-credit rejects, {5} title rejects)",
+                artist,
+                albumTitle,
+                candidates.Count,
+                releases.Count,
+                artistRejected,
+                titleRejected);
+
             // Reuse the approved ranking (status > primary > secondary > date, VA excluded).
             var syntheticRecording = new JObject { ["releases"] = candidates };
-            var selectedReleaseGroup = SelectBestReleaseGroup(syntheticRecording, null, filter);
+            var selectedReleaseGroup = SelectBestReleaseGroup(syntheticRecording, null, filter, _logger);
             if (selectedReleaseGroup == null)
             {
+                _logger.Debug("MusicBrainz title search candidates for {0} / '{1}' were filtered out by release type/status", artist, albumTitle);
                 return null;
             }
 
@@ -244,6 +273,8 @@ namespace SXMPlaylist.ImportLists
             {
                 return null;
             }
+
+            _logger.Debug("MusicBrainz title search selected '{0}' ({1}) for {2} / '{3}'", finalTitle, finalAlbumMbid, artist, albumTitle);
 
             return new AlbumResolution(true, finalTitle, artistMbid, finalAlbumMbid);
         }
@@ -351,9 +382,11 @@ namespace SXMPlaylist.ImportLists
             var tokenScore = union == 0 ? 0.0 : (double)intersection / union;
 
             // Containment: the fraction of the smaller token set present in the larger, so
-            // "best of" ⊂ "the best of" scores highly like token_set_ratio.
+            // "best of" ⊂ "the best of" scores highly like token_set_ratio. Do not let a
+            // one-token candidate title match only because it appears inside a longer provider
+            // title: that accepts false self-titled hits like Cake/moZart.
             var smaller = Math.Min(tokensA.Count, tokensB.Count);
-            var containment = smaller == 0 ? 0.0 : (double)intersection / smaller;
+            var containment = smaller < 2 ? 0.0 : (double)intersection / smaller;
 
             var editScore = 1.0 - (double)LevenshteinDistance(na, nb) / Math.Max(na.Length, nb.Length);
 
@@ -408,7 +441,7 @@ namespace SXMPlaylist.ImportLists
             return dp[a.Length, b.Length];
         }
 
-        private static JToken? SelectBestReleaseGroup(JToken? recording, string? recordingArtistId, AlbumTypeFilter filter)
+        private static JToken? SelectBestReleaseGroup(JToken? recording, string? recordingArtistId, AlbumTypeFilter filter, Logger? logger = null)
         {
             var releases = recording?["releases"] as JArray;
             if (releases == null || releases.Count == 0)
@@ -433,6 +466,25 @@ namespace SXMPlaylist.ImportLists
             if (candidates.Count == 0)
             {
                 return null;
+            }
+
+            if (recordingArtistId.IsNotNullOrWhiteSpace())
+            {
+                var creditedCandidates = candidates.Where(r => FirstCreditedArtist(r) != null).ToList();
+                var sameArtistCandidates = creditedCandidates.Where(r => MatchesRecordingArtist(r, recordingArtistId)).ToList();
+
+                if (sameArtistCandidates.Count > 0)
+                {
+                    candidates = sameArtistCandidates;
+                }
+                else if (creditedCandidates.Count > 0)
+                {
+                    logger?.Debug(
+                        "Rejected {0} MusicBrainz release candidates because none matched recording artist {1}",
+                        creditedCandidates.Count,
+                        recordingArtistId);
+                    return null;
+                }
             }
 
             // Approved lexicographic ranking (PLAN §6.6): artist-credit match, then release
@@ -578,11 +630,13 @@ namespace SXMPlaylist.ImportLists
 
             var lookup = GetJson($"https://itunes.apple.com/lookup?id={match.Groups[1].Value}");
             var albumTitle = lookup?["results"]?.FirstOrDefault()?["collectionName"]?.Value<string>();
+            _logger.Debug("Apple Music lookup for {0} returned album title '{1}'", artist, albumTitle ?? "<none>");
 
             // Try to upgrade the Apple title to a real MBID before falling back to the raw title.
             var viaTitleSearch = ResolveViaMusicBrainzTitleSearch(artist, albumTitle, filter);
             if (viaTitleSearch != null)
             {
+                _logger.Debug("Resolved {0} via Apple title search to MusicBrainz album '{1}' ({2})", artist, viaTitleSearch.Album, viaTitleSearch.AlbumMusicBrainzId);
                 return viaTitleSearch;
             }
 

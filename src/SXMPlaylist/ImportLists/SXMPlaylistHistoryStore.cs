@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data.SQLite;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
 using NzbDrone.Common.EnvironmentInfo;
 
@@ -345,23 +346,42 @@ namespace SXMPlaylist.ImportLists
         // Tracks resolved within the presentation window, for this channel - i.e. what the import
         // list hands to Lidarr. Resolved tracks stay presentable for the window; Lidarr's own
         // import-list processing is idempotent, so re-presentation is harmless.
-        public IReadOnlyList<PresentableTrack> GetPresentableTracks(string channel, DateTime resolvedSinceUtc, int limit)
+        public IReadOnlyList<PresentableTrack> GetPresentableTracks(string channel, DateTime resolvedSinceUtc, int limit, IReadOnlyList<ShowWindow>? windows = null)
         {
             var results = new List<PresentableTrack>();
+            var windowFilter = "";
+            if (windows != null)
+            {
+                if (windows.Count == 0)
+                {
+                    return results;
+                }
+
+                windowFilter = " AND (" + string.Join(" OR ", windows.Select((_, i) => $"(TimestampUtc >= @windowStart{i} AND TimestampUtc < @windowEnd{i})")) + ")";
+            }
 
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
                 "SELECT TrackId, ArtistsJson, Song, Album, ArtistMusicBrainzId, AlbumMusicBrainzId, TimestampUtc FROM Tracks " +
-                "WHERE Channel = @channel AND Resolved = 1 AND ResolvedUtc >= @since ORDER BY ResolvedUtc DESC LIMIT @limit",
+                "WHERE Channel = @channel AND Resolved = 1 AND ResolvedUtc >= @since" + windowFilter + " ORDER BY ResolvedUtc DESC LIMIT @limit",
                 connection);
 
             command.Parameters.AddWithValue("@channel", channel);
             command.Parameters.AddWithValue("@since", resolvedSinceUtc.ToString("O"));
             command.Parameters.AddWithValue("@limit", limit);
+            if (windows != null)
+            {
+                for (var i = 0; i < windows.Count; i++)
+                {
+                    command.Parameters.AddWithValue($"@windowStart{i}", windows[i].StartUtc.ToString("O"));
+                    command.Parameters.AddWithValue($"@windowEnd{i}", windows[i].EndUtc.ToString("O"));
+                }
+            }
 
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
+                var timestampUtc = DateTime.Parse(reader.GetString(6)).ToUniversalTime();
                 results.Add(new PresentableTrack(
                     reader.GetString(0),
                     JsonConvert.DeserializeObject<List<string>>(reader.GetString(1)) ?? new List<string>(),
@@ -369,7 +389,7 @@ namespace SXMPlaylist.ImportLists
                     reader.IsDBNull(3) ? null : reader.GetString(3),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
                     reader.IsDBNull(5) ? null : reader.GetString(5),
-                    DateTime.Parse(reader.GetString(6)).ToUniversalTime()));
+                    timestampUtc));
             }
 
             return results;
