@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json.Linq;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
@@ -12,13 +14,71 @@ namespace SXMPlaylist.ImportLists
     {
         public const string ChannelValue = "";
 
-        public static IReadOnlyList<ShowInfo> Fetch(IHttpClient httpClient, string channel)
+        private static readonly Dictionary<string, string[]> EpgKeyAliases = new(StringComparer.OrdinalIgnoreCase)
+        {
+            // xmplaylist uses williesroadhouse; SiriusXM EPG and channel-page show data use theroadhouse.
+            ["williesroadhouse"] = new[] { "theroadhouse" }
+        };
+
+        private static readonly object EpgKeyCacheLock = new();
+        private static readonly Dictionary<string, string> ResolvedEpgKeys = new(StringComparer.OrdinalIgnoreCase);
+
+        public static IReadOnlyList<ShowInfo> Fetch(IHttpClient httpClient, string channel, string? channelName = null)
         {
             if (channel.IsNullOrWhiteSpace())
             {
                 return new List<ShowInfo>();
             }
 
+            var triedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var cachedKey = GetCachedEpgKey(channel);
+            if (cachedKey.IsNotNullOrWhiteSpace())
+            {
+                triedKeys.Add(cachedKey!);
+                var cachedShows = FetchEpg(httpClient, cachedKey!);
+                if (cachedShows.Count > 0)
+                {
+                    return cachedShows;
+                }
+
+                ClearCachedEpgKey(channel, cachedKey!);
+            }
+
+            foreach (var epgKey in GetCandidateEpgKeys(channel))
+            {
+                if (!triedKeys.Add(epgKey))
+                {
+                    continue;
+                }
+
+                var shows = FetchEpg(httpClient, epgKey);
+                if (shows.Count > 0)
+                {
+                    CacheEpgKey(channel, epgKey);
+                    return shows;
+                }
+            }
+
+            foreach (var epgKey in FetchPageCandidateEpgKeys(httpClient, channelName))
+            {
+                if (!triedKeys.Add(epgKey))
+                {
+                    continue;
+                }
+
+                var shows = FetchEpg(httpClient, epgKey);
+                if (shows.Count > 0)
+                {
+                    CacheEpgKey(channel, epgKey);
+                    return shows;
+                }
+            }
+
+            return new List<ShowInfo>();
+        }
+
+        private static IReadOnlyList<ShowInfo> FetchEpg(IHttpClient httpClient, string channel)
+        {
             var url = "https://www.siriusxm.com/sxmepg/epg.sxmchepginfo.xmc" +
                       $"?channelKeys={Uri.EscapeDataString(channel)}&distribution=XMDCOM&tzone=Eastern";
             var request = SXMPlaylistRequestBuilder.Build(url);
@@ -30,6 +90,110 @@ namespace SXMPlaylist.ImportLists
             }
 
             return Parse(response.Content);
+        }
+
+        private static IEnumerable<string> GetCandidateEpgKeys(string channel)
+        {
+            if (EpgKeyAliases.TryGetValue(channel, out var aliases))
+            {
+                foreach (var alias in aliases)
+                {
+                    yield return alias;
+                }
+            }
+
+            yield return channel;
+        }
+
+        private static IEnumerable<string> FetchPageCandidateEpgKeys(IHttpClient httpClient, string? channelName)
+        {
+            var slug = ToSiriusXmSlug(channelName);
+            if (slug.IsNullOrWhiteSpace())
+            {
+                yield break;
+            }
+
+            var request = SXMPlaylistRequestBuilder.Build($"https://www.siriusxm.com/channels/{slug}");
+            var response = httpClient.Get(request);
+            if (response.StatusCode != System.Net.HttpStatusCode.OK || response.Content.IsNullOrWhiteSpace())
+            {
+                yield break;
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var normalized = response.Content
+                .Replace("\\\"", "\"")
+                .Replace("&quot;", "\"", StringComparison.OrdinalIgnoreCase)
+                .Replace("\\u0022", "\"", StringComparison.OrdinalIgnoreCase);
+
+            foreach (Match match in Regex.Matches(normalized, "\"channelId\"\\s*:\\s*\"(?<id>[a-z0-9_-]+)\"", RegexOptions.IgnoreCase))
+            {
+                var key = match.Groups["id"].Value;
+                if (key.IsNotNullOrWhiteSpace() && seen.Add(key))
+                {
+                    yield return key;
+                }
+            }
+        }
+
+        private static string? GetCachedEpgKey(string channel)
+        {
+            lock (EpgKeyCacheLock)
+            {
+                return ResolvedEpgKeys.TryGetValue(channel, out var epgKey) ? epgKey : null;
+            }
+        }
+
+        private static void CacheEpgKey(string channel, string epgKey)
+        {
+            lock (EpgKeyCacheLock)
+            {
+                ResolvedEpgKeys[channel] = epgKey;
+            }
+        }
+
+        private static void ClearCachedEpgKey(string channel, string epgKey)
+        {
+            lock (EpgKeyCacheLock)
+            {
+                if (ResolvedEpgKeys.TryGetValue(channel, out var cached) && string.Equals(cached, epgKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    ResolvedEpgKeys.Remove(channel);
+                }
+            }
+        }
+
+        private static string ToSiriusXmSlug(string? channelName)
+        {
+            if (channelName.IsNullOrWhiteSpace())
+            {
+                return "";
+            }
+
+            var normalized = channelName!.Normalize(NormalizationForm.FormD);
+            var builder = new StringBuilder();
+            var lastWasDash = false;
+
+            foreach (var c in normalized)
+            {
+                if (CharUnicodeInfo.GetUnicodeCategory(c) == UnicodeCategory.NonSpacingMark)
+                {
+                    continue;
+                }
+
+                if (char.IsLetterOrDigit(c))
+                {
+                    builder.Append(char.ToLowerInvariant(c));
+                    lastWasDash = false;
+                }
+                else if (!lastWasDash && builder.Length > 0)
+                {
+                    builder.Append('-');
+                    lastWasDash = true;
+                }
+            }
+
+            return builder.ToString().Trim('-');
         }
 
         public static IReadOnlyList<ShowInfo> Parse(string json)

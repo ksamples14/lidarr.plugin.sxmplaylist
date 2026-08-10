@@ -196,6 +196,8 @@ namespace SXMPlaylist.ImportLists
                 return;
             }
 
+            RefreshShowWindows(channel);
+
             var captured = 0;
 
             foreach (var play in feed.Results)
@@ -219,6 +221,7 @@ namespace SXMPlaylist.ImportLists
                 }
 
                 var isNew = false;
+                var showWindow = _historyStore.GetShowWindowForPlay(playChannel, play.Timestamp);
                 foreach (var artist in play.Track.Artists)
                 {
                     if (artist.IsNullOrWhiteSpace())
@@ -227,6 +230,7 @@ namespace SXMPlaylist.ImportLists
                     }
 
                     isNew |= _historyStore.TryRecordPlay(play.Id!, playChannel, artist, song, play.Timestamp);
+                    isNew |= _historyStore.TryRecordPlayEvent(play.Id!, playChannel, trackId, artist, song, play.Timestamp, showWindow);
                 }
 
                 if (isNew)
@@ -238,6 +242,29 @@ namespace SXMPlaylist.ImportLists
 
             _historyStore.SetLastCaptureUtc(channel, DateTime.UtcNow);
             _logger.Debug("Captured {0} new plays for channel {1}", captured, channel);
+        }
+
+        private void RefreshShowWindows(string channel)
+        {
+            try
+            {
+                var shows = SXMPlaylistShowSchedule.Fetch(_httpClient, channel, GetChannelName(channel));
+                if (shows.Count > 0)
+                {
+                    _historyStore.SaveShowWindows(channel, shows);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Failed to refresh SiriusXM EPG windows for channel {0}", channel);
+            }
+        }
+
+        private string? GetChannelName(string channel)
+        {
+            return _historyStore.GetCachedChannels()
+                .FirstOrDefault(c => string.Equals(c.Deeplink, channel, StringComparison.OrdinalIgnoreCase))
+                ?.Name;
         }
 
         private void ResolveDueTracks(CancellationToken token)
@@ -276,28 +303,36 @@ namespace SXMPlaylist.ImportLists
             }
 
             var artist = track.Artists.FirstOrDefault() ?? "";
-            var filter = filtersByChannel.TryGetValue(track.Channel, out var f) ? f : AlbumTypeFilter.Unrestricted;
-            var resolution = _albumResolver.Resolve(artist, track.Song, links, filter);
+            var baseFilter = filtersByChannel.TryGetValue(track.Channel, out var f) ? f : AlbumTypeFilter.Unrestricted;
+            var storedAny = false;
+            var retryIncomplete = false;
+            var resolutions = _albumResolver.ResolveAllPriorities(artist, track.Song, links, baseFilter);
 
-            // First-time resolution succeeds with any resolved album (a title floor result is fine -
-            // it makes the track presentable). A retry only counts as success if it actually found
-            // the missing MusicBrainz album ID; a title-only floor result means the retry failed,
-            // so the attempt counter advances and the give-up can eventually trigger.
-            var isSuccess = isRetry
-                ? resolution.Resolved && resolution.AlbumMusicBrainzId.IsNotNullOrWhiteSpace()
-                : resolution.Resolved;
-
-            if (isSuccess)
+            foreach (var releasePriority in new[] { ReleasePriorityMode.Singles, ReleasePriorityMode.Albums })
             {
-                _historyStore.MarkTrackResolved(track.TrackId, resolution);
-                _logger.Debug("Resolved album for {0} - {1}", artist, track.Song);
+                if (!resolutions.TryGetValue(releasePriority, out var resolution) || !resolution.Resolved)
+                {
+                    retryIncomplete = retryIncomplete || isRetry;
+                    continue;
+                }
+
+                if (isRetry && resolution.AlbumMusicBrainzId.IsNullOrWhiteSpace())
+                {
+                    retryIncomplete = true;
+                    continue;
+                }
+
+                _historyStore.MarkTrackResolved(track.TrackId, releasePriority, resolution);
+                storedAny = true;
+                _logger.Debug("Resolved {0} album for {1} - {2}", releasePriority, artist, track.Song);
             }
-            else if (isRetry)
+
+            if (isRetry && retryIncomplete)
             {
                 _historyStore.RecordRetryFailure(track.TrackId, DateTime.UtcNow);
-                _logger.Debug("Retry {0} - {1} failed, will retry later", artist, track.Song);
+                _logger.Debug("Retry {0} - {1} still has unresolved priority slots, will retry later", artist, track.Song);
             }
-            else
+            else if (!storedAny)
             {
                 _historyStore.RecordTrackFailure(track.TrackId);
             }
@@ -316,13 +351,14 @@ namespace SXMPlaylist.ImportLists
                 foreach (var definition in _importListFactory.All()
                     .Where(d => string.Equals(d.Implementation, ImplementationName, StringComparison.OrdinalIgnoreCase) && d.EnableAutomaticAdd))
                 {
-                    var channel = (definition.Settings as SXMPlaylistImportSettings)?.Channel;
+                    var settings = definition.Settings as SXMPlaylistImportSettings;
+                    var channel = settings?.Channel;
                     if (channel.IsNullOrWhiteSpace() || result.ContainsKey(channel!))
                     {
                         continue;
                     }
 
-                    result[channel!] = GetFilterForProfileId(definition.MetadataProfileId);
+                    result[channel!] = GetFilterForProfileId(definition.MetadataProfileId, settings?.ReleasePriority ?? ReleasePriorityMode.Singles);
                 }
             }
             catch (Exception ex)
@@ -333,7 +369,7 @@ namespace SXMPlaylist.ImportLists
             return result;
         }
 
-        private AlbumTypeFilter GetFilterForProfileId(int metadataProfileId)
+        private AlbumTypeFilter GetFilterForProfileId(int metadataProfileId, ReleasePriorityMode releasePriority)
         {
             try
             {
@@ -349,7 +385,8 @@ namespace SXMPlaylist.ImportLists
                 return new AlbumTypeFilter(
                     new HashSet<string>(profile.PrimaryAlbumTypes.Where(p => p.Allowed).Select(p => p.PrimaryAlbumType.Name), StringComparer.OrdinalIgnoreCase),
                     new HashSet<string>(profile.SecondaryAlbumTypes.Where(p => p.Allowed).Select(p => p.SecondaryAlbumType.Name), StringComparer.OrdinalIgnoreCase),
-                    new HashSet<string>(profile.ReleaseStatuses.Where(p => p.Allowed).Select(p => p.ReleaseStatus.Name), StringComparer.OrdinalIgnoreCase));
+                    new HashSet<string>(profile.ReleaseStatuses.Where(p => p.Allowed).Select(p => p.ReleaseStatus.Name), StringComparer.OrdinalIgnoreCase),
+                    releasePriority);
             }
             catch (Exception ex)
             {

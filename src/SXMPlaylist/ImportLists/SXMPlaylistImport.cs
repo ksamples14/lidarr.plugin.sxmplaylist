@@ -85,7 +85,8 @@ namespace SXMPlaylist.ImportLists
                 GetAlbumsPerHour(Settings),
                 windows,
                 Settings?.RequireMusicBrainzId ?? false,
-                GetMinimumPlays(Settings));
+                GetMinimumPlays(Settings),
+                Settings?.ReleasePriority ?? ReleasePriorityMode.Singles);
 
             var items = new List<ImportListItemInfo>();
             foreach (var track in presentable)
@@ -179,7 +180,7 @@ namespace SXMPlaylist.ImportLists
                 var shows = new List<ShowInfo>();
                 try
                 {
-                    shows = SXMPlaylistShowSchedule.Fetch(_httpClient, channel).ToList();
+                    shows = SXMPlaylistShowSchedule.Fetch(_httpClient, channel, GetChannelName(channel)).ToList();
                 }
                 catch (Exception ex)
                 {
@@ -281,7 +282,7 @@ namespace SXMPlaylist.ImportLists
 
             try
             {
-                return SXMPlaylistShowSchedule.Fetch(_httpClient, channel)
+                return SXMPlaylistShowSchedule.Fetch(_httpClient, channel, GetChannelName(channel))
                     .FirstOrDefault(s => string.Equals(s.ProgramId, show, StringComparison.OrdinalIgnoreCase))
                     ?.Windows ?? Array.Empty<ShowWindow>();
             }
@@ -290,6 +291,13 @@ namespace SXMPlaylist.ImportLists
                 _logger.Debug(ex, "Failed to refresh SiriusXM EPG for channel {0}, falling back to empty show window", channel);
                 return Array.Empty<ShowWindow>();
             }
+        }
+
+        private string? GetChannelName(string channel)
+        {
+            return _historyStore.GetCachedChannels()
+                .FirstOrDefault(c => string.Equals(c.Deeplink, channel, StringComparison.OrdinalIgnoreCase))
+                ?.Name;
         }
 
         private HashSet<string> GetUsedShowsForChannel(string channel)

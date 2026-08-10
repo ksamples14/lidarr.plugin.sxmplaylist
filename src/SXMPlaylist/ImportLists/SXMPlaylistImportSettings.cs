@@ -5,6 +5,14 @@ using NzbDrone.Core.Validation;
 
 namespace SXMPlaylist.ImportLists
 {
+    public enum ReleasePriorityMode
+    {
+        // Keep Singles at 0 so existing saved list settings that lack this field deserialize to
+        // the historical singles-first behavior.
+        Singles = 0,
+        Albums = 1
+    }
+
     public class SXMPlaylistImportSettingsValidator : AbstractValidator<SXMPlaylistImportSettings>
     {
         public SXMPlaylistImportSettingsValidator()
@@ -39,6 +47,7 @@ namespace SXMPlaylist.ImportLists
             HistoryRetentionDays = (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays;
             AlbumsPerHour = 20;
             RequireMusicBrainzId = false;
+            ReleasePriority = ReleasePriorityMode.Singles;
         }
 
         // Lidarr's dynamic Select field renders as a multi-select checklist or a single dropdown
@@ -71,6 +80,9 @@ namespace SXMPlaylist.ImportLists
 
         [FieldDefinition(5, Label = "Albums Per Hour", Type = FieldType.Number, HelpText = "Maximum albums this list presents each hourly import-list sync.")]
         public int AlbumsPerHour { get; set; }
+
+        [FieldDefinition(6, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "Prefer Singles for exact radio releases, or Albums for older/classic channels where the album is usually the desired add.")]
+        public ReleasePriorityMode ReleasePriority { get; set; }
 
         public string BaseUrl { get; set; }
 

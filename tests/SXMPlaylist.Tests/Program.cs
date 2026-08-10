@@ -34,10 +34,19 @@ internal static class Program
         TestChannelCacheStoresAndReuses();
         TestSettingsRequireNonEmptyChannel();
         TestSettingsApiPathMirrorsChannelForUiRefresh();
+        TestSettingsDefaultReleasePriorityIsSingles();
         TestShowScheduleParsesOfficialEpgShape();
+        TestShowScheduleUsesKnownEpgAlias();
+        TestShowScheduleSkipsPageFallbackWhenAliasWorks();
+        TestShowScheduleDiscoversEpgKeyFromChannelPage();
+        TestShowScheduleTriesMultiplePageCandidateKeys();
+        TestShowScheduleParsesEncodedChannelPageKeys();
+        TestShowScheduleSkipsPageFallbackWithoutChannelName();
+        TestShowScheduleCachesResolvedEpgKey();
         TestStoreFiltersPresentableTracksByShowWindow();
         TestImportAllowsSameChannelDifferentShows();
         TestImportBlocksSecondListWhenDefaultExists();
+        TestImportFetchUsesReleasePriorityResolution();
         TestRefreshSchedulerPushesRefreshForNewlyMonitoredAlbum();
 
         TestAlbumResolutionViaDeezerAndMusicBrainz();
@@ -46,18 +55,29 @@ internal static class Program
         TestAlbumResolutionSkipsVariousArtistsCompilations();
         TestAlbumResolutionRejectsDifferentAlbumArtist();
         TestAlbumResolutionPrefersSingleOverEpOverAlbum();
+        TestAlbumResolutionCanPreferAlbumOverEpOverSingle();
         TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss();
+        TestAlbumResolutionTitleSearchReturnsBothPrioritiesFromOneLookup();
+        TestAlbumResolutionEmptyDeezerResultFallsThroughToApple();
         TestAlbumResolutionTitleSearchRejectsWrongArtist();
         TestAlbumResolutionTitleSearchRejectsOneTokenContainment();
         TestAlbumResolutionTitleSearchViaApple();
         TestAlbumResolutionRanksCompilationLast();
         TestAlbumResolutionRanksMultiTagCompilationLast();
+        TestAlbumResolutionAllowsSameArtistCompilationFallback();
+        TestAlbumResolutionCompilationFallbackStillExcludesVariousArtists();
+        TestAlbumResolutionCompilationFallbackRequiresAllowedStatus();
+        TestAlbumResolutionTitleSearchAllowsSameArtistCompilationFallback();
         TestAlbumResolutionTitleSearchStripsEditionSuffixInQuery();
         TestAlbumResolutionFilterExcludesDisallowedRelease();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
 
         TestStoreRecordsAndDedupesPlays();
+        TestStoreRecordsRepeatedPlayEvents();
+        TestStoreMigratesLegacyPlaysToPlayEvents();
+        TestStoreAssociatesPlayEventsWithShowWindows();
+        TestStorePlayEventsCanBeQueriedByRangeAndShow();
         TestStoreUpsertsTrackAndResolvesToPresentable();
         TestStoreThreeStrikesExcludesTrack();
         TestStorePresentableWindowExpires();
@@ -65,6 +85,7 @@ internal static class Program
         TestStoreMinimumPlaysFiltersBeforeLimit();
         TestStoreAlbumsPerHourLimitsPresentation();
         TestStorePruneRemovesOldData();
+        TestStorePruneRemovesOldPlayEventsAndShowWindows();
         TestStoreHistoryRetentionFiltersQueryOnly();
         TestStoreSchedulesRetryForNoMbidTrack();
         TestStoreRetryGivesUpAfterMaxAttempts();
@@ -74,9 +95,13 @@ internal static class Program
         TestStoreMigrationAddsRetryColumnsIdempotently();
 
         TestWorkerCapturesDueChannel();
+        TestWorkerCapturesPlayEventShowAttribution();
+        TestWorkerRecordsPlayEventsWhenEpgFails();
         TestWorkerSkipsCaptureWhenNotDue();
         TestWorkerResolvesDueTracks();
         TestWorkerUsesListMetadataProfileForResolution();
+        TestWorkerUsesListReleasePriorityForResolution();
+        TestWorkerStoresBothReleasePrioritiesForSharedChannel();
         TestWorkerIdlesWithNoChannels();
 
         Console.WriteLine();
@@ -189,6 +214,15 @@ internal static class Program
         Assert("apiPath setter updates backend Channel", settings.Channel == "alt2k");
     }
 
+    private static void TestSettingsDefaultReleasePriorityIsSingles()
+    {
+        Console.WriteLine("\n[Test] Settings default release priority keeps singles-first behavior");
+
+        var settings = new SXMPlaylistImportSettings();
+
+        Assert("default release priority is Singles", settings.ReleasePriority == ReleasePriorityMode.Singles);
+    }
+
     private static void TestShowScheduleParsesOfficialEpgShape()
     {
         Console.WriteLine("\n[Test] Show schedule parses SiriusXM EPG episode windows");
@@ -204,6 +238,114 @@ internal static class Program
         Assert($"parses both scheduled shows (got {shows.Count})", shows.Count == 2);
         Assert("uses program name from episode pr.pName", alt18?.Name == "The Alt-18- Most Requested Countdown!");
         Assert("parses Eastern show window to UTC", alt18?.Windows.Count == 1 && alt18.Windows[0].Contains(new DateTime(2026, 8, 8, 22, 30, 0, DateTimeKind.Utc)));
+    }
+
+    private static void TestShowScheduleUsesKnownEpgAlias()
+    {
+        Console.WriteLine("\n[Test] Show schedule uses known SiriusXM EPG key aliases");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("channelKeys=theroadhouse", BuildEpgJson("17436", "Willie's Roadhouse with Dallas Wayne"));
+
+        var shows = SXMPlaylistShowSchedule.Fetch(httpClient, "williesroadhouse", "Willie's Roadhouse");
+
+        Assert("Willie's Roadhouse resolves through theroadhouse EPG key", shows.Any(s => s.ProgramId == "17436"));
+        Assert("known alias is tried before the xmplaylist deeplink", httpClient.LastRequestUrl.Contains("channelKeys=theroadhouse"));
+    }
+
+    private static void TestShowScheduleSkipsPageFallbackWhenAliasWorks()
+    {
+        Console.WriteLine("\n[Test] Show schedule does not fetch channel page when an alias works");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("channelKeys=theroadhouse", BuildEpgJson("17436", "Willie's Roadhouse with Dallas Wayne"));
+        httpClient.Respond("/channels/willie-s-roadhouse", "{\"channelId\":\"wrongkey\"}");
+
+        SXMPlaylistShowSchedule.Fetch(httpClient, "williesroadhouse", "Willie's Roadhouse");
+
+        Assert("alias success only made one request", httpClient.CallCount == 1);
+        Assert("channel page was not fetched", !httpClient.RequestUrls.Any(u => u.Contains("/channels/")));
+    }
+
+    private static void TestShowScheduleDiscoversEpgKeyFromChannelPage()
+    {
+        Console.WriteLine("\n[Test] Show schedule discovers SiriusXM EPG key from channel page");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("channelKeys=xmplaylistkey", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        httpClient.Respond("/channels/example-channel", "{\"shows\":[{\"name\":\"Example Show\",\"channelId\":\"realkey\"}]}");
+        httpClient.Respond("channelKeys=realkey", BuildEpgJson("999", "Example Show"));
+
+        var shows = SXMPlaylistShowSchedule.Fetch(httpClient, "xmplaylistkey", "Example Channel");
+
+        Assert("page channelId is used as an EPG fallback", shows.Count == 1 && shows[0].ProgramId == "999");
+        Assert("fallback requests the discovered EPG key", httpClient.LastRequestUrl.Contains("channelKeys=realkey"));
+    }
+
+    private static void TestShowScheduleTriesMultiplePageCandidateKeys()
+    {
+        Console.WriteLine("\n[Test] Show schedule tries multiple channel page EPG key candidates");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("channelKeys=multi-key", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        httpClient.Respond("/channels/multiple-candidates", "{\"channelId\":\"bad-key\"},{\"channelId\":\"good_key\"}");
+        httpClient.Respond("channelKeys=bad-key", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        httpClient.Respond("channelKeys=good_key", BuildEpgJson("1000", "Good Candidate"));
+
+        var shows = SXMPlaylistShowSchedule.Fetch(httpClient, "multi-key", "Multiple Candidates");
+
+        Assert("second page candidate resolved", shows.Count == 1 && shows[0].ProgramId == "1000");
+        Assert("hyphen and underscore candidate keys were requested", httpClient.RequestUrls.Any(u => u.Contains("channelKeys=bad-key")) && httpClient.RequestUrls.Any(u => u.Contains("channelKeys=good_key")));
+    }
+
+    private static void TestShowScheduleParsesEncodedChannelPageKeys()
+    {
+        Console.WriteLine("\n[Test] Show schedule parses encoded channel page EPG keys");
+
+        var htmlEncoded = new FakeHttpClient();
+        htmlEncoded.Respond("channelKeys=html-key", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        htmlEncoded.Respond("/channels/html-encoded", "{&quot;channelId&quot;:&quot;htmlreal&quot;}");
+        htmlEncoded.Respond("channelKeys=htmlreal", BuildEpgJson("1001", "HTML Candidate"));
+
+        var escaped = new FakeHttpClient();
+        escaped.Respond("channelKeys=escaped-key", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        escaped.Respond("/channels/escaped-encoded", "{\\\"channelId\\\":\\\"escapedreal\\\"}");
+        escaped.Respond("channelKeys=escapedreal", BuildEpgJson("1002", "Escaped Candidate"));
+
+        Assert("HTML-encoded page key resolved", SXMPlaylistShowSchedule.Fetch(htmlEncoded, "html-key", "HTML Encoded").Any(s => s.ProgramId == "1001"));
+        Assert("backslash-escaped page key resolved", SXMPlaylistShowSchedule.Fetch(escaped, "escaped-key", "Escaped Encoded").Any(s => s.ProgramId == "1002"));
+    }
+
+    private static void TestShowScheduleSkipsPageFallbackWithoutChannelName()
+    {
+        Console.WriteLine("\n[Test] Show schedule skips channel page fallback without a channel name");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("channelKeys=no-name-key", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+
+        var shows = SXMPlaylistShowSchedule.Fetch(httpClient, "no-name-key");
+
+        Assert("no channel name returns no shows when direct EPG is empty", shows.Count == 0);
+        Assert("no channel page request without channel name", httpClient.CallCount == 1 && !httpClient.RequestUrls.Any(u => u.Contains("/channels/")));
+    }
+
+    private static void TestShowScheduleCachesResolvedEpgKey()
+    {
+        Console.WriteLine("\n[Test] Show schedule caches resolved EPG keys");
+
+        var first = new FakeHttpClient();
+        first.Respond("channelKeys=cache-key", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        first.Respond("/channels/cache-channel", "{\"channelId\":\"cachedreal\"}");
+        first.Respond("channelKeys=cachedreal", BuildEpgJson("1003", "Cached Candidate"));
+
+        var second = new FakeHttpClient();
+        second.Respond("channelKeys=cachedreal", BuildEpgJson("1003", "Cached Candidate"));
+
+        SXMPlaylistShowSchedule.Fetch(first, "cache-key", "Cache Channel");
+        var shows = SXMPlaylistShowSchedule.Fetch(second, "cache-key", "Cache Channel");
+
+        Assert("second call reused cached key", shows.Any(s => s.ProgramId == "1003"));
+        Assert("cached call skipped direct miss and channel page", second.CallCount == 1 && second.LastRequestUrl.Contains("channelKeys=cachedreal"));
     }
 
     private static void TestStoreFiltersPresentableTracksByShowWindow()
@@ -273,7 +415,29 @@ internal static class Program
         Assert("channel with an existing default list is hidden for new lists", !channels.Contains("altnation"));
     }
 
-    private static SXMPlaylistImport NewImport(FakeHttpClient httpClient, FakeAppFolderInfo folder, FakeImportListRepository repo, int id, string channel, string show)
+    private static void TestImportFetchUsesReleasePriorityResolution()
+    {
+        Console.WriteLine("\n[Test] Import fetch reads the resolution slot selected by list release priority");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Singles, new AlbumResolution(true, "The Single", "artist-mbid-1", "single-mbid"), now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Albums, new AlbumResolution(true, "The Album", "artist-mbid-1", "album-mbid"), now);
+
+        var repo = new FakeImportListRepository();
+        var singlesImport = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Singles);
+        var albumsImport = NewImport(new FakeHttpClient(), folder, repo, 2, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Albums);
+
+        var singles = singlesImport.Fetch();
+        var albums = albumsImport.Fetch();
+
+        Assert("singles list fetch emits the single", singles.Count == 1 && singles[0].Album == "The Single" && singles[0].AlbumMusicBrainzId == "single-mbid");
+        Assert("albums list fetch emits the album", albums.Count == 1 && albums[0].Album == "The Album" && albums[0].AlbumMusicBrainzId == "album-mbid");
+    }
+
+    private static SXMPlaylistImport NewImport(FakeHttpClient httpClient, FakeAppFolderInfo folder, FakeImportListRepository repo, int id, string channel, string show, ReleasePriorityMode releasePriority = ReleasePriorityMode.Singles)
     {
         var import = new SXMPlaylistImport(
             httpClient,
@@ -291,7 +455,7 @@ internal static class Program
         {
             Id = id,
             Implementation = nameof(SXMPlaylistImport),
-            Settings = new SXMPlaylistImportSettings { Channel = channel, Show = show }
+            Settings = new SXMPlaylistImportSettings { Channel = channel, Show = show, ReleasePriority = releasePriority }
         };
 
         return import;
@@ -315,6 +479,13 @@ internal static class Program
         return "{\"chEpgInfo\":{\"dayChSchedules\":[{\"episode\":[" +
                "{\"pgid\":16824,\"pr\":{\"pName\":\"The Alt-18- Most Requested Countdown!\"},\"sc\":{\"sTimeStr\":\"08.08.2026 18:00 EDT\",\"eTimeStr\":\"08.08.2026 19:00 EDT\"}}," +
                "{\"pgid\":16606,\"pr\":{\"pName\":\"Alt Nation\"},\"sc\":{\"sTimeStr\":\"08.08.2026 19:00 EDT\",\"eTimeStr\":\"08.08.2026 20:00 EDT\"}}" +
+               "]}],\"pg\":[]}}";
+    }
+
+    private static string BuildEpgJson(string programId, string showName)
+    {
+        return "{\"chEpgInfo\":{\"dayChSchedules\":[{\"episode\":[" +
+               $"{{\"pgid\":{programId},\"pr\":{{\"pName\":\"{showName}\"}},\"sc\":{{\"sTimeStr\":\"08.08.2026 18:00 EDT\",\"eTimeStr\":\"08.08.2026 19:00 EDT\"}}}}" +
                "]}],\"pg\":[]}}";
     }
 
@@ -546,6 +717,52 @@ internal static class Program
         Assert("EP preferred over album when no single exists", resolution2.Album == "The EP");
     }
 
+    private static void TestAlbumResolutionCanPreferAlbumOverEpOverSingle()
+    {
+        Console.WriteLine("\n[Test] Album resolution can prefer Album over EP over Single when configured");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"ep-mbid\",\"title\":\"The EP\",\"primary-type\":\"EP\",\"first-release-date\":\"1996-07-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var albumsFirst = new AlbumTypeFilter(
+            new HashSet<string> { "Single", "EP", "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" },
+            ReleasePriorityMode.Albums);
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")), albumsFirst);
+
+        Assert("album preferred over EP and single", resolution.Album == "The Album");
+        Assert("album MBID used", resolution.AlbumMusicBrainzId == "album-mbid");
+
+        var httpClient2 = new FakeHttpClient();
+        httpClient2.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient2.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-2\"}]}");
+        httpClient2.Respond("musicbrainz.org/ws/2/recording/rec-2",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"ep-mbid\",\"title\":\"The EP\",\"primary-type\":\"EP\",\"first-release-date\":\"1996-07-01\"}}]}");
+
+        var resolver2 = new SXMPlaylistAlbumResolver(httpClient2, LogManager.GetLogger("Test"));
+        var resolution2 = resolver2.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")), albumsFirst);
+
+        Assert("EP preferred over single in albums-first mode when no album exists", resolution2.Album == "The EP");
+    }
+
     private static void TestAlbumResolutionFilterExcludesDisallowedRelease()
     {
         Console.WriteLine("\n[Test] A metadata profile filter drops release-groups of disallowed type/status");
@@ -612,6 +829,49 @@ internal static class Program
         Assert("title search recovered the album", resolution.Album == "Three Cheers for Sweet Revenge");
         Assert("album MBID attached", resolution.AlbumMusicBrainzId == "album-mbid-1");
         Assert("artist MBID attached", resolution.ArtistMusicBrainzId == "mcr-mbid");
+    }
+
+    private static void TestAlbumResolutionTitleSearchReturnsBothPrioritiesFromOneLookup()
+    {
+        Console.WriteLine("\n[Test] Title search ranks one result set for both release priorities");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"The Record\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Record\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Record\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities("Artist One", "Some Song", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("singles priority selected the single", results[ReleasePriorityMode.Singles].AlbumMusicBrainzId == "single-mbid");
+        Assert("albums priority selected the album", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "album-mbid");
+        Assert($"title-search dual ranking reused one Deezer, ISRC, and release-search sequence (calls: {httpClient.CallCount})", httpClient.CallCount == 3);
+    }
+
+    private static void TestAlbumResolutionEmptyDeezerResultFallsThroughToApple()
+    {
+        Console.WriteLine("\n[Test] Empty Deezer/MB results use Apple fallback for both priorities");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"Apple Album\"}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities(
+            "Artist One",
+            "Some Song",
+            Links(
+                ("deezer", "https://www.deezer.com/track/624510"),
+                ("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507")));
+
+        Assert("Apple filled singles priority with title floor", results[ReleasePriorityMode.Singles].Album == "Apple Album" && results[ReleasePriorityMode.Singles].AlbumMusicBrainzId == null);
+        Assert("Apple filled albums priority with title floor", results[ReleasePriorityMode.Albums].Album == "Apple Album" && results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == null);
     }
 
     private static void TestAlbumResolutionTitleSearchRejectsWrongArtist()
@@ -722,6 +982,101 @@ internal static class Program
         Assert("studio release preferred even when compilation carries Soundtrack too", resolution.AlbumMusicBrainzId == "album-mbid-1");
     }
 
+    private static void TestAlbumResolutionAllowsSameArtistCompilationFallback()
+    {
+        Console.WriteLine("\n[Test] Same-artist compilations are allowed as a metadata-profile fallback");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM10100001\",\"album\":{\"title\":\"B-Sides and Rarities\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM10100001", "{\"recordings\":[{\"id\":\"rec-cake\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-cake",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"cake-mbid\",\"name\":\"CAKE\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"cake-mbid\",\"name\":\"CAKE\"}}]," +
+            "\"release-group\":{\"id\":\"cake-bsides\",\"title\":\"B-Sides and Rarities\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2007-08-14\"}}]}");
+
+        var noCompilations = new AlbumTypeFilter(
+            new HashSet<string> { "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("CAKE", "Short Skirt/Long Jacket", Links(("deezer", "https://www.deezer.com/track/624510")), noCompilations);
+
+        Assert("same-artist compilation fallback selected", resolution.AlbumMusicBrainzId == "cake-bsides");
+        Assert("recording artist MBID retained", resolution.ArtistMusicBrainzId == "cake-mbid");
+    }
+
+    private static void TestAlbumResolutionCompilationFallbackStillExcludesVariousArtists()
+    {
+        Console.WriteLine("\n[Test] Compilation fallback still excludes Various Artists release-groups");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM10100001\",\"album\":{\"title\":\"B-Sides and Rarities\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM10100001", "{\"recordings\":[{\"id\":\"rec-cake\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-cake",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"cake-mbid\",\"name\":\"CAKE\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"89ad4ac3-39f7-470e-963a-56509c546377\",\"name\":\"Various Artists\"}}]," +
+            "\"release-group\":{\"id\":\"va-comp\",\"title\":\"Alternative Hits\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2007-08-14\"}}]}");
+
+        var noCompilations = new AlbumTypeFilter(
+            new HashSet<string> { "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("CAKE", "Short Skirt/Long Jacket", Links(("deezer", "https://www.deezer.com/track/624510")), noCompilations);
+
+        Assert("VA compilation fallback not selected", resolution.AlbumMusicBrainzId == null);
+        Assert("falls through to Deezer title", resolution.Album == "B-Sides and Rarities");
+    }
+
+    private static void TestAlbumResolutionCompilationFallbackRequiresAllowedStatus()
+    {
+        Console.WriteLine("\n[Test] Compilation fallback does not rescue disallowed statuses");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM10100001\",\"album\":{\"title\":\"B-Sides and Rarities\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM10100001", "{\"recordings\":[{\"id\":\"rec-cake\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-cake",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"cake-mbid\",\"name\":\"CAKE\"}}]," +
+            "\"releases\":[{\"status\":\"Bootleg\",\"artist-credit\":[{\"artist\":{\"id\":\"cake-mbid\",\"name\":\"CAKE\"}}]," +
+            "\"release-group\":{\"id\":\"bootleg-comp\",\"title\":\"B-Sides and Rarities\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2007-08-14\"}}]}");
+
+        var officialOnly = new AlbumTypeFilter(
+            new HashSet<string> { "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("CAKE", "Short Skirt/Long Jacket", Links(("deezer", "https://www.deezer.com/track/624510")), officialOnly);
+
+        Assert("Bootleg compilation fallback not selected", resolution.AlbumMusicBrainzId == null);
+        Assert("falls through to Deezer title", resolution.Album == "B-Sides and Rarities");
+    }
+
+    private static void TestAlbumResolutionTitleSearchAllowsSameArtistCompilationFallback()
+    {
+        Console.WriteLine("\n[Test] Title search can use same-artist compilation fallback");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM10100001\",\"album\":{\"title\":\"B-Sides and Rarities\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM10100001", "{\"recordings\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/release?query=",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"cake-mbid\",\"name\":\"CAKE\"}}]," +
+            "\"release-group\":{\"id\":\"cake-bsides\",\"title\":\"B-Sides and Rarities\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2007-08-14\"}}]}");
+
+        var noCompilations = new AlbumTypeFilter(
+            new HashSet<string> { "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("CAKE", "Short Skirt/Long Jacket", Links(("deezer", "https://www.deezer.com/track/624510")), noCompilations);
+
+        Assert("title-search same-artist compilation fallback selected", resolution.AlbumMusicBrainzId == "cake-bsides");
+        Assert("title-search artist MBID attached", resolution.ArtistMusicBrainzId == "cake-mbid");
+    }
+
     private static void TestAlbumResolutionTitleSearchStripsEditionSuffixInQuery()
     {
         Console.WriteLine("\n[Test] Edition suffix in the Deezer title is stripped from the search query");
@@ -807,6 +1162,97 @@ internal static class Program
         Assert("first sighting is new", store.TryRecordPlay("p1", "altnation", "Artist One", "Song A", now));
         Assert("same (play, artist) again is deduped", !store.TryRecordPlay("p1", "altnation", "Artist One", "Song A", now));
         Assert("different artist on the same play is a distinct record", store.TryRecordPlay("p1", "altnation", "Artist Two", "Song A", now));
+    }
+
+    private static void TestStoreRecordsRepeatedPlayEvents()
+    {
+        Console.WriteLine("\n[Test] PlayEvents keep repeated airings while deduping exact feed replays");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        Assert("first play event is new", store.TryRecordPlayEvent("p1", "altnation", "track1", "Artist One", "Song A", now, null));
+        Assert("exact same play event is deduped", !store.TryRecordPlayEvent("p1", "altnation", "track1", "Artist One", "Song A", now, null));
+        Assert("same play id at a different timestamp is retained as a repeated event", store.TryRecordPlayEvent("p1", "altnation", "track1", "Artist One", "Song A", now.AddHours(1), null));
+
+        var events = store.GetPlayEvents("altnation", now.AddMinutes(-1), now.AddHours(2));
+        Assert($"two play events retained (got {events.Count})", events.Count == 2);
+    }
+
+    private static void TestStoreMigratesLegacyPlaysToPlayEvents()
+    {
+        Console.WriteLine("\n[Test] Legacy Plays rows are copied into PlayEvents on initialization");
+
+        var folder = NewFolder();
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        Directory.CreateDirectory(Path.Combine(folder.AppDataFolder, "SXMPlaylist"));
+        var now = DateTime.UtcNow;
+
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var create = new System.Data.SQLite.SQLiteCommand(
+                "CREATE TABLE Plays (PlayId TEXT NOT NULL, Channel TEXT NOT NULL, Artist TEXT NOT NULL, Song TEXT NOT NULL, TimestampUtc TEXT NOT NULL, PRIMARY KEY (PlayId, Artist))",
+                connection);
+            create.ExecuteNonQuery();
+
+            using var insert = new System.Data.SQLite.SQLiteCommand(
+                "INSERT INTO Plays (PlayId, Channel, Artist, Song, TimestampUtc) VALUES ('legacy1', 'altnation', 'Legacy Artist', 'Legacy Song', @timestamp)",
+                connection);
+            insert.Parameters.AddWithValue("@timestamp", now.ToString("O"));
+            insert.ExecuteNonQuery();
+        }
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var events = store.GetPlayEvents("altnation", now.AddMinutes(-1), now.AddMinutes(1));
+
+        Assert("legacy play became a play event", events.Count == 1 && events[0].PlayId == "legacy1");
+        Assert("legacy play has unknown show attribution", events[0].ProgramId == null && events[0].ShowName == null);
+    }
+
+    private static void TestStoreAssociatesPlayEventsWithShowWindows()
+    {
+        Console.WriteLine("\n[Test] PlayEvents can carry persisted show-window attribution");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+        store.SaveShowWindows("altnation", new[]
+        {
+            new ShowInfo("16824", "Alt-18", new[] { new ShowWindow(now.AddMinutes(-10), now.AddMinutes(50)) })
+        });
+
+        var showWindow = store.GetShowWindowForPlay("altnation", now);
+        Assert("show window found for play timestamp", showWindow?.ProgramId == "16824" && showWindow.ShowName == "Alt-18");
+
+        store.TryRecordPlayEvent("p1", "altnation", "track1", "Artist One", "Song A", now, showWindow);
+        var events = store.GetPlayEvents("altnation", now.AddMinutes(-1), now.AddMinutes(1), "16824");
+
+        Assert("event is queryable by persisted show id", events.Count == 1 && events[0].ShowName == "Alt-18");
+        Assert("event stores show window bounds", events[0].ShowStartUtc != null && events[0].ShowEndUtc != null);
+    }
+
+    private static void TestStorePlayEventsCanBeQueriedByRangeAndShow()
+    {
+        Console.WriteLine("\n[Test] PlayEvents support playlist time-range and show filtering");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+        store.SaveShowWindows("altnation", new[]
+        {
+            new ShowInfo("show1", "Show One", new[] { new ShowWindow(now.AddHours(-3), now.AddHours(-1)) }),
+            new ShowInfo("show2", "Show Two", new[] { new ShowWindow(now.AddHours(-1), now.AddHours(1)) })
+        });
+
+        var oldShow = store.GetShowWindowForPlay("altnation", now.AddHours(-2));
+        var currentShow = store.GetShowWindowForPlay("altnation", now.AddMinutes(-30));
+        store.TryRecordPlayEvent("old", "altnation", "track-old", "Artist", "Old Song", now.AddHours(-2), oldShow);
+        store.TryRecordPlayEvent("new", "altnation", "track-new", "Artist", "New Song", now.AddMinutes(-30), currentShow);
+
+        var lastHour = store.GetPlayEvents("altnation", now.AddHours(-1), now.AddMinutes(1));
+        var show2 = store.GetPlayEvents("altnation", now.AddHours(-3), now.AddMinutes(1), "show2");
+
+        Assert("24h/1h-style range query only returns rows in range", lastHour.Count == 1 && lastHour[0].PlayId == "new");
+        Assert("show filter returns only matching show rows", show2.Count == 1 && show2[0].PlayId == "new");
     }
 
     private static void TestStoreUpsertsTrackAndResolvesToPresentable()
@@ -943,6 +1389,33 @@ internal static class Program
         Assert("fresh track kept", store.GetDueTracks(100).Any(t => t.TrackId == "newTrack"));
     }
 
+    private static void TestStorePruneRemovesOldPlayEventsAndShowWindows()
+    {
+        Console.WriteLine("\n[Test] Prune drops old play events and show windows after 180 days");
+
+        var store = NewHistoryStore();
+        var old = DateTime.UtcNow - SXMPlaylistHistoryStore.PlayRetention - TimeSpan.FromDays(1);
+        var fresh = DateTime.UtcNow;
+        store.SaveShowWindows("altnation", new[]
+        {
+            new ShowInfo("old-show", "Old Show", new[] { new ShowWindow(old.AddHours(-1), old.AddHours(1)) }),
+            new ShowInfo("new-show", "New Show", new[] { new ShowWindow(fresh.AddHours(-1), fresh.AddHours(1)) })
+        });
+
+        var oldShow = store.GetShowWindowForPlay("altnation", old);
+        var freshShow = store.GetShowWindowForPlay("altnation", fresh);
+        store.TryRecordPlayEvent("old", "altnation", "track-old", "Artist", "Old Song", old, oldShow);
+        store.TryRecordPlayEvent("new", "altnation", "track-new", "Artist", "New Song", fresh, freshShow);
+
+        store.Prune();
+
+        var allEvents = store.GetPlayEvents("altnation", DateTime.MinValue, DateTime.UtcNow.AddDays(1));
+        Assert("old play event pruned", allEvents.All(e => e.PlayId != "old"));
+        Assert("fresh play event kept", allEvents.Any(e => e.PlayId == "new"));
+        Assert("old show window pruned", store.GetShowWindowForPlay("altnation", old) == null);
+        Assert("fresh show window kept", store.GetShowWindowForPlay("altnation", fresh)?.ProgramId == "new-show");
+    }
+
     private static void TestStoreHistoryRetentionFiltersQueryOnly()
     {
         Console.WriteLine("\n[Test] History retention days filters query results only");
@@ -1040,10 +1513,12 @@ internal static class Program
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
 
-        // Fail a retry past the 25h presentation window; the track must remain presentable.
-        store.RecordRetryFailure("track1", now + SXMPlaylistHistoryStore.PresentationWindow + TimeSpan.FromHours(1));
+        // Fail a retry past the 25h presentation window; the track-resolution row must be renewed
+        // too, because presentation now joins the per-priority resolution cache.
+        var retryFailureTime = now + SXMPlaylistHistoryStore.PresentationWindow + TimeSpan.FromHours(1);
+        store.RecordRetryFailure("track1", retryFailureTime);
 
-        Assert("track still presentable after failed retry renewed the window", store.GetPresentableTracks("altnation", now, 10).Any(t => t.TrackId == "track1"));
+        Assert("track still presentable after failed retry renewed the window", store.GetPresentableTracks("altnation", retryFailureTime - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreMigrationAddsRetryColumnsIdempotently()
@@ -1109,7 +1584,53 @@ internal static class Program
         var store = new SXMPlaylistHistoryStore(folder);
         Assert("play was recorded", store.GetPlays("altnation", DateTime.MinValue).Count == 1);
         Assert("last capture recorded", store.GetLastCaptureUtc("altnation") != null);
-        Assert("one feed request made", httpClient.CallCount == 1);
+        Assert("feed plus EPG requests made", httpClient.CallCount == 2);
+    }
+
+    private static void TestWorkerCapturesPlayEventShowAttribution()
+    {
+        Console.WriteLine("\n[Test] Worker stores captured play events with show attribution when EPG is available");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "Song A", Array.Empty<(string, string)>())));
+        httpClient.Respond("sxmepg", "{\"chEpgInfo\":{\"dayChSchedules\":[{\"episode\":[" +
+            "{\"pgid\":\"show1\",\"pr\":{\"pName\":\"Show One\"},\"sc\":{\"sTimeStr\":\"08.04.2026 19:00 EDT\",\"eTimeStr\":\"08.04.2026 21:00 EDT\"}}" +
+            "]}],\"pg\":[]}}");
+
+        var factory = new FakeImportListFactory();
+        factory.AddChannel("altnation");
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var events = store.GetPlayEvents("altnation", new DateTime(2026, 8, 4, 23, 0, 0, DateTimeKind.Utc), new DateTime(2026, 8, 5, 1, 0, 0, DateTimeKind.Utc), "show1");
+
+        Assert("captured event is attributed to the EPG show", events.Count == 1 && events[0].ShowName == "Show One");
+    }
+
+    private static void TestWorkerRecordsPlayEventsWhenEpgFails()
+    {
+        Console.WriteLine("\n[Test] Worker still records play events when EPG refresh fails");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "Song A", Array.Empty<(string, string)>())));
+
+        var factory = new FakeImportListFactory();
+        factory.AddChannel("altnation");
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var events = store.GetPlayEvents("altnation", DateTime.MinValue, DateTime.UtcNow.AddYears(10));
+
+        Assert("play event recorded despite EPG 404", events.Count == 1 && events[0].PlayId == "play1");
+        Assert("show attribution is unknown when EPG failed", events[0].ProgramId == null && events[0].ShowName == null);
     }
 
     private static void TestWorkerSkipsCaptureWhenNotDue()
@@ -1153,7 +1674,7 @@ internal static class Program
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10);
+        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
 
         Assert("captured + resolved track is presentable", presentable.Count == 1);
         Assert("correct album resolved", presentable[0].Album == "No Code");
@@ -1203,11 +1724,112 @@ internal static class Program
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10);
+        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
 
         Assert("track still resolved via Deezer title fallback", presentable.Count == 1);
         Assert("album title kept from Deezer", presentable[0].Album == "No Code");
         Assert("no MBID because profile excluded the only MB candidate", presentable[0].AlbumMusicBrainzId == null);
+    }
+
+    private static void TestWorkerUsesListReleasePriorityForResolution()
+    {
+        Console.WriteLine("\n[Test] Worker applies the channel's list release priority when resolving");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "I'm Open", new[] { ("deezer", "https://www.deezer.com/track/624510") })));
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var factory = new FakeImportListFactory();
+        factory.AddChannel("altnation", metadataProfileId: 42, releasePriority: ReleasePriorityMode.Albums);
+
+        var profile = new MetadataProfile
+        {
+            Id = 42,
+            PrimaryAlbumTypes = new List<ProfilePrimaryAlbumTypeItem>
+            {
+                new() { Allowed = true, PrimaryAlbumType = PrimaryAlbumType.Single },
+                new() { Allowed = true, PrimaryAlbumType = PrimaryAlbumType.Album }
+            },
+            SecondaryAlbumTypes = new List<ProfileSecondaryAlbumTypeItem>
+            {
+                new() { Allowed = true, SecondaryAlbumType = SecondaryAlbumType.Studio }
+            },
+            ReleaseStatuses = new List<ProfileReleaseStatusItem>
+            {
+                new() { Allowed = true, ReleaseStatus = ReleaseStatus.Official }
+            }
+        };
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
+
+        Assert("album-first list selected the album", presentable.Count == 1 && presentable[0].Album == "The Album");
+        Assert("album-first list used album MBID", presentable[0].AlbumMusicBrainzId == "album-mbid");
+    }
+
+    private static void TestWorkerStoresBothReleasePrioritiesForSharedChannel()
+    {
+        Console.WriteLine("\n[Test] Worker stores both release priorities for shared channels");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "I'm Open", new[] { ("deezer", "https://www.deezer.com/track/624510") })));
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"The Single\",\"primary-type\":\"Single\",\"first-release-date\":\"1996-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var factory = new FakeImportListFactory();
+        factory.AddChannel("altnation", metadataProfileId: 42, releasePriority: ReleasePriorityMode.Singles);
+        factory.AddChannel("altnation", metadataProfileId: 42, releasePriority: ReleasePriorityMode.Albums);
+
+        var profile = new MetadataProfile
+        {
+            Id = 42,
+            PrimaryAlbumTypes = new List<ProfilePrimaryAlbumTypeItem>
+            {
+                new() { Allowed = true, PrimaryAlbumType = PrimaryAlbumType.Single },
+                new() { Allowed = true, PrimaryAlbumType = PrimaryAlbumType.Album }
+            },
+            SecondaryAlbumTypes = new List<ProfileSecondaryAlbumTypeItem>
+            {
+                new() { Allowed = true, SecondaryAlbumType = SecondaryAlbumType.Studio }
+            },
+            ReleaseStatuses = new List<ProfileReleaseStatusItem>
+            {
+                new() { Allowed = true, ReleaseStatus = ReleaseStatus.Official }
+            }
+        };
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var singles = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Singles);
+        var albums = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
+
+        Assert("singles-priority presentation uses the single", singles.Count == 1 && singles[0].Album == "The Single");
+        Assert("albums-priority presentation uses the album", albums.Count == 1 && albums[0].Album == "The Album");
+        Assert($"dual-priority resolution fetched feed, EPG, Deezer, ISRC, and recording once each (calls: {httpClient.CallCount})", httpClient.CallCount == 5);
     }
 
     private static void TestWorkerIdlesWithNoChannels()
@@ -1290,6 +1912,9 @@ internal class FakeHttpClient : IHttpClient
 
     public int CallCount { get; private set; }
     public string LastRequestUrl { get; private set; } = "";
+    public IReadOnlyList<string> RequestUrls => _requestUrls;
+
+    private readonly List<string> _requestUrls = new();
 
     public void Respond(string urlFragment, string jsonContent)
     {
@@ -1311,6 +1936,7 @@ internal class FakeHttpClient : IHttpClient
     {
         CallCount++;
         LastRequestUrl = request.Url.FullUri;
+        _requestUrls.Add(LastRequestUrl);
 
         foreach (var pair in _sequencesByUrlFragment)
         {
@@ -1471,14 +2097,14 @@ internal class FakeImportListFactory : IImportListFactory
 {
     private readonly List<ImportListDefinition> _definitions = new();
 
-    public void AddChannel(string channel, int metadataProfileId = 0)
+    public void AddChannel(string channel, int metadataProfileId = 0, ReleasePriorityMode releasePriority = ReleasePriorityMode.Singles)
     {
         _definitions.Add(new ImportListDefinition
         {
             Implementation = "SXMPlaylistImport",
             EnableAutomaticAdd = true,
             MetadataProfileId = metadataProfileId,
-            Settings = new SXMPlaylistImportSettings { Channel = channel }
+            Settings = new SXMPlaylistImportSettings { Channel = channel, ReleasePriority = releasePriority }
         });
     }
 
