@@ -120,18 +120,29 @@ namespace SXMPlaylist.ImportLists
                 yield break;
             }
 
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var normalized = response.Content
                 .Replace("\\\"", "\"")
                 .Replace("&quot;", "\"", StringComparison.OrdinalIgnoreCase)
                 .Replace("\\u0022", "\"", StringComparison.OrdinalIgnoreCase);
 
-            foreach (Match match in Regex.Matches(normalized, "\"channelId\"\\s*:\\s*\"(?<id>[a-z0-9_-]+)\"", RegexOptions.IgnoreCase))
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var patterns = new[]
             {
-                var key = match.Groups["id"].Value;
-                if (key.IsNotNullOrWhiteSpace() && seen.Add(key))
+                "name\\s*=\\s*\"contentid\"[^>]*\\scontent\\s*=\\s*\"(?<id>[a-z0-9_-]+)\"",
+                "\"name\"\\s*:\\s*\"contentid\".*?\"content\"\\s*:\\s*\"(?<id>[a-z0-9_-]+)\"",
+                "\"channel_id\"\\s*:\\s*\"(?<id>[a-z0-9_-]+)\"",
+                "\"channelId\"\\s*:\\s*\"(?<id>[a-z0-9_-]+)\""
+            };
+
+            foreach (var pattern in patterns)
+            {
+                foreach (Match match in Regex.Matches(normalized, pattern, RegexOptions.IgnoreCase))
                 {
-                    yield return key;
+                    var key = match.Groups["id"].Value;
+                    if (key.IsNotNullOrWhiteSpace() && seen.Add(key))
+                    {
+                        yield return key;
+                    }
                 }
             }
         }

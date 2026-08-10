@@ -39,6 +39,7 @@ internal static class Program
         TestShowScheduleUsesKnownEpgAlias();
         TestShowScheduleSkipsPageFallbackWhenAliasWorks();
         TestShowScheduleDiscoversEpgKeyFromChannelPage();
+        TestShowSchedulePrioritizesChannelPageContentId();
         TestShowScheduleTriesMultiplePageCandidateKeys();
         TestShowScheduleParsesEncodedChannelPageKeys();
         TestShowScheduleSkipsPageFallbackWithoutChannelName();
@@ -280,6 +281,25 @@ internal static class Program
 
         Assert("page channelId is used as an EPG fallback", shows.Count == 1 && shows[0].ProgramId == "999");
         Assert("fallback requests the discovered EPG key", httpClient.LastRequestUrl.Contains("channelKeys=realkey"));
+    }
+
+    private static void TestShowSchedulePrioritizesChannelPageContentId()
+    {
+        Console.WriteLine("\n[Test] Show schedule prioritizes channel page content id over related show channel ids");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("channelKeys=thebeatleschannel", "{\"chEpgInfo\":{\"dayChSchedules\":[],\"pg\":[]}}");
+        httpClient.Respond("/channels/the-beatles-channel",
+            "{\"channelId\":\"classicvinyl\"}" +
+            "<meta class=\"swiftype\" name=\"contentid\" data-type=\"enum\" content=\"9446\"/>" +
+            "{\"channel_id\":\"9446\",\"siriusChannelNumber\":18}");
+        httpClient.Respond("channelKeys=classicvinyl", BuildEpgJson("111", "Classic Vinyl"));
+        httpClient.Respond("channelKeys=9446", BuildEpgJson("15839", "Breakfast With The Beatles"));
+
+        var shows = SXMPlaylistShowSchedule.Fetch(httpClient, "thebeatleschannel", "The Beatles Channel");
+
+        Assert("Beatles content id selected before related channel ids", shows.Count == 1 && shows[0].ProgramId == "15839");
+        Assert("related channel id was not requested after content id resolved", !httpClient.RequestUrls.Any(u => u.Contains("channelKeys=classicvinyl")));
     }
 
     private static void TestShowScheduleTriesMultiplePageCandidateKeys()
