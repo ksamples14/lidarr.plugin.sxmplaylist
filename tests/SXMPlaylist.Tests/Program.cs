@@ -59,6 +59,7 @@ internal static class Program
         TestAlbumResolutionRejectsDifferentAlbumArtist();
         TestAlbumResolutionPrefersSingleOverEpOverAlbum();
         TestAlbumResolutionCanPreferAlbumOverEpOverSingle();
+        TestAlbumResolutionRecordingSearchFindsAlbumAfterIsrcMiss();
         TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss();
         TestAlbumResolutionTitleSearchReturnsBothPrioritiesFromOneLookup();
         TestAlbumResolutionEmptyDeezerResultFallsThroughToApple();
@@ -661,7 +662,7 @@ internal static class Program
 
         Assert("falls back to Deezer's own album title", resolution.Album == "No Code");
         Assert("no album MBID (no MusicBrainz match)", resolution.AlbumMusicBrainzId == null);
-        Assert("Deezer call plus one MB title-search attempt (calls: " + httpClient.CallCount + ")", httpClient.CallCount == 2);
+        Assert("Deezer call plus one MB recording-search attempt (calls: " + httpClient.CallCount + ")", httpClient.CallCount == 3);
     }
 
     private static void TestAlbumResolutionFallsBackToAppleMusic()
@@ -822,6 +823,33 @@ internal static class Program
         Assert("EP preferred over single in albums-first mode when no album exists", resolution2.Album == "The EP");
     }
 
+    private static void TestAlbumResolutionRecordingSearchFindsAlbumAfterIsrcMiss()
+    {
+        Console.WriteLine("\n[Test] Recording search finds album releases after ISRC misses");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"We Might as Well Be Strangers\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[{\"id\":\"rec-1\",\"title\":\"We Might as Well Be Strangers\"," +
+            "\"artist-credit\":[{\"artist\":{\"id\":\"weezer-mbid\",\"name\":\"Weezer\"}},{\"artist\":{\"id\":\"wednesday-mbid\",\"name\":\"Wednesday\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"weezer-mbid\",\"name\":\"Weezer\"}},{\"artist\":{\"id\":\"wednesday-mbid\",\"name\":\"Wednesday\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"weezer-mbid\",\"name\":\"Weezer\"}},{\"artist\":{\"id\":\"wednesday-mbid\",\"name\":\"Wednesday\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"We Might as Well Be Strangers\",\"primary-type\":\"Single\",\"first-release-date\":\"2026-06-03\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"weezer-mbid\",\"name\":\"Weezer\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"Weezer\",\"primary-type\":\"Album\",\"first-release-date\":\"2026-08-21\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities("Weezer", "We Might as Well Be Strangers", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("recording search selected the single for Singles priority", results[ReleasePriorityMode.Singles].AlbumMusicBrainzId == "single-mbid");
+        Assert("recording search selected the album for Albums priority", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "album-mbid");
+        Assert("multi-artist recording leaves artist MBID unset", results[ReleasePriorityMode.Singles].ArtistMusicBrainzId == null);
+        Assert($"recording search avoided title-search fallback (calls: {httpClient.CallCount})", httpClient.CallCount == 4);
+    }
+
     private static void TestAlbumResolutionFilterExcludesDisallowedRelease()
     {
         Console.WriteLine("\n[Test] A metadata profile filter drops release-groups of disallowed type/status");
@@ -909,7 +937,7 @@ internal static class Program
 
         Assert("singles priority selected the single", results[ReleasePriorityMode.Singles].AlbumMusicBrainzId == "single-mbid");
         Assert("albums priority selected the album", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "album-mbid");
-        Assert($"title-search dual ranking reused one Deezer, ISRC, and release-search sequence (calls: {httpClient.CallCount})", httpClient.CallCount == 3);
+        Assert($"title-search dual ranking followed Deezer, ISRC, empty recording-search, and release-search sequence (calls: {httpClient.CallCount})", httpClient.CallCount == 4);
     }
 
     private static void TestAlbumResolutionEmptyDeezerResultFallsThroughToApple()
@@ -1203,7 +1231,7 @@ internal static class Program
             var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
 
             Assert("not resolved after repeated 503s", resolution.Album == null);
-            Assert($"tried three times then gave up (calls: {httpClient.CallCount})", httpClient.CallCount == 4);
+            Assert($"tried three ISRC calls, then attempted recording search (calls: {httpClient.CallCount})", httpClient.CallCount == 5);
         }
         finally
         {
