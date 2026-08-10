@@ -232,9 +232,11 @@ internal static class Program
         Console.WriteLine("\n[Test] Settings default albums per day is the maximum");
 
         var settings = new SXMPlaylistImportSettings();
+        var unlimited = new SXMPlaylistImportSettings { Channel = "altnation", AlbumsPerDay = 0 };
         var tooMany = new SXMPlaylistImportSettings { Channel = "altnation", AlbumsPerDay = 501 };
 
         Assert("default albums per day is 500", settings.AlbumsPerDay == 500);
+        Assert("albums per day accepts zero as unlimited", unlimited.Validate().IsValid);
         Assert("albums per day rejects values above 500", !tooMany.Validate().IsValid);
     }
 
@@ -243,6 +245,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Import splits albums per day across UTC hours");
 
         var max = new SXMPlaylistImportSettings { AlbumsPerDay = 500 };
+        var unlimited = new SXMPlaylistImportSettings { AlbumsPerDay = 0 };
         var one = new SXMPlaylistImportSettings { AlbumsPerDay = 1 };
         var fortyEight = new SXMPlaylistImportSettings { AlbumsPerDay = 48 };
 
@@ -255,6 +258,7 @@ internal static class Program
 
         Assert("500/day totals 500 across 24 hourly windows", maxHourly.Sum() == 500);
         Assert("500/day spreads as 20 or 21 per hour", maxHourly.Min() == 20 && maxHourly.Max() == 21);
+        Assert("0/day is unlimited", SXMPlaylistImport.GetAlbumsPerFetch(unlimited, new DateTime(2026, 8, 10, 23, 0, 0, DateTimeKind.Utc)) == int.MaxValue);
         Assert("1/day exposes only one hourly slot", oneHourly.Sum() == 1 && oneHourly.Count(v => v == 1) == 1);
         Assert("48/day is exactly 2 per hour", SXMPlaylistImport.GetAlbumsPerFetch(fortyEight, new DateTime(2026, 8, 10, 23, 0, 0, DateTimeKind.Utc)) == 2);
     }

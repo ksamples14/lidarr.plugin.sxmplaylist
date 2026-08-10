@@ -347,6 +347,11 @@ namespace SXMPlaylist.ImportLists
         internal static int GetAlbumsPerFetch(SXMPlaylistImportSettings? settings, DateTime nowUtc)
         {
             var albumsPerDay = GetAlbumsPerDay(settings);
+            if (albumsPerDay == 0)
+            {
+                return int.MaxValue;
+            }
+
             var baseHourly = albumsPerDay / 24;
             var remainder = albumsPerDay % 24;
 
@@ -356,7 +361,7 @@ namespace SXMPlaylist.ImportLists
         private static int GetAlbumsPerDay(SXMPlaylistImportSettings? settings)
         {
             var value = settings?.AlbumsPerDay ?? 500;
-            return value <= 0 ? 500 : Math.Clamp(value, 1, 500);
+            return value < 0 ? 500 : Math.Clamp(value, 0, 500);
         }
 
         private static int GetMinimumPlays(SXMPlaylistImportSettings? settings)

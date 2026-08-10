@@ -28,7 +28,7 @@ namespace SXMPlaylist.ImportLists
                 .InclusiveBetween(1, (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays);
 
             RuleFor(c => c.AlbumsPerDay)
-                .InclusiveBetween(1, 500);
+                .InclusiveBetween(0, 500);
         }
     }
 
@@ -78,10 +78,10 @@ namespace SXMPlaylist.ImportLists
         [FieldDefinition(4, Label = "History Retention Days", Type = FieldType.Number, HelpText = "How many days of captured plays to keep and consider for this list.")]
         public int HistoryRetentionDays { get; set; }
 
-        [FieldDefinition(5, Label = "Albums Per Day", Type = FieldType.Number, HelpText = "Maximum albums this list presents per day, split evenly across the 24 hourly import-list sync windows. Default is 500 (Maximum).")]
+        [FieldDefinition(5, Label = "Albums Per Day", Type = FieldType.Number, HelpText = "Maximum albums per day, evenly split across 24 hours. Default is 500. 0 (Zero) is unlimited.")]
         public int AlbumsPerDay { get; set; }
 
-        [FieldDefinition(6, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "Prefer Singles for exact radio releases, or Albums for older/classic channels where the album is usually the desired add.")]
+        [FieldDefinition(6, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "Prefer Singles or Albums.")]
         public ReleasePriorityMode ReleasePriority { get; set; }
 
         public string BaseUrl { get; set; }
