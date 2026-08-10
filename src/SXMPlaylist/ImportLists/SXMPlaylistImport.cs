@@ -82,7 +82,7 @@ namespace SXMPlaylist.ImportLists
                 channel,
                 presentationSince,
                 retainedSince,
-                GetAlbumsPerHour(Settings),
+                GetAlbumsPerFetch(Settings, now),
                 windows,
                 Settings?.RequireMusicBrainzId ?? false,
                 GetMinimumPlays(Settings),
@@ -344,10 +344,19 @@ namespace SXMPlaylist.ImportLists
             return show.IsNullOrWhiteSpace() ? SXMPlaylistShowSchedule.ChannelValue : show!;
         }
 
-        private static int GetAlbumsPerHour(SXMPlaylistImportSettings? settings)
+        internal static int GetAlbumsPerFetch(SXMPlaylistImportSettings? settings, DateTime nowUtc)
         {
-            var value = settings?.AlbumsPerHour ?? 20;
-            return value <= 0 ? 20 : Math.Clamp(value, 1, 100);
+            var albumsPerDay = GetAlbumsPerDay(settings);
+            var baseHourly = albumsPerDay / 24;
+            var remainder = albumsPerDay % 24;
+
+            return baseHourly + (nowUtc.Hour < remainder ? 1 : 0);
+        }
+
+        private static int GetAlbumsPerDay(SXMPlaylistImportSettings? settings)
+        {
+            var value = settings?.AlbumsPerDay ?? 500;
+            return value <= 0 ? 500 : Math.Clamp(value, 1, 500);
         }
 
         private static int GetMinimumPlays(SXMPlaylistImportSettings? settings)

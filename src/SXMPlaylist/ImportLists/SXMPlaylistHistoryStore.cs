@@ -360,11 +360,11 @@ namespace SXMPlaylist.ImportLists
             return command.ExecuteNonQuery() > 0;
         }
 
-        public void SaveShowWindows(string channel, IEnumerable<ShowInfo> shows)
+        public void SaveShowWindows(string channel, IEnumerable<ShowInfo> shows, DateTime? cachedUtc = null)
         {
             using var connection = OpenConnection();
             using var transaction = connection.BeginTransaction();
-            var cachedUtc = DateTime.UtcNow.ToString("O");
+            var cachedAt = (cachedUtc ?? DateTime.UtcNow).ToString("O");
 
             foreach (var show in shows)
             {
@@ -382,12 +382,22 @@ namespace SXMPlaylist.ImportLists
                     command.Parameters.AddWithValue("@showName", show.Name);
                     command.Parameters.AddWithValue("@start", window.StartUtc.ToString("O"));
                     command.Parameters.AddWithValue("@end", window.EndUtc.ToString("O"));
-                    command.Parameters.AddWithValue("@cachedUtc", cachedUtc);
+                    command.Parameters.AddWithValue("@cachedUtc", cachedAt);
                     command.ExecuteNonQuery();
                 }
             }
 
             transaction.Commit();
+        }
+
+        public DateTime? GetShowWindowsCacheAge(string channel)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand("SELECT MAX(CachedUtc) FROM ShowWindows WHERE Channel = @channel", connection);
+            command.Parameters.AddWithValue("@channel", channel);
+
+            var result = command.ExecuteScalar();
+            return result == null || result is DBNull ? (DateTime?)null : DateTime.Parse((string)result).ToUniversalTime();
         }
 
         public ShowWindowRecord? GetShowWindowForPlay(string channel, DateTime timestampUtc)

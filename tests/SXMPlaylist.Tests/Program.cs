@@ -35,6 +35,8 @@ internal static class Program
         TestSettingsRequireNonEmptyChannel();
         TestSettingsApiPathMirrorsChannelForUiRefresh();
         TestSettingsDefaultReleasePriorityIsSingles();
+        TestSettingsDefaultAlbumsPerDayIsMaximum();
+        TestImportSplitsAlbumsPerDayAcrossUtcHours();
         TestShowScheduleParsesOfficialEpgShape();
         TestShowScheduleUsesKnownEpgAlias();
         TestShowScheduleSkipsPageFallbackWhenAliasWorks();
@@ -84,7 +86,7 @@ internal static class Program
         TestStorePresentableWindowExpires();
         TestStoreRequireMbidFiltersBeforeLimit();
         TestStoreMinimumPlaysFiltersBeforeLimit();
-        TestStoreAlbumsPerHourLimitsPresentation();
+        TestStoreLimitCapsPresentationRows();
         TestStorePruneRemovesOldData();
         TestStorePruneRemovesOldPlayEventsAndShowWindows();
         TestStoreHistoryRetentionFiltersQueryOnly();
@@ -98,6 +100,7 @@ internal static class Program
         TestWorkerCapturesDueChannel();
         TestWorkerCapturesPlayEventShowAttribution();
         TestWorkerRecordsPlayEventsWhenEpgFails();
+        TestWorkerReusesFreshShowWindowsForDailyEpgRefresh();
         TestWorkerSkipsCaptureWhenNotDue();
         TestWorkerResolvesDueTracks();
         TestWorkerUsesListMetadataProfileForResolution();
@@ -222,6 +225,38 @@ internal static class Program
         var settings = new SXMPlaylistImportSettings();
 
         Assert("default release priority is Singles", settings.ReleasePriority == ReleasePriorityMode.Singles);
+    }
+
+    private static void TestSettingsDefaultAlbumsPerDayIsMaximum()
+    {
+        Console.WriteLine("\n[Test] Settings default albums per day is the maximum");
+
+        var settings = new SXMPlaylistImportSettings();
+        var tooMany = new SXMPlaylistImportSettings { Channel = "altnation", AlbumsPerDay = 501 };
+
+        Assert("default albums per day is 500", settings.AlbumsPerDay == 500);
+        Assert("albums per day rejects values above 500", !tooMany.Validate().IsValid);
+    }
+
+    private static void TestImportSplitsAlbumsPerDayAcrossUtcHours()
+    {
+        Console.WriteLine("\n[Test] Import splits albums per day across UTC hours");
+
+        var max = new SXMPlaylistImportSettings { AlbumsPerDay = 500 };
+        var one = new SXMPlaylistImportSettings { AlbumsPerDay = 1 };
+        var fortyEight = new SXMPlaylistImportSettings { AlbumsPerDay = 48 };
+
+        var maxHourly = Enumerable.Range(0, 24)
+            .Select(h => SXMPlaylistImport.GetAlbumsPerFetch(max, new DateTime(2026, 8, 10, h, 0, 0, DateTimeKind.Utc)))
+            .ToList();
+        var oneHourly = Enumerable.Range(0, 24)
+            .Select(h => SXMPlaylistImport.GetAlbumsPerFetch(one, new DateTime(2026, 8, 10, h, 0, 0, DateTimeKind.Utc)))
+            .ToList();
+
+        Assert("500/day totals 500 across 24 hourly windows", maxHourly.Sum() == 500);
+        Assert("500/day spreads as 20 or 21 per hour", maxHourly.Min() == 20 && maxHourly.Max() == 21);
+        Assert("1/day exposes only one hourly slot", oneHourly.Sum() == 1 && oneHourly.Count(v => v == 1) == 1);
+        Assert("48/day is exactly 2 per hour", SXMPlaylistImport.GetAlbumsPerFetch(fortyEight, new DateTime(2026, 8, 10, 23, 0, 0, DateTimeKind.Utc)) == 2);
     }
 
     private static void TestShowScheduleParsesOfficialEpgShape()
@@ -1369,9 +1404,9 @@ internal static class Program
         Assert("older repeated row is returned while newer single-play rows are hidden", presentable.Count == 1 && presentable[0].TrackId == "repeatTrack");
     }
 
-    private static void TestStoreAlbumsPerHourLimitsPresentation()
+    private static void TestStoreLimitCapsPresentationRows()
     {
-        Console.WriteLine("\n[Test] Albums Per Hour limits the presented row count");
+        Console.WriteLine("\n[Test] Presentation limit caps the presented row count");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
@@ -1651,6 +1686,37 @@ internal static class Program
 
         Assert("play event recorded despite EPG 404", events.Count == 1 && events[0].PlayId == "play1");
         Assert("show attribution is unknown when EPG failed", events[0].ProgramId == null && events[0].ShowName == null);
+    }
+
+    private static void TestWorkerReusesFreshShowWindowsForDailyEpgRefresh()
+    {
+        Console.WriteLine("\n[Test] Worker reuses fresh show windows for 24h EPG refresh cadence");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api/station/altnation", BuildFeedJson(("play1", "track1", "Artist One", "Song A", Array.Empty<(string, string)>())));
+        httpClient.Respond("sxmepg", "{\"chEpgInfo\":{\"dayChSchedules\":[{\"episode\":[" +
+            "{\"pgid\":\"show1\",\"pr\":{\"pName\":\"Show One\"},\"sc\":{\"sTimeStr\":\"08.04.2026 19:00 EDT\",\"eTimeStr\":\"08.06.2026 21:00 EDT\"}}" +
+            "]}],\"pg\":[]}}");
+
+        var factory = new FakeImportListFactory();
+        factory.AddChannel("altnation");
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+
+        worker.RunOnce(CancellationToken.None);
+        var epgRequestsAfterFirstCapture = httpClient.RequestUrls.Count(u => u.Contains("sxmepg"));
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.SetLastCaptureUtc("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.CaptureInterval - TimeSpan.FromMinutes(1));
+        worker.RunOnce(CancellationToken.None);
+
+        var epgRequestsAfterSecondCapture = httpClient.RequestUrls.Count(u => u.Contains("sxmepg"));
+        var events = store.GetPlayEvents("altnation", new DateTime(2026, 8, 5, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 8, 5, 1, 0, 0, DateTimeKind.Utc), "show1");
+
+        Assert("first due capture fetched EPG", epgRequestsAfterFirstCapture == 1);
+        Assert("second due capture within 24h did not refetch EPG", epgRequestsAfterSecondCapture == 1);
+        Assert("cached show window still attributes captured play", events.Count == 1 && events[0].ShowName == "Show One");
     }
 
     private static void TestWorkerSkipsCaptureWhenNotDue()

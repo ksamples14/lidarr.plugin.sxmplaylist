@@ -29,6 +29,7 @@ namespace SXMPlaylist.ImportLists
     public class SXMPlaylistWorker
     {
         private static readonly TimeSpan BackfillWindow = TimeSpan.FromHours(2);
+        private static readonly TimeSpan ShowScheduleRefreshInterval = TimeSpan.FromHours(24);
         private static readonly TimeSpan LoopInterval = TimeSpan.FromSeconds(60);
         private const int ResolutionBatchSize = 50;
         private const int RetryBatchSize = 15;
@@ -248,6 +249,12 @@ namespace SXMPlaylist.ImportLists
         {
             try
             {
+                var cacheAge = _historyStore.GetShowWindowsCacheAge(channel);
+                if (cacheAge != null && DateTime.UtcNow - cacheAge.Value < ShowScheduleRefreshInterval)
+                {
+                    return;
+                }
+
                 var shows = SXMPlaylistShowSchedule.Fetch(_httpClient, channel, GetChannelName(channel));
                 if (shows.Count > 0)
                 {
