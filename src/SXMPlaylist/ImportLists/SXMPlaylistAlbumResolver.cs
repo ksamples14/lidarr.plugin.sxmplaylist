@@ -62,25 +62,27 @@ namespace SXMPlaylist.ImportLists
             _logger = logger;
         }
 
-        public AlbumResolution Resolve(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null)
+        public AlbumResolution Resolve(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null, IReadOnlyList<string>? artistFragments = null)
         {
             var effectiveFilter = filter ?? AlbumTypeFilter.Unrestricted;
-            var results = ResolveAllPriorities(artist, song, links, effectiveFilter);
+            var results = ResolveAllPriorities(artist, song, links, effectiveFilter, artistFragments);
             return results.TryGetValue(effectiveFilter.ReleasePriority, out var resolution) ? resolution : AlbumResolution.NotFound;
         }
 
-        public IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> ResolveAllPriorities(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null)
+        public IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> ResolveAllPriorities(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null, IReadOnlyList<string>? artistFragments = null)
         {
             var effectiveFilter = filter ?? AlbumTypeFilter.Unrestricted;
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
             string? deezerAlbumTitle = null;
             string? appleAlbumTitle = null;
+            string? deezerArtist = null;
             var appleLookupAttempted = false;
 
             try
             {
                 var deezerTrack = GetDeezerTrack(artist, links);
                 deezerAlbumTitle = deezerTrack?["album"]?["title"]?.Value<string>();
+                deezerArtist = deezerTrack?["artist"]?["name"]?.Value<string>();
 
                 foreach (var result in ResolveViaMusicBrainzAll(deezerTrack, effectiveFilter))
                 {
@@ -93,11 +95,13 @@ namespace SXMPlaylist.ImportLists
                 _logger.Debug(ex, "Deezer/MusicBrainz album lookup failed for {0} - {1}", artist, song);
             }
 
+            var artistCandidates = BuildArtistCandidates(artist, artistFragments, deezerArtist);
+
             if (!HasAllPriorities(results))
             {
                 try
                 {
-                    foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artist, song, effectiveFilter))
+                    foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artistCandidates, song, effectiveFilter))
                     {
                         if (!results.ContainsKey(result.Key))
                         {
@@ -112,7 +116,7 @@ namespace SXMPlaylist.ImportLists
                 }
             }
 
-            AddMissingTitleSearchResults(results, artist, deezerAlbumTitle, effectiveFilter, "Deezer");
+            AddMissingTitleSearchResults(results, artistCandidates, deezerAlbumTitle, effectiveFilter, "Deezer");
 
             if (!HasAllPriorities(results) && links.ContainsKey("appleMusic"))
             {
@@ -120,7 +124,7 @@ namespace SXMPlaylist.ImportLists
                 {
                     appleLookupAttempted = true;
                     appleAlbumTitle = GetAppleAlbumTitle(artist, links);
-                    AddMissingTitleSearchResults(results, artist, appleAlbumTitle, effectiveFilter, "Apple");
+                    AddMissingTitleSearchResults(results, artistCandidates, appleAlbumTitle, effectiveFilter, "Apple");
                 }
                 catch (Exception ex)
                 {
@@ -154,6 +158,47 @@ namespace SXMPlaylist.ImportLists
         private static bool HasAllPriorities(IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> results)
         {
             return ReleasePriorities.All(results.ContainsKey);
+        }
+
+        // The feed can fragment a single artist name across separators ("Kool & The Gang" becomes
+        // ['Kool', 'The Gang'], "M.A.R.R.S" becomes ['M','A','R','R','S']). Reconstruct candidate
+        // artist strings - the Deezer artist name is the most reliable, then the space-joined
+        // fragments, then the first fragment - so MusicBrainz searches are tried against every
+        // plausible name until one produces matches. Individual trailing fragments are dropped:
+        // a lone "Kool" or "The Gang" almost never passes ArtistCreditMatches against MB's
+        // canonical "Kool & The Gang", so they'd only waste a rate-limited search.
+        private static IReadOnlyList<string> BuildArtistCandidates(string artist, IReadOnlyList<string>? fragments, string? deezerArtist)
+        {
+            var candidates = new List<string>();
+            void Add(string? name)
+            {
+                if (name.IsNullOrWhiteSpace())
+                {
+                    return;
+                }
+
+                var collapsed = string.Join(' ', name!.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                if (!candidates.Any(c => string.Equals(c, collapsed, StringComparison.OrdinalIgnoreCase)))
+                {
+                    candidates.Add(collapsed);
+                }
+            }
+
+            Add(deezerArtist);
+            if (fragments != null)
+            {
+                var joined = string.Join(" ", fragments.Where(f => f.IsNotNullOrWhiteSpace())).Trim();
+                Add(joined);
+            }
+
+            Add(artist);
+
+            if (candidates.Count == 0)
+            {
+                candidates.Add(artist);
+            }
+
+            return candidates;
         }
 
         private JToken? GetDeezerTrack(string artist, IReadOnlyDictionary<string, string> links)
@@ -195,7 +240,7 @@ namespace SXMPlaylist.ImportLists
             return albumTitle;
         }
 
-        private void AddMissingTitleSearchResults(Dictionary<ReleasePriorityMode, AlbumResolution> results, string artist, string? albumTitle, AlbumTypeFilter filter, string source)
+        private void AddMissingTitleSearchResults(Dictionary<ReleasePriorityMode, AlbumResolution> results, IReadOnlyList<string> artistCandidates, string? albumTitle, AlbumTypeFilter filter, string source)
         {
             if (HasAllPriorities(results) || albumTitle.IsNullOrWhiteSpace())
             {
@@ -204,18 +249,18 @@ namespace SXMPlaylist.ImportLists
 
             try
             {
-                foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artist, albumTitle, filter))
+                foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artistCandidates, albumTitle, filter))
                 {
                     if (!results.ContainsKey(result.Key))
                     {
-                        _logger.Debug("Resolved {0} via {1} title search to {2} MusicBrainz album '{3}' ({4})", artist, source, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
+                        _logger.Debug("Resolved {0} via {1} title search to {2} MusicBrainz album '{3}' ({4})", string.Join(" / ", artistCandidates), source, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
                         results[result.Key] = result.Value;
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.Debug(ex, "MusicBrainz {0} title search fallback failed for {1}", source, artist);
+                _logger.Debug(ex, "MusicBrainz {0} title search fallback failed for {1}", source, string.Join(" / ", artistCandidates));
             }
         }
 
@@ -232,21 +277,11 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzRecordingSearchAll(string artist, string song, AlbumTypeFilter filter)
+        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzRecordingSearchAll(IReadOnlyList<string> artistCandidates, string song, AlbumTypeFilter filter)
         {
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
-            if (artist.IsNullOrWhiteSpace() || song.IsNullOrWhiteSpace())
+            if (artistCandidates == null || artistCandidates.Count == 0 || song.IsNullOrWhiteSpace())
             {
-                return results;
-            }
-
-            var query = BuildRecordingSearchQuery(artist, song);
-            ThrottleMusicBrainz();
-            var search = GetJson($"https://musicbrainz.org/ws/2/recording?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzRecordingSearchLimit}", musicBrainz: true);
-            var recordings = search?["recordings"] as JArray;
-            if (recordings == null || recordings.Count == 0)
-            {
-                _logger.Debug("MusicBrainz recording search found no recordings for {0} / '{1}'", artist, song);
                 return results;
             }
 
@@ -254,67 +289,94 @@ namespace SXMPlaylist.ImportLists
             string? recordingArtistMbid = null;
             var artistRejected = 0;
             var titleRejected = 0;
-            var detailLookups = 0;
+            var noRecordings = 0;
 
-            foreach (var recording in recordings)
+            foreach (var artist in artistCandidates)
             {
-                var title = recording["title"]?.Value<string>();
-                if (title.IsNullOrWhiteSpace() || TitleSimilarity(title!, song) < TitleMatchThreshold)
-                {
-                    titleRejected++;
-                    continue;
-                }
-
-                if (!ArtistCreditMatches(recording, artist))
-                {
-                    artistRejected++;
-                    continue;
-                }
-
-                var recordingId = recording["id"]?.Value<string>();
-                if (recordingId.IsNullOrWhiteSpace())
+                if (artist.IsNullOrWhiteSpace())
                 {
                     continue;
                 }
 
-                if (detailLookups >= MusicBrainzRecordingDetailLimit)
+                // Per-candidate budget: a wrong-artist candidate that passes the title gate and
+                // consumes all detail slots must not starve a later, correct candidate. A shared
+                // global cap would let "Kool" burn the budget before "Kool & The Gang" is tried.
+                var detailLookups = 0;
+
+                var query = BuildRecordingSearchQuery(artist, song);
+                ThrottleMusicBrainz();
+                var search = GetJson($"https://musicbrainz.org/ws/2/recording?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzRecordingSearchLimit}", musicBrainz: true);
+                var recordings = search?["recordings"] as JArray;
+                if (recordings == null || recordings.Count == 0)
+                {
+                    noRecordings++;
+                    continue;
+                }
+
+                foreach (var recording in recordings)
+                {
+                    var title = recording["title"]?.Value<string>();
+                    if (title.IsNullOrWhiteSpace() || TitleSimilarity(title!, song) < TitleMatchThreshold)
+                    {
+                        titleRejected++;
+                        continue;
+                    }
+
+                    if (!ArtistCreditMatches(recording, artist))
+                    {
+                        artistRejected++;
+                        continue;
+                    }
+
+                    var recordingId = recording["id"]?.Value<string>();
+                    if (recordingId.IsNullOrWhiteSpace())
+                    {
+                        continue;
+                    }
+
+                    if (detailLookups >= MusicBrainzRecordingDetailLimit)
+                    {
+                        break;
+                    }
+
+                    detailLookups++;
+
+                    ThrottleMusicBrainz();
+                    var fullRecording = GetJson(
+                        $"https://musicbrainz.org/ws/2/recording/{recordingId}?inc=releases+release-groups+artist-credits&fmt=json",
+                        musicBrainz: true);
+                    var releases = fullRecording?["releases"] as JArray;
+                    if (releases == null || releases.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var artistCredits = fullRecording?["artist-credit"] as JArray;
+                    if (recordingArtistMbid == null && artistCredits is { Count: 1 })
+                    {
+                        recordingArtistMbid = artistCredits[0]["artist"]?["id"]?.Value<string>();
+                    }
+
+                    foreach (var release in releases)
+                    {
+                        releaseCandidates.Add(release);
+                    }
+                }
+
+                if (releaseCandidates.Count > 0)
                 {
                     break;
-                }
-
-                detailLookups++;
-
-                ThrottleMusicBrainz();
-                var fullRecording = GetJson(
-                    $"https://musicbrainz.org/ws/2/recording/{recordingId}?inc=releases+release-groups+artist-credits&fmt=json",
-                    musicBrainz: true);
-                var releases = fullRecording?["releases"] as JArray;
-                if (releases == null || releases.Count == 0)
-                {
-                    continue;
-                }
-
-                var artistCredits = fullRecording?["artist-credit"] as JArray;
-                if (recordingArtistMbid == null && artistCredits is { Count: 1 })
-                {
-                    recordingArtistMbid = artistCredits[0]["artist"]?["id"]?.Value<string>();
-                }
-
-                foreach (var release in releases)
-                {
-                    releaseCandidates.Add(release);
                 }
             }
 
             if (releaseCandidates.Count == 0)
             {
                 _logger.Debug(
-                    "MusicBrainz recording search rejected all {0} recordings for {1} / '{2}' ({3} artist-credit, {4} title)",
-                    recordings.Count,
-                    artist,
+                    "MusicBrainz recording search rejected all recordings for '{0}' ({1} artist-credit, {2} title, {3} empty searches)",
                     song,
                     artistRejected,
-                    titleRejected);
+                    titleRejected,
+                    noRecordings);
                 return results;
             }
 
@@ -392,72 +454,84 @@ namespace SXMPlaylist.ImportLists
         // artist + the album title we already got (from Deezer or Apple), gated by a fuzzy
         // artist-credit match and a title-similarity threshold so a same-titled album by a
         // different artist can't be attached. Returns real MBIDs when matches are confident.
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzTitleSearchAll(string artist, string? albumTitle, AlbumTypeFilter filter)
+        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzTitleSearchAll(IReadOnlyList<string> artistCandidates, string? albumTitle, AlbumTypeFilter filter)
         {
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
-            if (artist.IsNullOrWhiteSpace() || albumTitle.IsNullOrWhiteSpace())
+            if (artistCandidates == null || artistCandidates.Count == 0 || albumTitle.IsNullOrWhiteSpace())
             {
-                return results;
-            }
-
-            var query = BuildTitleSearchQuery(artist, albumTitle!);
-            ThrottleMusicBrainz();
-            var result = GetJson($"https://musicbrainz.org/ws/2/release?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzTitleSearchLimit}", musicBrainz: true);
-
-            var releases = result?["releases"] as JArray;
-            if (releases == null || releases.Count == 0)
-            {
-                _logger.Debug("MusicBrainz title search found no releases for {0} / '{1}'", artist, albumTitle);
                 return results;
             }
 
             var candidates = new JArray();
             var artistRejected = 0;
             var titleRejected = 0;
-            foreach (var release in releases)
+            var noReleases = 0;
+
+            foreach (var artist in artistCandidates)
             {
-                var rg = release["release-group"];
-                if (rg == null)
+                if (artist.IsNullOrWhiteSpace())
                 {
                     continue;
                 }
 
-                // Artist gate: the release's credited artist must plausibly be the played artist.
-                if (!ArtistCreditMatches(release, artist))
+                var query = BuildTitleSearchQuery(artist, albumTitle!);
+                ThrottleMusicBrainz();
+                var result = GetJson($"https://musicbrainz.org/ws/2/release?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzTitleSearchLimit}", musicBrainz: true);
+
+                var releases = result?["releases"] as JArray;
+                if (releases == null || releases.Count == 0)
                 {
-                    artistRejected++;
+                    noReleases++;
                     continue;
                 }
 
-                // Title gate: release-group title must be similar enough to the Deezer/Apple title.
-                var rgTitle = rg["title"]?.Value<string>();
-                if (rgTitle.IsNullOrWhiteSpace() || TitleSimilarity(rgTitle!, albumTitle!) < TitleMatchThreshold)
+                foreach (var release in releases)
                 {
-                    titleRejected++;
-                    continue;
+                    var rg = release["release-group"];
+                    if (rg == null)
+                    {
+                        continue;
+                    }
+
+                    // Artist gate: the release's credited artist must plausibly be the played artist.
+                    if (!ArtistCreditMatches(release, artist))
+                    {
+                        artistRejected++;
+                        continue;
+                    }
+
+                    // Title gate: release-group title must be similar enough to the Deezer/Apple title.
+                    var rgTitle = rg["title"]?.Value<string>();
+                    if (rgTitle.IsNullOrWhiteSpace() || TitleSimilarity(rgTitle!, albumTitle!) < TitleMatchThreshold)
+                    {
+                        titleRejected++;
+                        continue;
+                    }
+
+                    candidates.Add(release);
                 }
 
-                candidates.Add(release);
+                if (candidates.Count > 0)
+                {
+                    break;
+                }
             }
 
             if (candidates.Count == 0)
             {
                 _logger.Debug(
-                    "MusicBrainz title search rejected all {0} releases for {1} / '{2}' ({3} artist-credit, {4} title)",
-                    releases.Count,
-                    artist,
+                    "MusicBrainz title search rejected all releases for '{0}' ({1} artist-credit, {2} title, {3} empty searches)",
                     albumTitle,
                     artistRejected,
-                    titleRejected);
+                    titleRejected,
+                    noReleases);
                 return results;
             }
 
             _logger.Debug(
-                "MusicBrainz title search for {0} / '{1}' kept {2}/{3} releases ({4} artist-credit rejects, {5} title rejects)",
-                artist,
+                "MusicBrainz title search for '{0}' kept {1} releases ({2} artist-credit rejects, {3} title rejects)",
                 albumTitle,
                 candidates.Count,
-                releases.Count,
                 artistRejected,
                 titleRejected);
 
@@ -489,13 +563,13 @@ namespace SXMPlaylist.ImportLists
                     continue;
                 }
 
-                _logger.Debug("MusicBrainz title search selected '{0}' ({1}) for {2} / '{3}' using {4} priority", finalTitle, finalAlbumMbid, artist, albumTitle, priority);
+                _logger.Debug("MusicBrainz title search selected '{0}' ({1}) for {2} / '{3}' using {4} priority", finalTitle, finalAlbumMbid, string.Join(" / ", artistCandidates), albumTitle, priority);
                 results[priority] = new AlbumResolution(true, finalTitle, artistMbid, finalAlbumMbid);
             }
 
             if (results.Count == 0)
             {
-                _logger.Debug("MusicBrainz title search candidates for {0} / '{1}' were filtered out by release type/status", artist, albumTitle);
+                _logger.Debug("MusicBrainz title search candidates for {0} / '{1}' were filtered out by release type/status", string.Join(" / ", artistCandidates), albumTitle);
             }
 
             return results;
@@ -503,11 +577,18 @@ namespace SXMPlaylist.ImportLists
 
         // Boosted-OR form (DroppedNeedle pattern): phrase boost the title, fall back to unquoted
         // tokens, all AND'd against the artist so recall stays high while precision lives in code.
-        // The edition suffix is stripped from the query too - a "Three Cheers (Deluxe Edition)"
-        // phrase won't match MusicBrainz's clean "Three Cheers for Sweet Revenge" otherwise.
+        // The edition suffix and bare year are stripped from the query too - a "Emergency (85)" or
+        // "Three Cheers (Deluxe Edition)" phrase won't match MusicBrainz's clean "Emergency" /
+        // "Three Cheers for Sweet Revenge" otherwise.
         private static string BuildTitleSearchQuery(string artist, string albumTitle)
         {
-            var stripped = EditionSuffixPattern.Replace(albumTitle, " ").Trim();
+            var stripped = EditionSuffixPattern.Replace(albumTitle, " ");
+            stripped = YearSuffixPattern.Replace(stripped, " ").Trim();
+            if (stripped.IsNullOrWhiteSpace())
+            {
+                stripped = albumTitle;
+            }
+
             var title = EscapeLucene(stripped);
             var artistQuery = EscapeLucene(artist);
             return $"(releasegroup:\"{title}\"^3 OR release:\"{title}\"^2 OR {title}) AND artist:\"{artistQuery}\"";
@@ -515,7 +596,14 @@ namespace SXMPlaylist.ImportLists
 
         private static string BuildRecordingSearchQuery(string artist, string song)
         {
-            var title = EscapeLucene(song);
+            var stripped = EditionSuffixPattern.Replace(song, " ");
+            stripped = YearSuffixPattern.Replace(stripped, " ").Trim();
+            if (stripped.IsNullOrWhiteSpace())
+            {
+                stripped = song;
+            }
+
+            var title = EscapeLucene(stripped);
             var artistQuery = EscapeLucene(artist);
             return $"(recording:\"{title}\"^3 OR {title}) AND artist:\"{artistQuery}\"";
         }
@@ -567,9 +655,19 @@ namespace SXMPlaylist.ImportLists
             @"[\(\[\{]\s*(deluxe|remaster(ed)?|edition|anniversary|special|expanded|bonus|complete|acoustic|live|demo|radio edit|extended|instrumental|mono|stereo|explicit|clean|version|single|promo)\b[^\)\]\}]*[\)\]\}]",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // SiriusXM/xmplaylist annotate each title with the year in parens, e.g. "Emergency (85)".
+        // MusicBrainz's clean title is just "Emergency"; strip the bare year before querying and
+        // scoring so "(85)" can't push a real match below the title threshold. Anchored to the end
+        // of the title so mid-title parenthesized numbers that aren't years (e.g. "Jump (12)") are
+        // left alone.
+        private static readonly Regex YearSuffixPattern = new(
+            @"[\(\[\{]\s*(?:(?:19|20)\d{2}|\d{2})\s*[\)\]\}]\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static string NormalizeForMatch(string value)
         {
             value = EditionSuffixPattern.Replace(value, " ");
+            value = YearSuffixPattern.Replace(value, " ");
 
             // Strip diacritics (Beyoncé -> Beyonce, Mötley Crüe -> Motley Crue).
             var normalized = value.Normalize(System.Text.NormalizationForm.FormD);

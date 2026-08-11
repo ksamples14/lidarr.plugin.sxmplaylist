@@ -313,7 +313,7 @@ namespace SXMPlaylist.ImportLists
             var baseFilter = filtersByChannel.TryGetValue(track.Channel, out var f) ? f : AlbumTypeFilter.Unrestricted;
             var storedAny = false;
             var retryIncomplete = false;
-            var resolutions = _albumResolver.ResolveAllPriorities(artist, track.Song, links, baseFilter);
+            var resolutions = _albumResolver.ResolveAllPriorities(artist, track.Song, links, baseFilter, track.Artists);
 
             foreach (var releasePriority in new[] { ReleasePriorityMode.Singles, ReleasePriorityMode.Albums })
             {

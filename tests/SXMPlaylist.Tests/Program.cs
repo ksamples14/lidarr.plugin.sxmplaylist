@@ -77,6 +77,8 @@ internal static class Program
         TestAlbumResolutionCompilationFallbackRequiresAllowedStatus();
         TestAlbumResolutionTitleSearchAllowsSameArtistCompilationFallback();
         TestAlbumResolutionTitleSearchStripsEditionSuffixInQuery();
+        TestAlbumResolutionRecordingSearchStripsYearSuffix();
+        TestAlbumResolutionRecordingSearchUsesDeezerArtistForFragmentedNames();
         TestAlbumResolutionFilterExcludesDisallowedRelease();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
@@ -1282,6 +1284,58 @@ internal static class Program
 
         Assert("resolved despite the suffix in the source title", resolution.AlbumMusicBrainzId == "album-mbid-1");
         Assert("query did not contain the literal suffix", !httpClient.LastRequestUrl.Contains("Deluxe"));
+    }
+
+    private static void TestAlbumResolutionRecordingSearchStripsYearSuffix()
+    {
+        Console.WriteLine("\n[Test] Recording search strips the SiriusXM year annotation from the song title");
+
+        var httpClient = new FakeHttpClient();
+        // No provider links -> recording search is the only path. The played title carries the
+        // "(85)" year annotation; MB's clean title is just "Emergency".
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[{\"id\":\"rec-1\",\"title\":\"Emergency\"," +
+            "\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool & The Gang\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool & The Gang\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool & The Gang\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"Emergency\",\"primary-type\":\"Album\",\"first-release-date\":\"1984-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Kool & The Gang", "Emergency (85)", new Dictionary<string, string>());
+
+        Assert("year-suffixed title matched the clean MusicBrainz recording", resolution.AlbumMusicBrainzId == "album-mbid");
+        Assert("query did not contain the literal year annotation", !httpClient.LastRequestUrl.Contains("(85)"));
+    }
+
+    private static void TestAlbumResolutionRecordingSearchUsesDeezerArtistForFragmentedNames()
+    {
+        Console.WriteLine("\n[Test] Recording search tries the Deezer artist name when the feed fragmented the artist");
+
+        // Feed splits "Kool & The Gang" into ['Kool', 'The Gang']; only "Kool" is passed as the
+        // primary artist. Deezer's track payload has the canonical name, which must be tried.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"artist\":{\"name\":\"Kool & The Gang\"},\"album\":{\"title\":\"Celebration Live\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[{\"id\":\"rec-1\",\"title\":\"Emergency\"," +
+            "\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool & The Gang\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool & The Gang\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool & The Gang\"}}]," +
+            "\"release-group\":{\"id\":\"emergency-album\",\"title\":\"Emergency\",\"primary-type\":\"Album\",\"first-release-date\":\"1984-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities(
+            "Kool",
+            "Emergency (85)",
+            Links(("deezer", "https://www.deezer.com/track/624510")),
+            null,
+            new List<string> { "Kool", "The Gang" });
+
+        Assert("fragmented artist resolved via the Deezer canonical name", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "emergency-album");
+        Assert("recording search ran once on the canonical artist", httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording?query=")) == 1);
     }
 
     private static void TestMusicBrainzBusyIsRetried()
