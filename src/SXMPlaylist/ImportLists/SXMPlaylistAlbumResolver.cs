@@ -43,6 +43,7 @@ namespace SXMPlaylist.ImportLists
         private static readonly int MusicBrainzMaxRetries = 2;
         private const int MusicBrainzTitleSearchLimit = 25;
         private const int MusicBrainzRecordingSearchLimit = 10;
+        private const int MusicBrainzRecordingDetailLimit = 3;
         private static readonly SemaphoreSlim MusicBrainzGate = new(1, 1);
         private static DateTime _lastMusicBrainzCallUtc = DateTime.MinValue;
 
@@ -72,18 +73,19 @@ namespace SXMPlaylist.ImportLists
         {
             var effectiveFilter = filter ?? AlbumTypeFilter.Unrestricted;
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
+            string? deezerAlbumTitle = null;
+            string? appleAlbumTitle = null;
+            var appleLookupAttempted = false;
 
             try
             {
-                var viaDeezer = ResolveViaDeezerAndMusicBrainzAll(artist, song, links, effectiveFilter);
-                foreach (var result in viaDeezer)
-                {
-                    results[result.Key] = result.Value;
-                }
+                var deezerTrack = GetDeezerTrack(artist, links);
+                deezerAlbumTitle = deezerTrack?["album"]?["title"]?.Value<string>();
 
-                if (HasAllPriorities(results))
+                foreach (var result in ResolveViaMusicBrainzAll(deezerTrack, effectiveFilter))
                 {
-                    return results;
+                    _logger.Debug("Resolved {0} via Deezer ISRC to {1} MusicBrainz album '{2}' ({3})", artist, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
+                    results[result.Key] = result.Value;
                 }
             }
             catch (Exception ex)
@@ -91,61 +93,11 @@ namespace SXMPlaylist.ImportLists
                 _logger.Debug(ex, "Deezer/MusicBrainz album lookup failed for {0} - {1}", artist, song);
             }
 
-            try
-            {
-                var viaApple = ResolveViaAppleMusicAll(artist, song, links, effectiveFilter);
-                foreach (var result in viaApple)
-                {
-                    if (!results.ContainsKey(result.Key))
-                    {
-                        results[result.Key] = result.Value;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.Debug(ex, "Apple Music album lookup failed for {0} - {1}", artist, song);
-            }
-
-            return results;
-        }
-
-        private static bool HasAllPriorities(IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> results)
-        {
-            return ReleasePriorities.All(results.ContainsKey);
-        }
-
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaDeezerAndMusicBrainzAll(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter filter)
-        {
-            var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
-            if (!links.TryGetValue("deezer", out var deezerUrl))
-            {
-                _logger.Debug("No Deezer link for {0}; trying Apple Music fallback", artist);
-                return results;
-            }
-
-            var match = DeezerTrackId.Match(deezerUrl);
-            if (!match.Success)
-            {
-                return results;
-            }
-
-            var track = GetJson($"https://api.deezer.com/track/{match.Groups[1].Value}");
-            var deezerAlbumTitle = track?["album"]?["title"]?.Value<string>();
-            _logger.Debug("Deezer lookup for {0} returned album title '{1}'", artist, deezerAlbumTitle ?? "<none>");
-
-            foreach (var result in ResolveViaMusicBrainzAll(track, filter))
-            {
-                _logger.Debug("Resolved {0} via Deezer ISRC to {1} MusicBrainz album '{2}' ({3})", artist, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
-                results[result.Key] = result.Value;
-            }
-
-            var missing = ReleasePriorities.Where(p => !results.ContainsKey(p)).ToList();
-            if (missing.Count > 0)
+            if (!HasAllPriorities(results))
             {
                 try
                 {
-                    foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artist, song, filter))
+                    foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artist, song, effectiveFilter))
                     {
                         if (!results.ContainsKey(result.Key))
                         {
@@ -160,35 +112,124 @@ namespace SXMPlaylist.ImportLists
                 }
             }
 
-            missing = ReleasePriorities.Where(p => !results.ContainsKey(p)).ToList();
-            if (missing.Count > 0)
+            AddMissingTitleSearchResults(results, artist, deezerAlbumTitle, effectiveFilter, "Deezer");
+
+            if (!HasAllPriorities(results) && links.ContainsKey("appleMusic"))
             {
                 try
                 {
-                    foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artist, deezerAlbumTitle, filter))
-                    {
-                        if (!results.ContainsKey(result.Key))
-                        {
-                            _logger.Debug("Resolved {0} via Deezer title search to {1} MusicBrainz album '{2}' ({3})", artist, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
-                            results[result.Key] = result.Value;
-                        }
-                    }
+                    appleLookupAttempted = true;
+                    appleAlbumTitle = GetAppleAlbumTitle(artist, links);
+                    AddMissingTitleSearchResults(results, artist, appleAlbumTitle, effectiveFilter, "Apple");
                 }
                 catch (Exception ex)
                 {
-                    _logger.Debug(ex, "MusicBrainz title search fallback failed for {0}; keeping any ISRC-derived results", artist);
+                    _logger.Debug(ex, "Apple Music album lookup failed for {0} - {1}", artist, song);
                 }
             }
 
-            if (deezerAlbumTitle.IsNotNullOrWhiteSpace())
+            AddTitleOnlyFallback(results, deezerAlbumTitle);
+
+            if (!HasAllPriorities(results) && links.ContainsKey("appleMusic"))
             {
-                foreach (var priority in ReleasePriorities.Where(p => !results.ContainsKey(p)))
+                try
                 {
-                    results[priority] = new AlbumResolution(true, deezerAlbumTitle, null, null);
+                    if (!appleLookupAttempted)
+                    {
+                        appleLookupAttempted = true;
+                        appleAlbumTitle = GetAppleAlbumTitle(artist, links);
+                    }
+
+                    AddTitleOnlyFallback(results, appleAlbumTitle);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug(ex, "Apple Music title-only fallback failed for {0} - {1}", artist, song);
                 }
             }
 
             return results;
+        }
+
+        private static bool HasAllPriorities(IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> results)
+        {
+            return ReleasePriorities.All(results.ContainsKey);
+        }
+
+        private JToken? GetDeezerTrack(string artist, IReadOnlyDictionary<string, string> links)
+        {
+            if (!links.TryGetValue("deezer", out var deezerUrl))
+            {
+                _logger.Debug("No Deezer link for {0}", artist);
+                return null;
+            }
+
+            var match = DeezerTrackId.Match(deezerUrl);
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            var track = GetJson($"https://api.deezer.com/track/{match.Groups[1].Value}");
+            var deezerAlbumTitle = track?["album"]?["title"]?.Value<string>();
+            _logger.Debug("Deezer lookup for {0} returned album title '{1}'", artist, deezerAlbumTitle ?? "<none>");
+            return track;
+        }
+
+        private string? GetAppleAlbumTitle(string artist, IReadOnlyDictionary<string, string> links)
+        {
+            if (!links.TryGetValue("appleMusic", out var appleUrl))
+            {
+                return null;
+            }
+
+            var match = AppleAlbumId.Match(appleUrl);
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            var lookup = GetJson($"https://itunes.apple.com/lookup?id={match.Groups[1].Value}");
+            var albumTitle = lookup?["results"]?.FirstOrDefault()?["collectionName"]?.Value<string>();
+            _logger.Debug("Apple Music lookup for {0} returned album title '{1}'", artist, albumTitle ?? "<none>");
+            return albumTitle;
+        }
+
+        private void AddMissingTitleSearchResults(Dictionary<ReleasePriorityMode, AlbumResolution> results, string artist, string? albumTitle, AlbumTypeFilter filter, string source)
+        {
+            if (HasAllPriorities(results) || albumTitle.IsNullOrWhiteSpace())
+            {
+                return;
+            }
+
+            try
+            {
+                foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artist, albumTitle, filter))
+                {
+                    if (!results.ContainsKey(result.Key))
+                    {
+                        _logger.Debug("Resolved {0} via {1} title search to {2} MusicBrainz album '{3}' ({4})", artist, source, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
+                        results[result.Key] = result.Value;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "MusicBrainz {0} title search fallback failed for {1}", source, artist);
+            }
+        }
+
+        private static void AddTitleOnlyFallback(Dictionary<ReleasePriorityMode, AlbumResolution> results, string? albumTitle)
+        {
+            if (albumTitle.IsNullOrWhiteSpace())
+            {
+                return;
+            }
+
+            foreach (var priority in ReleasePriorities.Where(p => !results.ContainsKey(p)))
+            {
+                results[priority] = new AlbumResolution(true, albumTitle, null, null);
+            }
         }
 
         private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzRecordingSearchAll(string artist, string song, AlbumTypeFilter filter)
@@ -213,6 +254,7 @@ namespace SXMPlaylist.ImportLists
             string? recordingArtistMbid = null;
             var artistRejected = 0;
             var titleRejected = 0;
+            var detailLookups = 0;
 
             foreach (var recording in recordings)
             {
@@ -234,6 +276,13 @@ namespace SXMPlaylist.ImportLists
                 {
                     continue;
                 }
+
+                if (detailLookups >= MusicBrainzRecordingDetailLimit)
+                {
+                    break;
+                }
+
+                detailLookups++;
 
                 ThrottleMusicBrainz();
                 var fullRecording = GetJson(
@@ -843,51 +892,6 @@ namespace SXMPlaylist.ImportLists
             }
 
             return credit[0]["artist"];
-        }
-
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaAppleMusicAll(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter filter)
-        {
-            var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
-            if (!links.TryGetValue("appleMusic", out var appleUrl))
-            {
-                return results;
-            }
-
-            var match = AppleAlbumId.Match(appleUrl);
-            if (!match.Success)
-            {
-                return results;
-            }
-
-            var lookup = GetJson($"https://itunes.apple.com/lookup?id={match.Groups[1].Value}");
-            var albumTitle = lookup?["results"]?.FirstOrDefault()?["collectionName"]?.Value<string>();
-            _logger.Debug("Apple Music lookup for {0} returned album title '{1}'", artist, albumTitle ?? "<none>");
-
-            // Try to upgrade by recording first, then by Apple album title, before falling back to the raw title.
-            foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artist, song, filter))
-            {
-                _logger.Debug("Resolved {0} via Apple MusicBrainz recording search to {1} MusicBrainz album '{2}' ({3})", artist, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
-                results[result.Key] = result.Value;
-            }
-
-            foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artist, albumTitle, filter))
-            {
-                if (!results.ContainsKey(result.Key))
-                {
-                    _logger.Debug("Resolved {0} via Apple title search to {1} MusicBrainz album '{2}' ({3})", artist, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
-                    results[result.Key] = result.Value;
-                }
-            }
-
-            if (albumTitle.IsNotNullOrWhiteSpace())
-            {
-                foreach (var priority in ReleasePriorities.Where(p => !results.ContainsKey(p)))
-                {
-                    results[priority] = new AlbumResolution(true, albumTitle, null, null);
-                }
-            }
-
-            return results;
         }
 
         private JToken? GetJson(string url, bool musicBrainz = false)

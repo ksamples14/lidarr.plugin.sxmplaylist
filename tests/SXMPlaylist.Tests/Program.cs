@@ -60,6 +60,10 @@ internal static class Program
         TestAlbumResolutionPrefersSingleOverEpOverAlbum();
         TestAlbumResolutionCanPreferAlbumOverEpOverSingle();
         TestAlbumResolutionRecordingSearchFindsAlbumAfterIsrcMiss();
+        TestAlbumResolutionRecordingSearchRunsWithoutProviderLinks();
+        TestAlbumResolutionRecordingSearchAvoidsDuplicateAppleLookup();
+        TestAlbumResolutionAppleLookupFailureIsNotRepeated();
+        TestAlbumResolutionRecordingSearchCapsDetailLookups();
         TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss();
         TestAlbumResolutionTitleSearchReturnsBothPrioritiesFromOneLookup();
         TestAlbumResolutionEmptyDeezerResultFallsThroughToApple();
@@ -848,6 +852,103 @@ internal static class Program
         Assert("recording search selected the album for Albums priority", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "album-mbid");
         Assert("multi-artist recording leaves artist MBID unset", results[ReleasePriorityMode.Singles].ArtistMusicBrainzId == null);
         Assert($"recording search avoided title-search fallback (calls: {httpClient.CallCount})", httpClient.CallCount == 4);
+    }
+
+    private static void TestAlbumResolutionRecordingSearchRunsWithoutProviderLinks()
+    {
+        Console.WriteLine("\n[Test] Recording search runs without Deezer or Apple links");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[{\"id\":\"rec-1\",\"title\":\"Song A\"," +
+            "\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"Song A\",\"primary-type\":\"Single\",\"first-release-date\":\"2026-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"Album A\",\"primary-type\":\"Album\",\"first-release-date\":\"2026-08-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities("Artist One", "Song A", new Dictionary<string, string>());
+
+        Assert("no-link recording search selected the single", results[ReleasePriorityMode.Singles].AlbumMusicBrainzId == "single-mbid");
+        Assert("no-link recording search selected the album", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "album-mbid");
+        Assert($"no-link path used one search plus one recording detail call (calls: {httpClient.CallCount})", httpClient.CallCount == 2);
+    }
+
+    private static void TestAlbumResolutionRecordingSearchAvoidsDuplicateAppleLookup()
+    {
+        Console.WriteLine("\n[Test] Recording search avoids duplicate Apple lookup when Deezer metadata resolves");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"album\":{\"title\":\"Song A\"}}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[{\"id\":\"rec-1\",\"title\":\"Song A\"," +
+            "\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"Song A\",\"primary-type\":\"Single\",\"first-release-date\":\"2026-06-01\"}}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"Album A\",\"primary-type\":\"Album\",\"first-release-date\":\"2026-08-01\"}}]}");
+        httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[{\"collectionName\":\"Apple Album\"}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities(
+            "Artist One",
+            "Song A",
+            Links(
+                ("deezer", "https://www.deezer.com/track/624510"),
+                ("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507")));
+
+        Assert("recording search resolved both priorities", results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "album-mbid");
+        Assert("Apple lookup was skipped after MBID resolution", !httpClient.RequestUrls.Any(u => u.Contains("itunes.apple.com")));
+    }
+
+    private static void TestAlbumResolutionAppleLookupFailureIsNotRepeated()
+    {
+        Console.WriteLine("\n[Test] Apple lookup failure is not repeated for title-only fallback");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=", "{\"recordings\":[]}");
+        httpClient.Respond("itunes.apple.com/lookup", "{\"results\":[]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities(
+            "Artist One",
+            "Song A",
+            Links(("appleMusic", "https://geo.music.apple.com/us/album/_/157478390?i=157478507")));
+
+        Assert("failed Apple lookup produced no fallback result", results.Count == 0);
+        Assert("Apple lookup was attempted once", httpClient.RequestUrls.Count(u => u.Contains("itunes.apple.com")) == 1);
+    }
+
+    private static void TestAlbumResolutionRecordingSearchCapsDetailLookups()
+    {
+        Console.WriteLine("\n[Test] Recording search caps detail lookups");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[" +
+            "{\"id\":\"rec-1\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]}," +
+            "{\"id\":\"rec-2\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]}," +
+            "{\"id\":\"rec-3\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]}," +
+            "{\"id\":\"rec-4\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-2", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-3", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-4",
+            "{\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"late-mbid\",\"title\":\"Late Album\",\"primary-type\":\"Album\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities("Artist One", "Song A", new Dictionary<string, string>());
+        var detailCalls = httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording/rec-"));
+
+        Assert("recording search stopped before the fourth detail lookup", detailCalls == 3);
+        Assert("capped lookup did not use the fourth recording result", !results.ContainsKey(ReleasePriorityMode.Albums));
     }
 
     private static void TestAlbumResolutionFilterExcludesDisallowedRelease()
@@ -1671,7 +1772,7 @@ internal static class Program
         var store = new SXMPlaylistHistoryStore(folder);
         Assert("play was recorded", store.GetPlays("altnation", DateTime.MinValue).Count == 1);
         Assert("last capture recorded", store.GetLastCaptureUtc("altnation") != null);
-        Assert("feed plus EPG requests made", httpClient.CallCount == 2);
+        Assert("feed and EPG requests made", httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation")) == 1 && httpClient.RequestUrls.Count(u => u.Contains("sxmepg")) == 1);
     }
 
     private static void TestWorkerCapturesPlayEventShowAttribution()
@@ -1765,10 +1866,11 @@ internal static class Program
 
         var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
-        var callsAfterFirst = httpClient.CallCount;
+        var feedCallsAfterFirst = httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation"));
         worker.RunOnce(CancellationToken.None);
 
-        Assert($"no additional feed request on the second pass (before {callsAfterFirst}, after {httpClient.CallCount})", httpClient.CallCount == callsAfterFirst);
+        var feedCallsAfterSecond = httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation"));
+        Assert($"no additional feed request on the second pass (before {feedCallsAfterFirst}, after {feedCallsAfterSecond})", feedCallsAfterSecond == feedCallsAfterFirst);
     }
 
     private static void TestWorkerResolvesDueTracks()
@@ -1947,7 +2049,12 @@ internal static class Program
 
         Assert("singles-priority presentation uses the single", singles.Count == 1 && singles[0].Album == "The Single");
         Assert("albums-priority presentation uses the album", albums.Count == 1 && albums[0].Album == "The Album");
-        Assert($"dual-priority resolution fetched feed, EPG, Deezer, ISRC, and recording once each (calls: {httpClient.CallCount})", httpClient.CallCount == 5);
+        Assert("dual-priority resolution fetched feed, EPG, Deezer, ISRC, and recording once each",
+            httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation")) == 1 &&
+            httpClient.RequestUrls.Count(u => u.Contains("sxmepg")) == 1 &&
+            httpClient.RequestUrls.Count(u => u.Contains("api.deezer.com/track/624510")) == 1 &&
+            httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/isrc/USSM19601763")) == 1 &&
+            httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording/rec-1")) == 1);
     }
 
     private static void TestWorkerIdlesWithNoChannels()
