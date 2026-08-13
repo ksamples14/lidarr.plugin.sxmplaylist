@@ -40,6 +40,7 @@
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistFeed.cs" Link="SXMPlaylistFeed.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistFeedCache.cs" Link="SXMPlaylistFeedCache.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistWorker.cs" Link="SXMPlaylistWorker.cs" />
+    <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistPlexClient.cs" Link="SXMPlaylistPlexClient.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
 </Project>

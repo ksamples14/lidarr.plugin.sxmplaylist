@@ -12,12 +12,16 @@ using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Datastore;
 using NzbDrone.Core.ImportLists;
+using NzbDrone.Core.MediaFiles;
 using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Music;
 using NzbDrone.Core.Music.Commands;
+using NzbDrone.Core.Notifications;
+using NzbDrone.Core.Notifications.Plex.Server;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Profiles.Metadata;
 using NzbDrone.Core.ThingiProvider;
+using NzbDrone.Core.Validation;
 using SXMPlaylist.ImportLists;
 
 internal static class Program
@@ -50,6 +54,9 @@ internal static class Program
         TestImportAllowsSameChannelDifferentShows();
         TestImportBlocksSecondListWhenDefaultExists();
         TestImportFetchUsesReleasePriorityResolution();
+        TestImportSkipsWhenAlternateResolutionIsMonitored();
+        TestImportSkipsWhenAlternateResolutionIsOnDisk();
+        TestImportDoesNotSkipForUnmonitoredMissingAlternate();
         TestRefreshSchedulerPushesRefreshForNewlyMonitoredAlbum();
 
         TestAlbumResolutionViaDeezerAndMusicBrainz();
@@ -64,6 +71,8 @@ internal static class Program
         TestAlbumResolutionRecordingSearchAvoidsDuplicateAppleLookup();
         TestAlbumResolutionAppleLookupFailureIsNotRepeated();
         TestAlbumResolutionRecordingSearchCapsDetailLookups();
+        TestAlbumResolutionRecordingSearchPrefersStudioRecording();
+        TestAlbumResolutionRecordingSearchKeepsSingleCandidate();
         TestAlbumResolutionTitleSearchRecoversAfterIsrcMiss();
         TestAlbumResolutionTitleSearchReturnsBothPrioritiesFromOneLookup();
         TestAlbumResolutionEmptyDeezerResultFallsThroughToApple();
@@ -114,6 +123,13 @@ internal static class Program
         TestWorkerUsesListReleasePriorityForResolution();
         TestWorkerStoresBothReleasePrioritiesForSharedChannel();
         TestWorkerIdlesWithNoChannels();
+
+        TestPlexExactTitleMatch();
+        TestPlexFeatCreditStrippedFromArtist();
+        TestPlexFuzzyTitleVersionMatch();
+        TestPlexMultiArtistPlayMatchesPrimaryArtist();
+        TestPlexRepeatedTrackUsesPersistedCache();
+        TestPlexRetriesTransientSearchFailure();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -236,13 +252,13 @@ internal static class Program
 
     private static void TestSettingsDefaultAlbumsPerDayIsMaximum()
     {
-        Console.WriteLine("\n[Test] Settings default albums per day is the maximum");
+        Console.WriteLine("\n[Test] Settings default albums per day is 24, zero is unlimited");
 
         var settings = new SXMPlaylistImportSettings();
         var unlimited = new SXMPlaylistImportSettings { Channel = "altnation", AlbumsPerDay = 0 };
         var tooMany = new SXMPlaylistImportSettings { Channel = "altnation", AlbumsPerDay = 501 };
 
-        Assert("default albums per day is 500", settings.AlbumsPerDay == 500);
+        Assert("default albums per day is 24", settings.AlbumsPerDay == 24);
         Assert("albums per day accepts zero as unlimited", unlimited.Validate().IsValid);
         Assert("albums per day rejects values above 500", !tooMany.Validate().IsValid);
     }
@@ -503,8 +519,68 @@ internal static class Program
         Assert("albums list fetch emits the album", albums.Count == 1 && albums[0].Album == "The Album" && albums[0].AlbumMusicBrainzId == "album-mbid");
     }
 
-    private static SXMPlaylistImport NewImport(FakeHttpClient httpClient, FakeAppFolderInfo folder, FakeImportListRepository repo, int id, string channel, string show, ReleasePriorityMode releasePriority = ReleasePriorityMode.Singles)
+    private static void TestImportSkipsWhenAlternateResolutionIsMonitored()
     {
+        Console.WriteLine("\n[Test] Import skips preferred release when alternate resolution is monitored");
+
+        var folder = NewFolder();
+        SeedDualResolutionTrack(folder);
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { ForeignAlbumId = "album-mbid", Monitored = true });
+
+        var repo = new FakeImportListRepository();
+        var singlesImport = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Singles, albumService);
+        var albumsImport = NewImport(new FakeHttpClient(), folder, repo, 2, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Albums, albumService);
+
+        Assert("singles preferred skipped because album is monitored", singlesImport.Fetch().Count == 0);
+        Assert("albums preferred skipped because preferred album is monitored", albumsImport.Fetch().Count == 0);
+    }
+
+    private static void TestImportSkipsWhenAlternateResolutionIsOnDisk()
+    {
+        Console.WriteLine("\n[Test] Import skips preferred release when alternate resolution is on disk");
+
+        var folder = NewFolder();
+        SeedDualResolutionTrack(folder);
+        var albumService = new FakeAlbumService();
+        var artist = new Artist { Id = 42 };
+        albumService.Add(new Album { Id = 10, ForeignAlbumId = "single-mbid", Monitored = false, Artist = artist });
+        albumService.AddWithFiles(new Album { Id = 10, ForeignAlbumId = "single-mbid" }, artist);
+
+        var repo = new FakeImportListRepository();
+        var albumsImport = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Albums, albumService);
+
+        Assert("albums preferred skipped because single is on disk", albumsImport.Fetch().Count == 0);
+    }
+
+    private static void TestImportDoesNotSkipForUnmonitoredMissingAlternate()
+    {
+        Console.WriteLine("\n[Test] Import does not skip when alternate resolution only exists as unmonitored metadata");
+
+        var folder = NewFolder();
+        SeedDualResolutionTrack(folder);
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { ForeignAlbumId = "album-mbid", Monitored = false });
+
+        var repo = new FakeImportListRepository();
+        var singlesImport = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Singles, albumService);
+        var singles = singlesImport.Fetch();
+
+        Assert("singles preferred still emits single when album is unmonitored and missing", singles.Count == 1 && singles[0].AlbumMusicBrainzId == "single-mbid");
+    }
+
+    private static void SeedDualResolutionTrack(FakeAppFolderInfo folder)
+    {
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Singles, new AlbumResolution(true, "The Single", "artist-mbid-1", "single-mbid"), now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Albums, new AlbumResolution(true, "The Album", "artist-mbid-1", "album-mbid"), now);
+    }
+
+    private static SXMPlaylistImport NewImport(FakeHttpClient httpClient, FakeAppFolderInfo folder, FakeImportListRepository repo, int id, string channel, string show, ReleasePriorityMode releasePriority = ReleasePriorityMode.Singles, FakeAlbumService? albumService = null)
+    {
+        albumService ??= new FakeAlbumService();
         var import = new SXMPlaylistImport(
             httpClient,
             null!,
@@ -512,7 +588,7 @@ internal static class Program
             null!,
             folder,
             new FakeArtistService(),
-            new FakeAlbumService(),
+            albumService,
             new FakeCommandQueue(),
             repo,
             LogManager.GetLogger("Test"));
@@ -951,6 +1027,68 @@ internal static class Program
 
         Assert("recording search stopped before the fourth detail lookup", detailCalls == 3);
         Assert("capped lookup did not use the fourth recording result", !results.ContainsKey(ReleasePriorityMode.Albums));
+    }
+
+    private static void TestAlbumResolutionRecordingSearchPrefersStudioRecording()
+    {
+        Console.WriteLine("\n[Test] Recording search prefers a later studio recording over earlier compilations");
+
+        // MusicBrainz relevance lists compilations first; the studio-album recording sits at index 3,
+        // beyond the 3-detail cap. Inline release metadata lets the resolver promote it before the cap.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[" +
+            "{\"id\":\"rec-1\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"comp-1\",\"title\":\"Summer Hits\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"]}}]}," +
+            "{\"id\":\"rec-2\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"comp-2\",\"title\":\"Best Of\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"]}}]}," +
+            "{\"id\":\"rec-3\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"comp-3\",\"title\":\"Gold\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"]}}]}," +
+            "{\"id\":\"rec-4\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"studio-mbid\",\"title\":\"The Studio Album\",\"primary-type\":\"Album\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-2", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-3", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-4",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"studio-mbid\",\"title\":\"The Studio Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1984-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities("Artist One", "Song A", new Dictionary<string, string>());
+
+        Assert("studio recording was detail-fetched ahead of the compilations", httpClient.RequestUrls.Any(u => u.Contains("recording/rec-4")));
+        Assert("singles priority resolved to the studio album", results.TryGetValue(ReleasePriorityMode.Singles, out var singles) && singles.AlbumMusicBrainzId == "studio-mbid");
+        Assert("albums priority resolved to the studio album", results.TryGetValue(ReleasePriorityMode.Albums, out var albums) && albums.AlbumMusicBrainzId == "studio-mbid");
+    }
+
+    private static void TestAlbumResolutionRecordingSearchKeepsSingleCandidate()
+    {
+        Console.WriteLine("\n[Test] Recording search reorder keeps a single-carrying recording reachable");
+
+        // A recording whose inline release is a Single (allowed primary type, no secondary types)
+        // must still be promoted ahead of compilation-only recordings so Singles priority can pick it.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[" +
+            "{\"id\":\"rec-1\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"comp-1\",\"title\":\"Hits\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"]}}]}," +
+            "{\"id\":\"rec-2\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"single-mbid\",\"title\":\"Song A\",\"primary-type\":\"Single\"}}]}," +
+            "{\"id\":\"rec-3\",\"title\":\"Song A\",\"artist-credit\":[{\"artist\":{\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"release-group\":{\"id\":\"comp-2\",\"title\":\"Gold\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"]}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1", "{\"releases\":[]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-2",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"Song A\",\"primary-type\":\"Single\",\"first-release-date\":\"1984-01-01\"}}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-3", "{\"releases\":[]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities("Artist One", "Song A", new Dictionary<string, string>());
+
+        Assert("single-carrying recording was detail-fetched", httpClient.RequestUrls.Any(u => u.Contains("recording/rec-2")));
+        Assert("singles priority selected the single", results.TryGetValue(ReleasePriorityMode.Singles, out var singles) && singles.AlbumMusicBrainzId == "single-mbid");
     }
 
     private static void TestAlbumResolutionFilterExcludesDisallowedRelease()
@@ -1820,7 +1958,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -1844,7 +1982,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -1865,7 +2003,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -1889,7 +2027,7 @@ internal static class Program
 
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
 
         worker.RunOnce(CancellationToken.None);
         var epgRequestsAfterFirstCapture = httpClient.RequestUrls.Count(u => u.Contains("sxmepg"));
@@ -1918,7 +2056,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
         var feedCallsAfterFirst = httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation"));
         worker.RunOnce(CancellationToken.None);
@@ -1944,7 +2082,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -1994,7 +2132,7 @@ internal static class Program
         };
 
         var profiles = new FakeMetadataProfileService(singlesOnly);
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2044,7 +2182,7 @@ internal static class Program
             }
         };
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2094,7 +2232,7 @@ internal static class Program
             }
         };
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2120,12 +2258,126 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         var factory = new FakeImportListFactory();
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         Assert("no HTTP requests made", httpClient.CallCount == 0);
         var store = new SXMPlaylistHistoryStore(folder);
         Assert("no plays recorded", store.GetPlays("altnation", DateTime.MinValue).Count == 0);
+    }
+
+    private static void TestPlexExactTitleMatch()
+    {
+        Console.WriteLine("\n[Test] Plex match uses exact title + artist");
+
+        var httpClient = NewPlexEnvironment();
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("exact match adds the Plex track", HasPlaylistItem(httpClient, "100"));
+    }
+
+    private static void TestPlexFeatCreditStrippedFromArtist()
+    {
+        Console.WriteLine("\n[Test] Plex match strips feat credits from the feed artist");
+
+        var httpClient = NewPlexEnvironment(trackTitle: "Celebration", trackArtist: "Kool & The Gang");
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang (feat. Foo)", "Celebration") });
+
+        Assert("feat-stripped artist matched the Plex track", HasPlaylistItem(httpClient, "100"));
+    }
+
+    private static void TestPlexFuzzyTitleVersionMatch()
+    {
+        Console.WriteLine("\n[Test] Plex match falls back to fuzzy title for version suffixes");
+
+        var httpClient = NewPlexEnvironment(trackTitle: "Celebration", trackArtist: "Kool & The Gang");
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration (Live)") });
+
+        Assert("version-suffixed title matched via fuzzy tier", HasPlaylistItem(httpClient, "100"));
+    }
+
+    private static void TestPlexMultiArtistPlayMatchesPrimaryArtist()
+    {
+        Console.WriteLine("\n[Test] Plex match tries each credited artist and adds one playlist entry");
+
+        var httpClient = NewPlexEnvironment(trackTitle: "Walk This Way", trackArtist: "Run-DMC");
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[]
+        {
+            PlayEvent("p1", "Run-DMC", "Walk This Way"),
+            PlayEvent("p1", "Aerosmith", "Walk This Way")
+        });
+
+        Assert("primary credited artist matched the Plex track", HasPlaylistItem(httpClient, "100"));
+        Assert("duet produced exactly one playlist entry", CountPlaylistItem(httpClient) == 1);
+    }
+
+    private static void TestPlexRepeatedTrackUsesPersistedCache()
+    {
+        Console.WriteLine("\n[Test] Plex reuses the persisted (artist, title) cache and skips re-searching");
+
+        var httpClient = NewPlexEnvironment(trackTitle: "Celebration", trackArtist: "Kool & The Gang");
+        var client = NewPlexClient(httpClient);
+        client.SeedTrackCache(new Dictionary<string, string> { ["Kool & The Gang||Celebration"] = "100" });
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("no library search request when the pair is cached", !httpClient.RequestUrls.Any(u => u.Contains("/library/sections/1/all")));
+        Assert("cached rating key exported for persistence", client.ExportTrackCache()["Kool & The Gang||Celebration"] == "100");
+    }
+
+    private static void TestPlexRetriesTransientSearchFailure()
+    {
+        Console.WriteLine("\n[Test] Plex retries a transient search failure");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.RespondSequence("/library/sections/1/all",
+            (HttpStatusCode.InternalServerError, "{}"),
+            (HttpStatusCode.OK, TrackMatchJson("Celebration", "Kool & The Gang")));
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("transient 500 was retried and the track was added", HasPlaylistItem(httpClient, "100"));
+    }
+
+    private static PlayEventRecord PlayEvent(string playId, string artist, string song, long eventId = 1)
+    {
+        return new PlayEventRecord(eventId, playId, "altnation", null, artist, song, DateTime.UtcNow, null, null, null, null);
+    }
+
+    private static SXMPlaylistPlexClient NewPlexClient(FakeHttpClient httpClient)
+    {
+        var factory = new FakeNotificationFactory();
+        factory.AddPlexServer();
+        return new SXMPlaylistPlexClient(httpClient, factory, LogManager.GetLogger("Test"));
+    }
+
+    private static FakeHttpClient NewPlexEnvironment(string trackTitle = "Celebration", string trackArtist = "Kool & The Gang")
+    {
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        httpClient.Respond("/library/sections/1/all", TrackMatchJson(trackTitle, trackArtist));
+        httpClient.Respond("/playlists?playlistType=audio", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"SXM Alt Nation\",\"ratingKey\":\"500\"}]}}");
+        httpClient.Respond("/playlists/500/items", "{\"MediaContainer\":{\"Metadata\":[{\"ratingKey\":\"999\"}]}}");
+        return httpClient;
+    }
+
+    private static string TrackMatchJson(string title, string artist)
+    {
+        return $"{{\"MediaContainer\":{{\"Metadata\":[{{\"title\":\"{title}\",\"grandparentTitle\":\"{artist}\",\"ratingKey\":\"100\"}}]}}}}";
+    }
+
+    private static bool HasPlaylistItem(FakeHttpClient httpClient, string ratingKey)
+    {
+        return httpClient.RequestUrls.Any(u => u.Contains("/playlists/500/items?uri=") && u.Contains(ratingKey));
+    }
+
+    private static int CountPlaylistItem(FakeHttpClient httpClient)
+    {
+        return httpClient.RequestUrls.Count(u => u.Contains("/playlists/500/items?uri="));
     }
 
     private static string BuildFeedJson(params (string PlayId, string TrackId, string Artist, string Title, (string Site, string Url)[] Links)[] plays)
@@ -2217,21 +2469,25 @@ internal class FakeHttpClient : IHttpClient
         LastRequestUrl = request.Url.FullUri;
         _requestUrls.Add(LastRequestUrl);
 
-        foreach (var pair in _sequencesByUrlFragment)
+        // Match the longest fragment first so a specific endpoint (e.g. "/library/sections/1/all")
+        // wins over a prefix that also matches it ("/library/sections").
+        var sequenceMatch = _sequencesByUrlFragment
+            .Where(p => p.Value.Count > 0 && request.Url.FullUri.Contains(p.Key, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(p => p.Key.Length)
+            .FirstOrDefault();
+        if (!string.IsNullOrEmpty(sequenceMatch.Key))
         {
-            if (request.Url.FullUri.Contains(pair.Key, StringComparison.OrdinalIgnoreCase) && pair.Value.Count > 0)
-            {
-                var (status, content) = pair.Value.Dequeue();
-                return new HttpResponse(request, new HttpHeader(), content, status);
-            }
+            var (status, content) = sequenceMatch.Value.Dequeue();
+            return new HttpResponse(request, new HttpHeader(), content, status);
         }
 
-        foreach (var pair in _responsesByUrlFragment)
+        var responseMatch = _responsesByUrlFragment
+            .Where(p => request.Url.FullUri.Contains(p.Key, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(p => p.Key.Length)
+            .FirstOrDefault();
+        if (!string.IsNullOrEmpty(responseMatch.Key))
         {
-            if (request.Url.FullUri.Contains(pair.Key, StringComparison.OrdinalIgnoreCase))
-            {
-                return new HttpResponse(request, new HttpHeader(), pair.Value, HttpStatusCode.OK);
-            }
+            return new HttpResponse(request, new HttpHeader(), responseMatch.Value, HttpStatusCode.OK);
         }
 
         return new HttpResponse(request, new HttpHeader(), "{}", HttpStatusCode.NotFound);
@@ -2301,10 +2557,22 @@ internal class FakeArtistService : IArtistService
 internal class FakeAlbumService : IAlbumService
 {
     private readonly Dictionary<string, Album> _byForeignId = new();
+    private readonly Dictionary<int, List<Album>> _withFilesByArtistId = new();
 
     public void Add(Album album)
     {
         _byForeignId[album.ForeignAlbumId] = album;
+    }
+
+    public void AddWithFiles(Album album, Artist artist)
+    {
+        if (!_withFilesByArtistId.TryGetValue(artist.Id, out var albums))
+        {
+            albums = new List<Album>();
+            _withFilesByArtistId[artist.Id] = albums;
+        }
+
+        albums.Add(album);
     }
 
     public Album FindById(string foreignId)
@@ -2338,7 +2606,7 @@ internal class FakeAlbumService : IAlbumService
     public void SetAddOptions(IEnumerable<Album> albums) => throw new NotSupportedException();
     public Album FindAlbumByRelease(string albumReleaseId) => throw new NotSupportedException();
     public Album FindAlbumByTrackId(int trackId) => throw new NotSupportedException();
-    public List<Album> GetArtistAlbumsWithFiles(Artist artist) => throw new NotSupportedException();
+    public List<Album> GetArtistAlbumsWithFiles(Artist artist) => _withFilesByArtistId.TryGetValue(artist.Id, out var albums) ? albums : new List<Album>();
 }
 
 internal class FakeCommandQueue : IManageCommandQueue
@@ -2478,4 +2746,113 @@ internal class FakeMetadataProfileService : IMetadataProfileService
     public List<MetadataProfile> All() => _profiles.Values.ToList();
     public MetadataProfile Get(int id) => _profiles.TryGetValue(id, out var p) ? p : _defaultProfile ?? throw new NotSupportedException();
     public bool Exists(int id) => _profiles.ContainsKey(id);
+}
+
+internal class FakeNotificationFactory : INotificationFactory
+{
+    private readonly List<INotification> _providers = new();
+
+    public FakeNotificationFactory()
+    {
+    }
+
+    public FakeNotificationFactory(params INotification[] providers)
+    {
+        _providers.AddRange(providers);
+    }
+
+    public void AddPlexServer(string host = "127.0.0.1", int port = 32400, bool useSsl = false, string? urlBase = null, string? authToken = "token123")
+    {
+        var definition = new NotificationDefinition
+        {
+            Implementation = nameof(PlexServer),
+            Settings = new PlexServerSettings
+            {
+                Host = host,
+                Port = port,
+                UseSsl = useSsl,
+                UrlBase = urlBase,
+                AuthToken = authToken
+            }
+        };
+
+        _providers.Add(new FakePlexNotification(definition));
+    }
+
+    public List<INotification> GetAvailableProviders() => _providers;
+    public List<NotificationDefinition> All() => _providers.Select(p => (NotificationDefinition)p.Definition).ToList();
+
+    public List<INotification> OnGrabEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnReleaseImportEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnUpgradeEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnRenameEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnArtistAddEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnArtistDeleteEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnAlbumDeleteEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnHealthIssueEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnHealthRestoredEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnDownloadFailureEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnImportFailureEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnTrackRetagEnabled(bool filterBlockedNotifications = true) => new();
+    public List<INotification> OnApplicationUpdateEnabled(bool filterBlockedNotifications = true) => new();
+    public bool Exists(int id) => throw new NotSupportedException();
+    public NotificationDefinition Find(int id) => throw new NotSupportedException();
+    public NotificationDefinition Get(int id) => throw new NotSupportedException();
+    public IEnumerable<NotificationDefinition> Get(IEnumerable<int> ids) => throw new NotSupportedException();
+    public NotificationDefinition Create(NotificationDefinition definition) => throw new NotSupportedException();
+    public void Update(NotificationDefinition definition) => throw new NotSupportedException();
+    public IEnumerable<NotificationDefinition> Update(IEnumerable<NotificationDefinition> definitions) => throw new NotSupportedException();
+    public void Delete(int id) => throw new NotSupportedException();
+    public void Delete(IEnumerable<int> ids) => throw new NotSupportedException();
+    public IEnumerable<NotificationDefinition> GetDefaultDefinitions() => throw new NotSupportedException();
+    public IEnumerable<NotificationDefinition> GetPresetDefinitions(NotificationDefinition providerDefinition) => throw new NotSupportedException();
+    public void SetProviderCharacteristics(NotificationDefinition definition) => throw new NotSupportedException();
+    public void SetProviderCharacteristics(INotification provider, NotificationDefinition definition) => throw new NotSupportedException();
+    public INotification GetInstance(NotificationDefinition definition) => throw new NotSupportedException();
+    public ValidationResult Test(NotificationDefinition definition) => throw new NotSupportedException();
+    public object RequestAction(NotificationDefinition definition, string action, IDictionary<string, string> query) => throw new NotSupportedException();
+    public List<NotificationDefinition> AllForTag(int tagId) => throw new NotSupportedException();
+}
+
+internal class FakePlexNotification : INotification
+{
+    public FakePlexNotification(NotificationDefinition definition)
+    {
+        Definition = definition;
+    }
+
+    public string Name => "Plex Media Server";
+    public string Link => "https://www.plex.tv/";
+    public Type ConfigContract => typeof(PlexServerSettings);
+    public ProviderMessage Message => null!;
+    public IEnumerable<ProviderDefinition> DefaultDefinitions => Array.Empty<ProviderDefinition>();
+    public ProviderDefinition Definition { get; set; }
+    public bool SupportsOnGrab => false;
+    public bool SupportsOnReleaseImport => false;
+    public bool SupportsOnUpgrade => false;
+    public bool SupportsOnRename => false;
+    public bool SupportsOnArtistAdd => false;
+    public bool SupportsOnArtistDelete => false;
+    public bool SupportsOnAlbumDelete => false;
+    public bool SupportsOnHealthIssue => false;
+    public bool SupportsOnHealthRestored => false;
+    public bool SupportsOnApplicationUpdate => false;
+    public bool SupportsOnDownloadFailure => false;
+    public bool SupportsOnImportFailure => false;
+    public bool SupportsOnTrackRetag => false;
+    public void OnGrab(GrabMessage grabMessage) { }
+    public void OnReleaseImport(AlbumDownloadMessage message) { }
+    public void OnRename(Artist artist, List<RenamedTrackFile> renamedFiles) { }
+    public void OnArtistAdd(ArtistAddMessage message) { }
+    public void OnArtistDelete(ArtistDeleteMessage deleteMessage) { }
+    public void OnAlbumDelete(AlbumDeleteMessage deleteMessage) { }
+    public void OnHealthIssue(NzbDrone.Core.HealthCheck.HealthCheck healthCheck) { }
+    public void OnHealthRestored(NzbDrone.Core.HealthCheck.HealthCheck previousCheck) { }
+    public void OnApplicationUpdate(ApplicationUpdateMessage updateMessage) { }
+    public void OnDownloadFailure(DownloadFailedMessage message) { }
+    public void OnImportFailure(AlbumDownloadMessage message) { }
+    public void OnTrackRetag(TrackRetagMessage message) { }
+    public void ProcessQueue() { }
+    public ValidationResult Test() => new();
+    public object RequestAction(string action, IDictionary<string, string> query) => new();
 }

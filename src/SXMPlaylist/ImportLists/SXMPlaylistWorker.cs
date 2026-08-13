@@ -9,6 +9,7 @@ using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.ImportLists;
+using NzbDrone.Core.Notifications;
 using NzbDrone.Core.Profiles.Metadata;
 
 namespace SXMPlaylist.ImportLists
@@ -31,6 +32,7 @@ namespace SXMPlaylist.ImportLists
         private static readonly TimeSpan BackfillWindow = TimeSpan.FromHours(2);
         private static readonly TimeSpan ShowScheduleRefreshInterval = TimeSpan.FromHours(24);
         private static readonly TimeSpan LoopInterval = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan PlexSyncInterval = TimeSpan.FromMinutes(15);
         private const int ResolutionBatchSize = 50;
         private const int RetryBatchSize = 15;
 
@@ -42,6 +44,7 @@ namespace SXMPlaylist.ImportLists
         private readonly IMetadataProfileService _metadataProfileService;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistAlbumResolver _albumResolver;
+        private readonly SXMPlaylistPlexClient _plexClient;
         private readonly Logger _logger;
 
         private readonly object _lifecycleLock = new();
@@ -53,6 +56,7 @@ namespace SXMPlaylist.ImportLists
             IAppFolderInfo appFolderInfo,
             IImportListFactory importListFactory,
             IMetadataProfileService metadataProfileService,
+            INotificationFactory notificationFactory,
             Logger logger)
         {
             _httpClient = httpClient;
@@ -60,6 +64,7 @@ namespace SXMPlaylist.ImportLists
             _metadataProfileService = metadataProfileService;
             _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
             _albumResolver = new SXMPlaylistAlbumResolver(httpClient, logger);
+            _plexClient = new SXMPlaylistPlexClient(httpClient, notificationFactory, logger);
             _logger = logger;
         }
 
@@ -153,6 +158,8 @@ namespace SXMPlaylist.ImportLists
 
             ResolveDueTracks(token);
 
+            SyncCompanionPlexPlaylists(token);
+
             _historyStore.Prune();
         }
 
@@ -178,6 +185,74 @@ namespace SXMPlaylist.ImportLists
         {
             var lastCapture = _historyStore.GetLastCaptureUtc(channel);
             return lastCapture == null || DateTime.UtcNow - lastCapture.Value >= SXMPlaylistHistoryStore.CaptureInterval;
+        }
+
+        // Refreshes companion Plex playlists for any import list that opted in, throttled to
+        // PlexSyncInterval per list. Best-effort: a missing Plex connection or auth failure is
+        // logged and ignored, never fatal to the worker pass.
+        private void SyncCompanionPlexPlaylists(CancellationToken token)
+        {
+            List<ImportListDefinition> plexLists;
+            try
+            {
+                plexLists = _importListFactory.All()
+                    .Where(d => string.Equals(d.Implementation, ImplementationName, StringComparison.OrdinalIgnoreCase) && d.EnableAutomaticAdd)
+                    .Where(d => (d.Settings as SXMPlaylistImportSettings)?.AddCompanionPlexPlaylist == true)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not read configured SXM Playlist lists for companion Plex sync");
+                return;
+            }
+
+            foreach (var definition in plexLists)
+            {
+                token.ThrowIfCancellationRequested();
+
+                try
+                {
+                    var settings = definition.Settings as SXMPlaylistImportSettings;
+                    if (settings == null)
+                    {
+                        continue;
+                    }
+
+                    var state = _historyStore.GetPlexPlaylistState(definition.Id);
+                    if (state != null && DateTime.UtcNow - state.LastSyncUtc < PlexSyncInterval)
+                    {
+                        continue;
+                    }
+
+                    var playlistTitle = BuildPlexPlaylistTitle(definition);
+                    var lookback = TimeSpan.FromDays(Math.Clamp(settings.HistoryRetentionDays, 1, (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays));
+                    var sinceUtc = DateTime.UtcNow - lookback;
+                    var programId = settings.Show.IsNullOrWhiteSpace() ? null : settings.Show;
+
+                    var events = _historyStore.GetPlayEvents(settings.Channel, sinceUtc, DateTime.UtcNow, programId);
+
+                    if (state?.TrackCache != null && state.TrackCache.Count > 0)
+                    {
+                        _plexClient.SeedTrackCache(state.TrackCache);
+                    }
+
+                    _plexClient.Sync(definition.Id, playlistTitle, events);
+
+                    _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, state?.PlaylistRatingKey ?? "", DateTime.UtcNow, _plexClient.ExportTrackCache());
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn(ex, "Companion Plex playlist sync failed for list '{0}'", definition.Name);
+                }
+            }
+        }
+
+        private static string BuildPlexPlaylistTitle(ImportListDefinition definition)
+        {
+            var settings = definition.Settings as SXMPlaylistImportSettings;
+            var baseTitle = definition.Name.IsNotNullOrWhiteSpace() ? definition.Name : "SXM Playlist";
+            var show = settings?.Show ?? SXMPlaylistShowSchedule.ChannelValue;
+            return show.IsNullOrWhiteSpace() ? baseTitle : $"{baseTitle} ({show})";
         }
 
         private void CaptureChannel(string channel, CancellationToken token)

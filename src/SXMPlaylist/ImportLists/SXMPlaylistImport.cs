@@ -29,6 +29,7 @@ namespace SXMPlaylist.ImportLists
     {
         private static readonly TimeSpan ChannelCacheLifetime = TimeSpan.FromHours(24);
         private readonly IImportListRepository _importListRepository;
+        private readonly IAlbumService _albumService;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistRefreshScheduler _refreshScheduler;
 
@@ -61,6 +62,7 @@ namespace SXMPlaylist.ImportLists
             : base(httpClient, importListStatusService, configService, parsingService, logger)
         {
             _importListRepository = importListRepository;
+            _albumService = albumService;
             _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
             _refreshScheduler = new SXMPlaylistRefreshScheduler(artistService, albumService, commandQueueManager, logger);
         }
@@ -75,7 +77,7 @@ namespace SXMPlaylist.ImportLists
 
             var now = DateTime.UtcNow;
             var presentationSince = now - SXMPlaylistHistoryStore.PresentationWindow;
-            var retainedSince = now - GetHistoryRetention(Settings);
+            var retainedSince = now - SXMPlaylistHistoryStore.PlayRetention;
             var show = Settings?.Show ?? SXMPlaylistShowSchedule.ChannelValue;
             var windows = GetShowWindows(channel, show);
             var presentable = _historyStore.GetPresentableTracks(
@@ -91,6 +93,11 @@ namespace SXMPlaylist.ImportLists
             var items = new List<ImportListItemInfo>();
             foreach (var track in presentable)
             {
+                if (IsAlreadyCovered(track))
+                {
+                    continue;
+                }
+
                 foreach (var artist in track.Artists)
                 {
                     var item = new ImportListItemInfo
@@ -118,6 +125,61 @@ namespace SXMPlaylist.ImportLists
             _refreshScheduler.Schedule(result);
 
             return result;
+        }
+
+        private bool IsAlreadyCovered(PresentableTrack track)
+        {
+            if (IsCoveredAlbum(track.AlbumMusicBrainzId, out var reason))
+            {
+                _logger.Debug("Skipping '{0}' - '{1}' by {2} because album '{3}' is {4}", track.Song, track.Album, string.Join(", ", track.Artists), track.AlbumMusicBrainzId, reason);
+                return true;
+            }
+
+            if (IsCoveredAlbum(track.AlternateAlbumMusicBrainzId, out reason))
+            {
+                _logger.Debug("Skipping '{0}' - '{1}' by {2} because alternate album '{3}' is {4}", track.Song, track.Album, string.Join(", ", track.Artists), track.AlternateAlbumMusicBrainzId, reason);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsCoveredAlbum(string? albumMusicBrainzId, out string reason)
+        {
+            reason = "";
+            if (albumMusicBrainzId.IsNullOrWhiteSpace())
+            {
+                return false;
+            }
+
+            var album = _albumService.FindById(albumMusicBrainzId!);
+            if (album == null)
+            {
+                return false;
+            }
+
+            if (album.Monitored)
+            {
+                reason = "monitored";
+                return true;
+            }
+
+            try
+            {
+                var artist = album.Artist?.Value;
+                if (artist != null && _albumService.GetArtistAlbumsWithFiles(artist).Any(a => string.Equals(a.ForeignAlbumId, album.ForeignAlbumId, StringComparison.OrdinalIgnoreCase) || (album.Id > 0 && a.Id == album.Id)))
+                {
+                    reason = "already on disk";
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not determine whether album '{0}' is on disk", albumMusicBrainzId);
+                return false;
+            }
         }
 
         public override IImportListRequestGenerator GetRequestGenerator()
@@ -360,19 +422,13 @@ namespace SXMPlaylist.ImportLists
 
         private static int GetAlbumsPerDay(SXMPlaylistImportSettings? settings)
         {
-            var value = settings?.AlbumsPerDay ?? 500;
-            return value < 0 ? 500 : Math.Clamp(value, 0, 500);
+            var value = settings?.AlbumsPerDay ?? 24;
+            return value < 0 ? 24 : Math.Clamp(value, 0, 500);
         }
 
         private static int GetMinimumPlays(SXMPlaylistImportSettings? settings)
         {
             return Math.Max(settings?.MinimumPlays ?? 1, 1);
-        }
-
-        private static TimeSpan GetHistoryRetention(SXMPlaylistImportSettings? settings)
-        {
-            var value = settings?.HistoryRetentionDays ?? (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays;
-            return TimeSpan.FromDays(value <= 0 ? SXMPlaylistHistoryStore.PlayRetention.TotalDays : Math.Clamp(value, 1, (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays));
         }
     }
 }

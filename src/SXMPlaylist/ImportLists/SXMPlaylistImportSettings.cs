@@ -44,10 +44,11 @@ namespace SXMPlaylist.ImportLists
             Channel = "";
             Show = SXMPlaylistShowSchedule.ChannelValue;
             MinimumPlays = 1;
-            HistoryRetentionDays = (int)SXMPlaylistHistoryStore.PlayRetention.TotalDays;
-            AlbumsPerDay = 500;
+            HistoryRetentionDays = 1;
+            AlbumsPerDay = 24;
             RequireMusicBrainzId = false;
             ReleasePriority = ReleasePriorityMode.Singles;
+            AddCompanionPlexPlaylist = false;
         }
 
         // Lidarr's dynamic Select field renders as a multi-select checklist or a single dropdown
@@ -75,13 +76,16 @@ namespace SXMPlaylist.ImportLists
         [FieldDefinition(3, Label = "Minimum Plays", Type = FieldType.Number, HelpText = "Minimum number of times a song must appear in the retained channel history before it is imported.")]
         public int MinimumPlays { get; set; }
 
-        [FieldDefinition(4, Label = "History Retention Days", Type = FieldType.Number, HelpText = "How many days of captured plays to keep and consider for this list.")]
+        [FieldDefinition(4, Label = "Companion Plex Playlist", Type = FieldType.Checkbox, HelpText = "Add a Companion Plex Playlist based on this Channel/Show Import List. Requires a Plex Media Server connection in Settings > Connect.", HelpTextWarning = "Set up Plex under Connections")]
+        public bool AddCompanionPlexPlaylist { get; set; }
+
+        [FieldDefinition(5, Label = "Plex Playlist History Days", Type = FieldType.Number, HelpText = "How far back the companion Plex playlist should go. Only applies when the Companion Plex Playlist checkbox is enabled.", HelpTextWarning = "Set up Plex under Connections")]
         public int HistoryRetentionDays { get; set; }
 
-        [FieldDefinition(5, Label = "Albums Per Day", Type = FieldType.Number, HelpText = "Maximum albums per day, evenly split across 24 hours. Default is 500. 0 (Zero) is unlimited.")]
+        [FieldDefinition(6, Label = "Albums Per Day", Type = FieldType.Number, HelpText = "Maximum albums per day, evenly split across 24 hours. Default is 24. 0 (Zero) is unlimited.")]
         public int AlbumsPerDay { get; set; }
 
-        [FieldDefinition(6, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "Prefer Singles or Albums.")]
+        [FieldDefinition(7, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "Prefer Singles or Albums.")]
         public ReleasePriorityMode ReleasePriority { get; set; }
 
         public string BaseUrl { get; set; }

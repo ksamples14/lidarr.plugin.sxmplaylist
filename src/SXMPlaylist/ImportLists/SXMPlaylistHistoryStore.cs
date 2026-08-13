@@ -269,6 +269,26 @@ namespace SXMPlaylist.ImportLists
             {
                 command.ExecuteNonQuery();
             }
+
+            // One row per import list that opted into a companion Plex playlist. Persists the Plex
+            // playlist ratingKey so we only ever touch playlists we created (find-by-title is the
+            // fallback for first-run), the last sync time so the worker can throttle refreshes, and
+            // a JSON cache of matched (artist||title) -> Plex track ratingKeys so repeat syncs don't
+            // re-search the Plex library for tracks already matched.
+            using (var command = new SQLiteCommand(
+                "CREATE TABLE IF NOT EXISTS PlexPlaylistState (" +
+                "ListId INTEGER PRIMARY KEY, " +
+                "PlaylistTitle TEXT NOT NULL, " +
+                "PlaylistRatingKey TEXT NOT NULL, " +
+                "LastSyncUtc TEXT NOT NULL, " +
+                "TrackCacheJson TEXT NOT NULL DEFAULT '{}')",
+                connection))
+            {
+                command.ExecuteNonQuery();
+            }
+
+            // Upgrade databases created before the track cache column existed (idempotent).
+            EnsureColumn(connection, "PlexPlaylistState", "TrackCacheJson", "TEXT NOT NULL DEFAULT '{}'");
         }
 
         // Adds a column to an existing table if it isn't present. Used to upgrade databases created
@@ -679,8 +699,9 @@ namespace SXMPlaylist.ImportLists
 
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
-                "SELECT Tracks.TrackId, ArtistsJson, Song, r.Album, r.ArtistMusicBrainzId, r.AlbumMusicBrainzId, TimestampUtc FROM Tracks " +
+                "SELECT Tracks.TrackId, ArtistsJson, Song, r.Album, r.ArtistMusicBrainzId, r.AlbumMusicBrainzId, TimestampUtc, alt.AlbumMusicBrainzId FROM Tracks " +
                 "JOIN TrackResolutions r ON r.TrackId = Tracks.TrackId AND r.ReleasePriority = @releasePriority " +
+                "LEFT JOIN TrackResolutions alt ON alt.TrackId = Tracks.TrackId AND alt.ReleasePriority <> @releasePriority " +
                 "WHERE Channel = @channel AND Resolved = 1 AND r.ResolvedUtc >= @resolvedSince AND TimestampUtc >= @retainedSince" + mbidFilter + minimumPlaysFilter + windowFilter + " ORDER BY r.ResolvedUtc DESC LIMIT @limit",
                 connection);
 
@@ -710,7 +731,8 @@ namespace SXMPlaylist.ImportLists
                     reader.IsDBNull(3) ? null : reader.GetString(3),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
                     reader.IsDBNull(5) ? null : reader.GetString(5),
-                    timestampUtc));
+                    timestampUtc,
+                    reader.IsDBNull(7) ? null : reader.GetString(7)));
             }
 
             return results;
@@ -735,6 +757,79 @@ namespace SXMPlaylist.ImportLists
                 connection);
             command.Parameters.AddWithValue("@channel", channel);
             command.Parameters.AddWithValue("@utc", utc.ToString("O"));
+            command.ExecuteNonQuery();
+        }
+
+        public PlexPlaylistStateRecord? GetPlexPlaylistState(long listId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson FROM PlexPlaylistState WHERE ListId = @listId",
+                connection);
+            command.Parameters.AddWithValue("@listId", listId);
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            return new PlexPlaylistStateRecord(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                DateTime.Parse(reader.GetString(3)).ToUniversalTime(),
+                DeserializeTrackCache(reader.IsDBNull(4) ? null : reader.GetString(4)));
+        }
+
+        public void UpsertPlexPlaylistState(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string>? trackCache = null)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "INSERT INTO PlexPlaylistState (ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson) VALUES (@listId, @title, @ratingKey, @utc, @cache) " +
+                "ON CONFLICT(ListId) DO UPDATE SET PlaylistTitle = @title, PlaylistRatingKey = @ratingKey, LastSyncUtc = @utc, TrackCacheJson = @cache",
+                connection);
+            command.Parameters.AddWithValue("@listId", listId);
+            command.Parameters.AddWithValue("@title", playlistTitle);
+            command.Parameters.AddWithValue("@ratingKey", playlistRatingKey);
+            command.Parameters.AddWithValue("@utc", lastSyncUtc.ToString("O"));
+            command.Parameters.AddWithValue("@cache", SerializeTrackCache(trackCache));
+            command.ExecuteNonQuery();
+        }
+
+        private static string SerializeTrackCache(IReadOnlyDictionary<string, string>? trackCache)
+        {
+            if (trackCache == null || trackCache.Count == 0)
+            {
+                return "{}";
+            }
+
+            return JsonConvert.SerializeObject(trackCache);
+        }
+
+        private static Dictionary<string, string> DeserializeTrackCache(string? json)
+        {
+            if (json.IsNullOrWhiteSpace())
+            {
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<Dictionary<string, string>>(json!)
+                       ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+            catch (Exception)
+            {
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        public void DeletePlexPlaylistState(long listId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand("DELETE FROM PlexPlaylistState WHERE ListId = @listId", connection);
+            command.Parameters.AddWithValue("@listId", listId);
             command.ExecuteNonQuery();
         }
 
@@ -933,7 +1028,7 @@ namespace SXMPlaylist.ImportLists
 
     public class PresentableTrack
     {
-        public PresentableTrack(string trackId, IReadOnlyList<string> artists, string song, string? album, string? artistMusicBrainzId, string? albumMusicBrainzId, DateTime timestampUtc)
+        public PresentableTrack(string trackId, IReadOnlyList<string> artists, string song, string? album, string? artistMusicBrainzId, string? albumMusicBrainzId, DateTime timestampUtc, string? alternateAlbumMusicBrainzId = null)
         {
             TrackId = trackId;
             Artists = artists;
@@ -942,6 +1037,7 @@ namespace SXMPlaylist.ImportLists
             ArtistMusicBrainzId = artistMusicBrainzId;
             AlbumMusicBrainzId = albumMusicBrainzId;
             TimestampUtc = timestampUtc;
+            AlternateAlbumMusicBrainzId = alternateAlbumMusicBrainzId;
         }
 
         public string TrackId { get; }
@@ -951,6 +1047,7 @@ namespace SXMPlaylist.ImportLists
         public string? ArtistMusicBrainzId { get; }
         public string? AlbumMusicBrainzId { get; }
         public DateTime TimestampUtc { get; }
+        public string? AlternateAlbumMusicBrainzId { get; }
     }
 
     public class PlayRecord
@@ -1056,5 +1153,23 @@ namespace SXMPlaylist.ImportLists
         public string? Album { get; }
         public string? ArtistMusicBrainzId { get; }
         public string? AlbumMusicBrainzId { get; }
+    }
+
+    public class PlexPlaylistStateRecord
+    {
+        public PlexPlaylistStateRecord(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string> trackCache)
+        {
+            ListId = listId;
+            PlaylistTitle = playlistTitle;
+            PlaylistRatingKey = playlistRatingKey;
+            LastSyncUtc = lastSyncUtc;
+            TrackCache = trackCache;
+        }
+
+        public long ListId { get; }
+        public string PlaylistTitle { get; }
+        public string PlaylistRatingKey { get; }
+        public DateTime LastSyncUtc { get; }
+        public IReadOnlyDictionary<string, string> TrackCache { get; }
     }
 }

@@ -313,6 +313,18 @@ namespace SXMPlaylist.ImportLists
                     continue;
                 }
 
+                // MusicBrainz relevance orders compilations above the artist's own release, so the
+                // first recordings often only carry compilations and consume the detail budget below.
+                // The search response already embeds each recording's releases with their
+                // release-groups, so reorder before the detail cap: recordings that inline a
+                // profile-eligible, non-compilation release-group are examined first, recordings
+                // that only inline compilations/VA sink to the end, and unknown ones keep MB order.
+                recordings = new JArray(
+                    recordings
+                        .Cast<JToken>()
+                        .OrderBy(r => InlineReleasePriority(r, filter))
+                        .ToList());
+
                 foreach (var recording in recordings)
                 {
                     var title = recording["title"]?.Value<string>();
@@ -874,6 +886,64 @@ namespace SXMPlaylist.ImportLists
             }
 
             return secondaryTypes.Any(t => allowedSecondaryTypes.Contains(t.Value<string>() ?? ""));
+        }
+
+        // Sort key used to reorder recording-search results before the detail-lookup cap. MusicBrainz
+        // relevance puts compilations first, so we examine recordings whose inline releases include a
+        // profile-eligible, non-compilation release-group ahead of ones that only carry compilations
+        // or Various Artists releases. Lower = examined first. This uses only the releases already
+        // embedded in the search response, so it costs no extra MusicBrainz calls and works per
+        // artist candidate (the detail budget below is per candidate).
+        private static int InlineReleasePriority(JToken recording, AlbumTypeFilter filter)
+        {
+            var inlineReleases = recording["releases"] as JArray;
+            if (inlineReleases == null || inlineReleases.Count == 0)
+            {
+                return 1;
+            }
+
+            var hasEligible = false;
+            foreach (var release in inlineReleases)
+            {
+                var releaseGroup = release["release-group"];
+                if (releaseGroup == null)
+                {
+                    continue;
+                }
+
+                var primaryType = releaseGroup["primary-type"]?.Value<string>() ?? "";
+                if (!filter.PrimaryTypes.Contains(primaryType))
+                {
+                    continue;
+                }
+
+                if (!filter.Statuses.Contains(release["status"]?.Value<string>() ?? ""))
+                {
+                    continue;
+                }
+
+                if (IsVariousArtistsRelease(release))
+                {
+                    continue;
+                }
+
+                var secondaryTypes = releaseGroup["secondary-types"] as JArray;
+                var isCompilation = secondaryTypes != null
+                                    && secondaryTypes.Any(t => string.Equals(t.Value<string>(), "Compilation", StringComparison.OrdinalIgnoreCase));
+
+                // A release-group with no secondary types counts as Studio; allow the profile's
+                // non-compilation secondary types (Studio, Live, ...) to count as eligible too.
+                var isEligibleSecondary = secondaryTypes == null || secondaryTypes.Count == 0
+                    ? filter.SecondaryTypes.Contains("Studio")
+                    : !isCompilation && secondaryTypes.Any(t => filter.SecondaryTypes.Contains(t.Value<string>() ?? ""));
+
+                if (isEligibleSecondary)
+                {
+                    hasEligible = true;
+                }
+            }
+
+            return hasEligible ? 0 : 2;
         }
 
         // Approved ranking ladder (PLAN §6.6): lower = better.
