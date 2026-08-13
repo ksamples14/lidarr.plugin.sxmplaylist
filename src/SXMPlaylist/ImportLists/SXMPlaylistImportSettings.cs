@@ -60,33 +60,33 @@ namespace SXMPlaylist.ImportLists
         // Lidarr only refetches dynamic select options when baseUrl/apiPath/apiKey change
         // (EnhancedSelectInputConnector.importantFieldNames). Bind the Channel UI to apiPath so
         // the Show dropdown refreshes when a user picks a different channel.
-        [FieldDefinition(0, Label = "Channel", Type = FieldType.Select, SelectOptionsProviderAction = "getChannels", HelpText = "SiriusXM channel to pull plays from. Multiple lists can use the same channel when each selects a different show.")]
+        [FieldDefinition(0, Label = "Channel", Type = FieldType.Select, SelectOptionsProviderAction = "getChannels", HelpText = "SiriusXM channel to import plays from. Multiple import lists can target the same channel if each selects a different show.")]
         public string ApiPath
         {
             get => Channel;
             set => Channel = value;
         }
 
-        [FieldDefinition(1, Label = "Show", Type = FieldType.Select, SelectOptionsProviderAction = "getShows", HelpText = "Optional SiriusXM show filter from the official EPG schedule. Channel imports the whole channel.")]
+        [FieldDefinition(1, Label = "Show", Type = FieldType.Select, SelectOptionsProviderAction = "getShows", HelpText = "Optional show filter from the SiriusXM EPG schedule. Leave blank to import all plays from the entire channel.")]
         public string Show { get; set; }
 
-        [FieldDefinition(2, Label = "Require MusicBrainz ID", Type = FieldType.Checkbox, HelpText = "Only import albums with a MusicBrainz album ID. Title-only matches can still appear later if background retries find an ID.")]
+        [FieldDefinition(2, Label = "Require MusicBrainz ID", Type = FieldType.Checkbox, HelpText = "Only import albums that have a MusicBrainz album ID at import time. Albums without an ID may be retried in the background and imported later if one is found.")]
         public bool RequireMusicBrainzId { get; set; }
 
-        [FieldDefinition(3, Label = "Minimum Plays", Type = FieldType.Number, HelpText = "Minimum number of times a song must appear in the retained channel history before it is imported.")]
+        [FieldDefinition(3, Label = "Minimum Plays", Type = FieldType.Number, HelpText = "Minimum number of times a track must have been played in the channel history before its album is imported.")]
         public int MinimumPlays { get; set; }
 
-        [FieldDefinition(4, Label = "Companion Plex Playlist", Type = FieldType.Checkbox, HelpText = "Add a Companion Plex Playlist based on this Channel/Show Import List. Requires a Plex Media Server connection in Settings > Connect.", HelpTextWarning = "Set up Plex under Connections")]
-        public bool AddCompanionPlexPlaylist { get; set; }
-
-        [FieldDefinition(5, Label = "Plex Playlist History Days", Type = FieldType.Number, HelpText = "How far back the companion Plex playlist should go. Only applies when the Companion Plex Playlist checkbox is enabled.", HelpTextWarning = "Set up Plex under Connections")]
-        public int HistoryRetentionDays { get; set; }
-
-        [FieldDefinition(6, Label = "Albums Per Day", Type = FieldType.Number, HelpText = "Maximum albums per day, evenly split across 24 hours. Default is 24. 0 (Zero) is unlimited.")]
+        [FieldDefinition(4, Label = "Albums Per Day", Type = FieldType.Number, HelpText = "Maximum number of albums added per day, spread evenly across 24 hours. Set to 0 for unlimited.")]
         public int AlbumsPerDay { get; set; }
 
-        [FieldDefinition(7, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "Prefer Singles or Albums.")]
+        [FieldDefinition(5, Label = "Release Priority", Type = FieldType.Select, SelectOptions = typeof(ReleasePriorityMode), HelpText = "When both a single and an album release exist for a track, prefer importing one over the other.")]
         public ReleasePriorityMode ReleasePriority { get; set; }
+
+        [FieldDefinition(6, Label = "Companion Plex Playlist", Type = FieldType.Checkbox, HelpText = "Create and maintain a Plex playlist mirroring this import list's plays. Requires a Plex server configured in Settings > Connect.", HelpTextWarning = "Set up Plex in Settings > Connect")]
+        public bool AddCompanionPlexPlaylist { get; set; }
+
+        [FieldDefinition(7, Label = "Plex Playlist History Days", Type = FieldType.Number, HelpText = "Number of days of play history to include in the companion Plex playlist.")]
+        public int HistoryRetentionDays { get; set; }
 
         public string BaseUrl { get; set; }
 
