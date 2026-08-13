@@ -133,6 +133,7 @@ internal static class Program
         TestPlexMultiArtistPlayMatchesPrimaryArtist();
         TestPlexRepeatedTrackUsesPersistedCache();
         TestPlexRetriesTransientSearchFailure();
+        TestPlexCacheIsolationBetweenLists();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -2423,6 +2424,48 @@ internal static class Program
         client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
 
         Assert("transient 500 was retried and the track was added", HasPlaylistItem(httpClient, "100"));
+    }
+
+    private static void TestPlexCacheIsolationBetweenLists()
+    {
+        Console.WriteLine("\n[Test] Plex cache is isolated between list syncs");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        
+        // Track A: Celebration by Kool & The Gang -> ratingKey 100
+        httpClient.Respond("artist=Kool%20%26%20The%20Gang&title=Celebration",
+            "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"Celebration\",\"grandparentTitle\":\"Kool & The Gang\",\"ratingKey\":\"100\"}]}}");
+        
+        // Track B: Stayin' Alive by Bee Gees -> ratingKey 200
+        httpClient.Respond("artist=Bee%20Gees&title=Stayin%27%20Alive",
+            "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"Stayin' Alive\",\"grandparentTitle\":\"Bee Gees\",\"ratingKey\":\"200\"}]}}");
+        
+        // Playlist 1
+        httpClient.Respond("/playlists?playlistType=audio&title=List+1", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"List 1\",\"ratingKey\":\"501\"}]}}");
+        httpClient.Respond("/playlists/501/items", "{\"MediaContainer\":{\"Metadata\":[]}}");
+        
+        // Playlist 2
+        httpClient.Respond("/playlists?playlistType=audio&title=List+2", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"List 2\",\"ratingKey\":\"502\"}]}}");
+        httpClient.Respond("/playlists/502/items", "{\"MediaContainer\":{\"Metadata\":[]}}");
+
+        var client = NewPlexClient(httpClient);
+        
+        // Sync list 1 with Track A
+        client.ClearTrackCache();
+        client.Sync(1, "List 1", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+        var cache1 = client.ExportTrackCache();
+        
+        // Sync list 2 with Track B
+        client.ClearTrackCache();
+        client.Sync(2, "List 2", new[] { PlayEvent("p2", "Bee Gees", "Stayin' Alive") });
+        var cache2 = client.ExportTrackCache();
+
+        Assert("cache 1 contains only Track A", cache1.Count == 1 && cache1.ContainsKey("Kool & The Gang||Celebration"));
+        Assert("cache 2 contains only Track B", cache2.Count == 1 && cache2.ContainsKey("Bee Gees||Stayin' Alive"));
+        Assert("cache 1 does not contain Track B", !cache1.ContainsKey("Bee Gees||Stayin' Alive"));
+        Assert("cache 2 does not contain Track A", !cache2.ContainsKey("Kool & The Gang||Celebration"));
     }
 
     private static PlayEventRecord PlayEvent(string playId, string artist, string song, long eventId = 1)

@@ -41,7 +41,7 @@ namespace SXMPlaylist.ImportLists
         private readonly INotificationFactory _notificationFactory;
         private readonly Logger _logger;
 
-        // Per-pass caches (reset per Sync call).
+        // Per-pass caches (reset per list sync or Sync call).
         private readonly Dictionary<string, string?> _trackRatingKeyCache = new(StringComparer.OrdinalIgnoreCase);
         private string? _cachedMachineId;
         private List<long>? _cachedMusicSectionIds;
@@ -51,6 +51,12 @@ namespace SXMPlaylist.ImportLists
             _httpClient = httpClient;
             _notificationFactory = notificationFactory;
             _logger = logger;
+        }
+
+        // Clears the track cache. Called before each list sync to prevent cross-list contamination.
+        public void ClearTrackCache()
+        {
+            _trackRatingKeyCache.Clear();
         }
 
         // Seeded from the persisted per-list cache (see SXMPlaylistHistoryStore) so repeated syncs
@@ -96,9 +102,9 @@ namespace SXMPlaylist.ImportLists
 
         public void Sync(long listId, string playlistTitle, IReadOnlyList<PlayEventRecord> events)
         {
-            // The track cache is intentionally NOT cleared here: it is seeded from the persisted
-            // per-list cache (SeedTrackCache) before this call and exported back afterward. Only the
-            // per-pass connection caches reset.
+            // Reset per-pass connection caches. The track cache is managed externally by the caller:
+            // ClearTrackCache() before the list sync, SeedTrackCache() from the persisted per-list
+            // cache, then ExportTrackCache() to persist after.
             _cachedMachineId = null;
             _cachedMusicSectionIds = null;
 

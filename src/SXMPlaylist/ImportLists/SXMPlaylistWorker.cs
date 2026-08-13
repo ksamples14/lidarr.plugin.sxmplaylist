@@ -231,6 +231,8 @@ namespace SXMPlaylist.ImportLists
 
                     var events = _historyStore.GetPlayEvents(settings.Channel, sinceUtc, DateTime.UtcNow, programId);
 
+                    _plexClient.ClearTrackCache();
+
                     if (state?.TrackCache != null && state.TrackCache.Count > 0)
                     {
                         _plexClient.SeedTrackCache(state.TrackCache);
