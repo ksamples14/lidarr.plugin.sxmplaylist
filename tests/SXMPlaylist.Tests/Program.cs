@@ -57,6 +57,9 @@ internal static class Program
         TestImportSkipsWhenAlternateResolutionIsMonitored();
         TestImportSkipsWhenAlternateResolutionIsOnDisk();
         TestImportDoesNotSkipForUnmonitoredMissingAlternate();
+        TestImportBudgetCountsNewAlbumsOnly();
+        TestImportBudgetDedupesAlbumsWithinPass();
+        TestImportUnlimitedBudgetEmitsAllUncovered();
         TestRefreshSchedulerPushesRefreshForNewlyMonitoredAlbum();
 
         TestAlbumResolutionViaDeezerAndMusicBrainz();
@@ -567,6 +570,86 @@ internal static class Program
         var singles = singlesImport.Fetch();
 
         Assert("singles preferred still emits single when album is unmonitored and missing", singles.Count == 1 && singles[0].AlbumMusicBrainzId == "single-mbid");
+    }
+
+    private static void TestImportBudgetCountsNewAlbumsOnly()
+    {
+        Console.WriteLine("\n[Test] Import budget counts new albums only, not covered ones");
+
+        // AlbumsPerDay = 24 -> hourly budget of 1 regardless of the current UTC hour. Three
+        // presentable tracks resolve to three albums; the two newest are already covered, the
+        // oldest is new. The budget must still emit the new album rather than returning nothing.
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track-oldest", "altnation", new[] { "Artist One" }, "Song A", null, null, now.AddMinutes(-3));
+        store.MarkTrackResolved("track-oldest", ReleasePriorityMode.Albums, new AlbumResolution(true, "New Album", "artist-mbid-1", "new-mbid"), now.AddMinutes(-3));
+        store.UpsertTrack("track-new2", "altnation", new[] { "Artist Two" }, "Song B", null, null, now.AddMinutes(-2));
+        store.MarkTrackResolved("track-new2", ReleasePriorityMode.Albums, new AlbumResolution(true, "Covered Album 2", "artist-mbid-2", "covered2-mbid"), now.AddMinutes(-2));
+        store.UpsertTrack("track-new1", "altnation", new[] { "Artist Three" }, "Song C", null, null, now.AddMinutes(-1));
+        store.MarkTrackResolved("track-new1", ReleasePriorityMode.Albums, new AlbumResolution(true, "Covered Album 1", "artist-mbid-3", "covered1-mbid"), now.AddMinutes(-1));
+
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { ForeignAlbumId = "covered1-mbid", Monitored = true });
+        albumService.Add(new Album { ForeignAlbumId = "covered2-mbid", Monitored = true });
+
+        var repo = new FakeImportListRepository();
+        var import = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Albums, albumService);
+        ((SXMPlaylistImportSettings)import.Definition.Settings).AlbumsPerDay = 24;
+
+        var items = import.Fetch();
+
+        Assert("budget of 1 emits the one new album despite two newer covered ones", items.Count == 1 && items[0].AlbumMusicBrainzId == "new-mbid");
+    }
+
+    private static void TestImportBudgetDedupesAlbumsWithinPass()
+    {
+        Console.WriteLine("\n[Test] Import budget counts a repeated album once within a pass");
+
+        // AlbumsPerDay = 48 -> hourly budget of 2. Three presentable tracks all resolve to the SAME
+        // new album. The budget must emit the album once, not three times.
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        for (var i = 0; i < 3; i++)
+        {
+            store.UpsertTrack($"track{i}", "altnation", new[] { "Artist One" }, $"Song {i}", null, null, now.AddMinutes(-i));
+            store.MarkTrackResolved($"track{i}", ReleasePriorityMode.Albums, new AlbumResolution(true, "The Album", "artist-mbid-1", "album-mbid"), now.AddMinutes(-i));
+        }
+
+        var repo = new FakeImportListRepository();
+        var import = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Albums);
+        ((SXMPlaylistImportSettings)import.Definition.Settings).AlbumsPerDay = 48;
+
+        var items = import.Fetch();
+
+        Assert("repeated album counted once within the pass", items.Count == 1 && items[0].AlbumMusicBrainzId == "album-mbid");
+    }
+
+    private static void TestImportUnlimitedBudgetEmitsAllUncovered()
+    {
+        Console.WriteLine("\n[Test] Import unlimited budget emits all uncovered albums");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Albums, new AlbumResolution(true, "New Album", "artist-mbid-1", "new-mbid"), now);
+        store.UpsertTrack("track2", "altnation", new[] { "Artist Two" }, "Song B", null, null, now.AddMinutes(-1));
+        store.MarkTrackResolved("track2", ReleasePriorityMode.Albums, new AlbumResolution(true, "Another Album", "artist-mbid-2", "another-mbid"), now.AddMinutes(-1));
+        store.UpsertTrack("track3", "altnation", new[] { "Artist Three" }, "Song C", null, null, now.AddMinutes(-2));
+        store.MarkTrackResolved("track3", ReleasePriorityMode.Albums, new AlbumResolution(true, "Covered Album", "artist-mbid-3", "covered-mbid"), now.AddMinutes(-2));
+
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { ForeignAlbumId = "covered-mbid", Monitored = true });
+
+        var repo = new FakeImportListRepository();
+        var import = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue, ReleasePriorityMode.Albums, albumService);
+        ((SXMPlaylistImportSettings)import.Definition.Settings).AlbumsPerDay = 0;
+
+        var items = import.Fetch();
+
+        Assert("unlimited emits both uncovered albums and skips the covered one", items.Count == 2 && !items.Any(i => i.AlbumMusicBrainzId == "covered-mbid"));
     }
 
     private static void SeedDualResolutionTrack(FakeAppFolderInfo folder)

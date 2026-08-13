@@ -80,23 +80,46 @@ namespace SXMPlaylist.ImportLists
             var retainedSince = now - SXMPlaylistHistoryStore.PlayRetention;
             var show = Settings?.Show ?? SXMPlaylistShowSchedule.ChannelValue;
             var windows = GetShowWindows(channel, show);
+
+            // The daily budget is "new albums per day", not "presentations per day": a covered album
+            // (already monitored or on disk) must not consume budget. Fetch the whole presentation
+            // window (bounded by channel play rate, a few hundred rows) and apply the budget in
+            // memory after skipping covered albums and deduplicating by album.
+            var albumsPerFetch = GetAlbumsPerFetch(Settings, now);
             var presentable = _historyStore.GetPresentableTracks(
                 channel,
                 presentationSince,
                 retainedSince,
-                GetAlbumsPerFetch(Settings, now),
+                int.MaxValue,
                 windows,
                 Settings?.RequireMusicBrainzId ?? false,
                 GetMinimumPlays(Settings),
                 Settings?.ReleasePriority ?? ReleasePriorityMode.Singles);
 
             var items = new List<ImportListItemInfo>();
+            var seenAlbums = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var uncoveredAlbums = 0;
             foreach (var track in presentable)
             {
                 if (IsAlreadyCovered(track))
                 {
                     continue;
                 }
+
+                var albumKey = track.AlbumMusicBrainzId.IsNotNullOrWhiteSpace()
+                    ? track.AlbumMusicBrainzId!
+                    : $"{track.Album}|{string.Join("|", track.Artists)}";
+                if (!seenAlbums.Add(albumKey))
+                {
+                    continue;
+                }
+
+                if (albumsPerFetch != int.MaxValue && uncoveredAlbums >= albumsPerFetch)
+                {
+                    break;
+                }
+
+                uncoveredAlbums++;
 
                 foreach (var artist in track.Artists)
                 {
