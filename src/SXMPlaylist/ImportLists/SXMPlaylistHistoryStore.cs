@@ -786,6 +786,32 @@ namespace SXMPlaylist.ImportLists
                 DeserializeStringMap(reader.IsDBNull(5) ? null : reader.GetString(5)));
         }
 
+        // Enumerates every persisted companion-playlist state row. Used by the worker to find lists
+        // whose "Companion Plex Playlist" option has since been disabled so their playlists can be
+        // deleted rather than left orphaned.
+        public List<PlexPlaylistStateRecord> GetAllPlexPlaylistState()
+        {
+            var result = new List<PlexPlaylistStateRecord>();
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson, UserPlaylistKeysJson FROM PlexPlaylistState",
+                connection);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                result.Add(new PlexPlaylistStateRecord(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    DateTime.Parse(reader.GetString(3)).ToUniversalTime(),
+                    DeserializeTrackCache(reader.IsDBNull(4) ? null : reader.GetString(4)),
+                    DeserializeStringMap(reader.IsDBNull(5) ? null : reader.GetString(5))));
+            }
+
+            return result;
+        }
+
         public void UpsertPlexPlaylistState(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string>? trackCache = null, IReadOnlyDictionary<string, string>? userPlaylistKeys = null)
         {
             using var connection = OpenConnection();

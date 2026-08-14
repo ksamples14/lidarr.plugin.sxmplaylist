@@ -192,12 +192,14 @@ namespace SXMPlaylist.ImportLists
         // logged and ignored, never fatal to the worker pass.
         private void SyncCompanionPlexPlaylists(CancellationToken token)
         {
-            List<ImportListDefinition> plexLists;
+            // All SXM Playlist import lists, regardless of enabled state. Used to distinguish "list
+            // deleted entirely" (clean up playlists) from "list exists but disabled/paused" (leave
+            // the playlists alone so re-enabling doesn't lose them).
+            List<ImportListDefinition> allSxmLists;
             try
             {
-                plexLists = _importListFactory.All()
-                    .Where(d => string.Equals(d.Implementation, ImplementationName, StringComparison.OrdinalIgnoreCase) && d.EnableAutomaticAdd)
-                    .Where(d => (d.Settings as SXMPlaylistImportSettings)?.AddCompanionPlexPlaylist == true)
+                allSxmLists = _importListFactory.All()
+                    .Where(d => string.Equals(d.Implementation, ImplementationName, StringComparison.OrdinalIgnoreCase))
                     .ToList();
             }
             catch (Exception ex)
@@ -205,6 +207,13 @@ namespace SXMPlaylist.ImportLists
                 _logger.Debug(ex, "Could not read configured SXM Playlist lists for companion Plex sync");
                 return;
             }
+
+            var allSxmListIds = allSxmLists.Select(d => (long)d.Id).ToHashSet();
+
+            var plexLists = allSxmLists
+                .Where(d => d.EnableAutomaticAdd)
+                .Where(d => (d.Settings as SXMPlaylistImportSettings)?.AddCompanionPlexPlaylist == true)
+                .ToList();
 
             foreach (var definition in plexLists)
             {
@@ -256,6 +265,72 @@ namespace SXMPlaylist.ImportLists
                 catch (Exception ex)
                 {
                     _logger.Warn(ex, "Companion Plex playlist sync failed for list '{0}'", definition.Name);
+                }
+            }
+
+            CleanupOrphanedCompanionPlaylists(token, allSxmListIds, plexLists);
+        }
+
+        // Deletes companion playlists that are no longer wanted:
+        //  1. Lists deleted from Lidarr entirely -> delete owner + all fan-out copies, remove state.
+        //  2. Still-active lists -> prune copies for users whose music share was removed in Plex.
+        // Lists that exist but are disabled are left untouched (treated as paused).
+        private void CleanupOrphanedCompanionPlaylists(CancellationToken token, HashSet<long> allSxmListIds, List<ImportListDefinition> activeLists)
+        {
+            List<PlexPlaylistStateRecord> states;
+            try
+            {
+                states = _historyStore.GetAllPlexPlaylistState();
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not read companion Plex playlist state for cleanup");
+                return;
+            }
+
+            var activeIds = activeLists.Select(d => (long)d.Id).ToHashSet();
+
+            foreach (var state in states)
+            {
+                token.ThrowIfCancellationRequested();
+
+                try
+                {
+                    if (!allSxmListIds.Contains(state.ListId))
+                    {
+                        // The import list was deleted -> full cleanup, then drop the state row only
+                        // if cleanup actually completed (plex.tv reachable). Otherwise retry next cycle.
+                        var completed = _plexClient.CleanupPlaylist(state.PlaylistTitle, state.PlaylistRatingKey, state.UserPlaylistKeys);
+                        if (completed)
+                        {
+                            _logger.Info("Cleaned up companion Plex playlist '{0}' (import list removed)", state.PlaylistTitle);
+                            _historyStore.DeletePlexPlaylistState(state.ListId);
+                        }
+                        else
+                        {
+                            _logger.Warn("Companion Plex playlist '{0}' cleanup deferred: plex.tv unreachable", state.PlaylistTitle);
+                        }
+
+                        continue;
+                    }
+
+                    if (!activeIds.Contains(state.ListId))
+                    {
+                        // List still exists but is disabled or the companion option is off: pause,
+                        // leave the playlists in place so re-enabling restores them.
+                        continue;
+                    }
+
+                    // Active list: remove copies for users who lost the music library share.
+                    var retained = _plexClient.PruneUnsharedPlaylistCopies(state.PlaylistTitle, state.UserPlaylistKeys);
+                    if (retained.Count != state.UserPlaylistKeys.Count)
+                    {
+                        _historyStore.UpsertPlexPlaylistState(state.ListId, state.PlaylistTitle, state.PlaylistRatingKey, state.LastSyncUtc, state.TrackCache, retained);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn(ex, "Companion Plex playlist cleanup failed for list '{0}'", state.ListId);
                 }
             }
         }

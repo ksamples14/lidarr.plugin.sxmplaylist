@@ -140,6 +140,10 @@ internal static class Program
         TestPlexFanOutOwnerSyncSurvivesHomeUsersFailure();
         TestPlexFanOutCoversSharedUsersOutsideHome();
         TestPlexFanOutSkipsUsersWithoutMusicShare();
+        TestPlexCleanupDeletesOwnerAndUserCopies();
+        TestPlexCleanupDefersWhenPlexTvUnreachable();
+        TestPlexPruneRemovesUnsharedUserCopies();
+        TestPlexPruneKeepsAllWhenPlexTvUnreachable();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -2623,6 +2627,82 @@ internal static class Program
 
         Assert("owner playlist still synced when plex.tv is unreachable", result.OwnerPlaylistRatingKey == "500");
         Assert("no skipped users surfaced on enumeration failure", result.SkippedUsers.Count == 0);
+    }
+
+    private static void TestPlexCleanupDeletesOwnerAndUserCopies()
+    {
+        Console.WriteLine("\n[Test] Plex cleanup deletes the owner and fan-out copies when a list is removed");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        httpClient.Respond("/api/servers/mach1/shared_servers",
+            "<?xml version=\"1.0\"?><MediaContainer>" +
+            "<SharedServer id=\"100\" userID=\"user1\" username=\"vsa191\" accessToken=\"vsa-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "</MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        var completed = client.CleanupPlaylist(
+            "SXM Alt Nation",
+            "500",
+            new Dictionary<string, string> { ["user1"] = "600" });
+
+        Assert("cleanup reported complete", completed);
+        Assert("owner playlist delete attempted", httpClient.RequestUrls.Any(u => u.Contains("/playlists/500")));
+        Assert("user copy delete attempted with the user's token", httpClient.RequestUrls.Any(u => u.Contains("/playlists/600")));
+    }
+
+    private static void TestPlexCleanupDefersWhenPlexTvUnreachable()
+    {
+        Console.WriteLine("\n[Test] Plex cleanup reports incomplete when plex.tv is unreachable");
+
+        var httpClient = NewPlexEnvironment();
+        // No shared_servers Respond -> plex.tv returns 404 -> token lookup returns null.
+        var client = NewPlexClient(httpClient);
+        var completed = client.CleanupPlaylist(
+            "SXM Alt Nation",
+            "500",
+            new Dictionary<string, string> { ["user1"] = "600" });
+
+        Assert("cleanup reported incomplete (defer state deletion)", !completed);
+    }
+
+    private static void TestPlexPruneRemovesUnsharedUserCopies()
+    {
+        Console.WriteLine("\n[Test] Plex prune removes copies for users who lost the music library share");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        httpClient.Respond("/api/servers/mach1/shared_servers",
+            "<?xml version=\"1.0\"?><MediaContainer>" +
+            "<SharedServer id=\"100\" userID=\"user1\" username=\"vsa191\" accessToken=\"vsa-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"0\"/>" +
+            "</SharedServer>" +
+            "</MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        var retained = client.PruneUnsharedPlaylistCopies(
+            "SXM Alt Nation",
+            new Dictionary<string, string> { ["user1"] = "600", ["user2"] = "601" });
+
+        Assert("music-unshared user's copy deleted", httpClient.RequestUrls.Any(u => u.Contains("/playlists/600")));
+        Assert("user2 (absent from shared_servers) key dropped", !retained.ContainsKey("user2"));
+        Assert("no keys retained for unshared users", retained.Count == 0);
+    }
+
+    private static void TestPlexPruneKeepsAllWhenPlexTvUnreachable()
+    {
+        Console.WriteLine("\n[Test] Plex prune keeps all keys when plex.tv is unreachable");
+
+        var httpClient = NewPlexEnvironment();
+        // No shared_servers Respond -> plex.tv 404 -> lookup returns null -> keep everything.
+        var client = NewPlexClient(httpClient);
+        var retained = client.PruneUnsharedPlaylistCopies(
+            "SXM Alt Nation",
+            new Dictionary<string, string> { ["user1"] = "600" });
+
+        Assert("all keys retained when plex.tv unreachable", retained.ContainsKey("user1") && retained["user1"] == "600");
     }
 
     private static PlayEventRecord PlayEvent(string playId, string artist, string song, long eventId = 1)

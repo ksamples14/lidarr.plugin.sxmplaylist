@@ -327,6 +327,181 @@ namespace SXMPlaylist.ImportLists
             return null;
         }
 
+        // Deletes a companion playlist and every fan-out copy previously created for it. Called by
+        // the worker when the "Companion Plex Playlist" option is switched off (or the list is
+        // deleted) so the playlists don't linger as orphans.
+        //
+        // Returns true when cleanup completed (the owner copy was deleted and, if there were user
+        // copies, every one was attempted). Returns false when plex.tv was unreachable so the caller
+        // keeps the persisted state and retries next cycle instead of leaving orphaned copies with
+        // no record to recover them from.
+        public bool CleanupPlaylist(string playlistTitle, string ownerPlaylistRatingKey, IReadOnlyDictionary<string, string> userPlaylistKeys)
+        {
+            var plex = FindPlexSettings();
+            if (plex == null)
+            {
+                _logger.Debug("Companion Plex playlist '{0}' cleanup skipped: no Plex Media Server connection is configured", playlistTitle);
+                return false;
+            }
+
+            var baseUrl = BuildBaseUrl(plex);
+
+            if (ownerPlaylistRatingKey.IsNotNullOrWhiteSpace())
+            {
+                DeletePlaylist(baseUrl, plex, ownerPlaylistRatingKey);
+            }
+
+            if (userPlaylistKeys.Count == 0 || plex.AuthToken.IsNullOrWhiteSpace())
+            {
+                return true;
+            }
+
+            // Resolve each fan-out user's server token so the playlist can be deleted from their
+            // account. shared_servers provides direct tokens. If plex.tv is unreachable we cannot
+            // resolve tokens, so report incomplete and let the caller retry later.
+            var tokenByUserId = GetSharedUserTokens(plex, baseUrl);
+            if (tokenByUserId == null)
+            {
+                _logger.Warn("Playlist '{0}' cleanup incomplete: plex.tv unreachable, will retry next cycle", playlistTitle);
+                return false;
+            }
+
+            foreach (var pair in userPlaylistKeys)
+            {
+                var userId = pair.Key;
+                var ratingKey = pair.Value;
+                if (ratingKey.IsNullOrWhiteSpace())
+                {
+                    continue;
+                }
+
+                if (tokenByUserId.TryGetValue(userId, out var shared))
+                {
+                    var userPlex = CloneWithToken(plex, shared.AccessToken);
+                    DeletePlaylist(BuildBaseUrl(userPlex), userPlex, ratingKey);
+                }
+                else
+                {
+                    _logger.Debug("Playlist '{0}' cleanup skipped for user id '{1}': no server token available", playlistTitle, userId);
+                }
+            }
+
+            return true;
+        }
+
+        // Removes the playlist copies for users who no longer have the music library shared (e.g.
+        // their share was edited in Plex while the Lidarr option stays on). Returns the keys that
+        // should be retained in the persisted per-user map. Best-effort and idempotent.
+        //
+        // - User still has music shared -> key retained.
+        // - User in shared_servers but music no longer shared -> copy deleted, key dropped.
+        // - plex.tv unreachable -> nothing verifiable, ALL keys retained so nothing is dropped
+        //   incorrectly.
+        // - User absent from shared_servers entirely (fully unshared / removed) -> key dropped: we
+        //   cannot manage that account anymore, and keeping a stale key risks collisions if the user
+        //   is later re-added.
+        public IReadOnlyDictionary<string, string> PruneUnsharedPlaylistCopies(string playlistTitle, IReadOnlyDictionary<string, string> userPlaylistKeys)
+        {
+            var retained = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (userPlaylistKeys.Count == 0)
+            {
+                return retained;
+            }
+
+            var plex = FindPlexSettings();
+            if (plex == null || plex.AuthToken.IsNullOrWhiteSpace())
+            {
+                _logger.Debug("Companion Plex playlist '{0}' unshare-prune skipped: no Plex connection configured", playlistTitle);
+                foreach (var pair in userPlaylistKeys)
+                {
+                    retained[pair.Key] = pair.Value;
+                }
+
+                return retained;
+            }
+
+            var baseUrl = BuildBaseUrl(plex);
+            var tokenByUserId = GetSharedUserTokens(plex, baseUrl);
+            if (tokenByUserId == null)
+            {
+                // plex.tv unreachable: cannot verify current shares, keep everything.
+                _logger.Debug("Companion Plex playlist '{0}' unshare-prune deferred: plex.tv unreachable", playlistTitle);
+                foreach (var pair in userPlaylistKeys)
+                {
+                    retained[pair.Key] = pair.Value;
+                }
+
+                return retained;
+            }
+
+            foreach (var pair in userPlaylistKeys)
+            {
+                var userId = pair.Key;
+                var ratingKey = pair.Value;
+                if (ratingKey.IsNullOrWhiteSpace())
+                {
+                    continue;
+                }
+
+                // User still present with music shared -> keep the copy.
+                if (tokenByUserId.TryGetValue(userId, out var shared))
+                {
+                    if (shared.HasMusicShare)
+                    {
+                        retained[userId] = ratingKey;
+                        continue;
+                    }
+
+                    if (shared.AccessToken.IsNotNullOrWhiteSpace())
+                    {
+                        var userPlex = CloneWithToken(plex, shared.AccessToken);
+                        DeletePlaylist(BuildBaseUrl(userPlex), userPlex, ratingKey);
+                        _logger.Info("Removed companion Plex playlist '{0}' from user id '{1}': music library no longer shared", playlistTitle, userId);
+                    }
+
+                    continue;
+                }
+
+                // User fully removed from shared_servers: drop the stale key.
+                _logger.Debug("Playlist '{0}' key dropped for user id '{1}': user no longer in shared_servers", playlistTitle, userId);
+            }
+
+            return retained;
+        }
+
+        // Resolves fan-out user server tokens from shared_servers (direct tokens). Returns null when
+        // plex.tv was unreachable (callers should not draw conclusions from an empty result), and a
+        // (possibly empty) map when the lookup succeeded. Duplicate user ids are collapsed.
+        private Dictionary<string, PlexSharedUser>? GetSharedUserTokens(PlexServerSettings plex, string baseUrl)
+        {
+            try
+            {
+                var machineId = GetMachineId(baseUrl, plex);
+                if (machineId.IsNullOrWhiteSpace())
+                {
+                    return null;
+                }
+
+                // Distinguish "plex.tv unreachable" (no payload) from "valid response, no users":
+                // the former must not be treated as an authoritative empty set.
+                var content = GetSharedServersJson(machineId!, plex.AuthToken!);
+                if (content.IsNullOrWhiteSpace())
+                {
+                    return null;
+                }
+
+                var users = ParseSharedServerUsers(content!);
+                return users
+                    .GroupBy(u => u.UserId, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not resolve shared user tokens for playlist cleanup");
+                return null;
+            }
+        }
+
         private static PlexServerSettings CloneWithToken(PlexServerSettings source, string token)
         {
             return new PlexServerSettings
@@ -595,14 +770,19 @@ namespace SXMPlaylist.ImportLists
         // header: <MediaContainer><SharedServer id=".." username=".." userID=".." accessToken="..">.
         private List<PlexSharedUser> GetSharedServerUsers(string ownerToken, string machineId)
         {
-            var result = new List<PlexSharedUser>();
             var content = GetSharedServersJson(machineId, ownerToken);
             if (content.IsNullOrWhiteSpace())
             {
-                return result;
+                return new List<PlexSharedUser>();
             }
 
-            var document = XDocument.Parse(content!);
+            return ParseSharedServerUsers(content!);
+        }
+
+        private static List<PlexSharedUser> ParseSharedServerUsers(string content)
+        {
+            var result = new List<PlexSharedUser>();
+            var document = XDocument.Parse(content);
             var root = document.Root;
             if (root == null)
             {
@@ -941,6 +1121,29 @@ namespace SXMPlaylist.ImportLists
                 .Where(k => k.IsNotNullOrWhiteSpace())
                 .Cast<string>()
                 .ToList();
+        }
+
+        // Deletes a playlist from a user's account. Best-effort: a failure is logged and swallowed
+        // so cleanup never aborts the worker pass. A null response (e.g. HTTP 404 for an already
+        // deleted playlist) is treated as success-for-idempotency but logged at Debug, not Warn.
+        private void DeletePlaylist(string baseUrl, PlexServerSettings plex, string playlistRatingKey)
+        {
+            try
+            {
+                var response = Get($"{baseUrl}/playlists/{playlistRatingKey}", plex, HttpMethod.Delete);
+                if (response != null)
+                {
+                    _logger.Info("Deleted Plex playlist ratingKey {0}", playlistRatingKey);
+                }
+                else
+                {
+                    _logger.Debug("Plex playlist ratingKey {0} delete returned no payload (already gone or rejected)", playlistRatingKey);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(ex, "Failed to delete Plex playlist ratingKey {0}", playlistRatingKey);
+            }
         }
 
         private string? GetMachineId(string baseUrl, PlexServerSettings plex)
