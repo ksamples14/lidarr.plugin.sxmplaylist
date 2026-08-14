@@ -272,23 +272,26 @@ namespace SXMPlaylist.ImportLists
 
             // One row per import list that opted into a companion Plex playlist. Persists the Plex
             // playlist ratingKey so we only ever touch playlists we created (find-by-title is the
-            // fallback for first-run), the last sync time so the worker can throttle refreshes, and
-            // a JSON cache of matched (artist||title) -> Plex track ratingKeys so repeat syncs don't
-            // re-search the Plex library for tracks already matched.
+            // fallback for first-run), the last sync time so the worker can throttle refreshes, a
+            // JSON cache of matched (artist||title) -> Plex track ratingKeys so repeat syncs don't
+            // re-search the Plex library for tracks already matched, and the per-Plex-Home-user
+            // playlist ratingKeys (username -> ratingKey) for the fan-out copies.
             using (var command = new SQLiteCommand(
                 "CREATE TABLE IF NOT EXISTS PlexPlaylistState (" +
                 "ListId INTEGER PRIMARY KEY, " +
                 "PlaylistTitle TEXT NOT NULL, " +
                 "PlaylistRatingKey TEXT NOT NULL, " +
                 "LastSyncUtc TEXT NOT NULL, " +
-                "TrackCacheJson TEXT NOT NULL DEFAULT '{}')",
+                "TrackCacheJson TEXT NOT NULL DEFAULT '{}', " +
+                "UserPlaylistKeysJson TEXT NOT NULL DEFAULT '{}')",
                 connection))
             {
                 command.ExecuteNonQuery();
             }
 
-            // Upgrade databases created before the track cache column existed (idempotent).
+            // Upgrade databases created before the track cache / user keys columns existed (idempotent).
             EnsureColumn(connection, "PlexPlaylistState", "TrackCacheJson", "TEXT NOT NULL DEFAULT '{}'");
+            EnsureColumn(connection, "PlexPlaylistState", "UserPlaylistKeysJson", "TEXT NOT NULL DEFAULT '{}'");
         }
 
         // Adds a column to an existing table if it isn't present. Used to upgrade databases created
@@ -764,7 +767,7 @@ namespace SXMPlaylist.ImportLists
         {
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
-                "SELECT ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson FROM PlexPlaylistState WHERE ListId = @listId",
+                "SELECT ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson, UserPlaylistKeysJson FROM PlexPlaylistState WHERE ListId = @listId",
                 connection);
             command.Parameters.AddWithValue("@listId", listId);
 
@@ -779,21 +782,23 @@ namespace SXMPlaylist.ImportLists
                 reader.GetString(1),
                 reader.GetString(2),
                 DateTime.Parse(reader.GetString(3)).ToUniversalTime(),
-                DeserializeTrackCache(reader.IsDBNull(4) ? null : reader.GetString(4)));
+                DeserializeTrackCache(reader.IsDBNull(4) ? null : reader.GetString(4)),
+                DeserializeStringMap(reader.IsDBNull(5) ? null : reader.GetString(5)));
         }
 
-        public void UpsertPlexPlaylistState(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string>? trackCache = null)
+        public void UpsertPlexPlaylistState(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string>? trackCache = null, IReadOnlyDictionary<string, string>? userPlaylistKeys = null)
         {
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
-                "INSERT INTO PlexPlaylistState (ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson) VALUES (@listId, @title, @ratingKey, @utc, @cache) " +
-                "ON CONFLICT(ListId) DO UPDATE SET PlaylistTitle = @title, PlaylistRatingKey = @ratingKey, LastSyncUtc = @utc, TrackCacheJson = @cache",
+                "INSERT INTO PlexPlaylistState (ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson, UserPlaylistKeysJson) VALUES (@listId, @title, @ratingKey, @utc, @cache, @userKeys) " +
+                "ON CONFLICT(ListId) DO UPDATE SET PlaylistTitle = @title, PlaylistRatingKey = @ratingKey, LastSyncUtc = @utc, TrackCacheJson = @cache, UserPlaylistKeysJson = @userKeys",
                 connection);
             command.Parameters.AddWithValue("@listId", listId);
             command.Parameters.AddWithValue("@title", playlistTitle);
             command.Parameters.AddWithValue("@ratingKey", playlistRatingKey);
             command.Parameters.AddWithValue("@utc", lastSyncUtc.ToString("O"));
             command.Parameters.AddWithValue("@cache", SerializeTrackCache(trackCache));
+            command.Parameters.AddWithValue("@userKeys", SerializeTrackCache(userPlaylistKeys));
             command.ExecuteNonQuery();
         }
 
@@ -808,6 +813,24 @@ namespace SXMPlaylist.ImportLists
         }
 
         private static Dictionary<string, string> DeserializeTrackCache(string? json)
+        {
+            if (json.IsNullOrWhiteSpace())
+            {
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<Dictionary<string, string>>(json!)
+                       ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+            catch (Exception)
+            {
+                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private static Dictionary<string, string> DeserializeStringMap(string? json)
         {
             if (json.IsNullOrWhiteSpace())
             {
@@ -1157,13 +1180,14 @@ namespace SXMPlaylist.ImportLists
 
     public class PlexPlaylistStateRecord
     {
-        public PlexPlaylistStateRecord(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string> trackCache)
+        public PlexPlaylistStateRecord(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string> trackCache, IReadOnlyDictionary<string, string> userPlaylistKeys)
         {
             ListId = listId;
             PlaylistTitle = playlistTitle;
             PlaylistRatingKey = playlistRatingKey;
             LastSyncUtc = lastSyncUtc;
             TrackCache = trackCache;
+            UserPlaylistKeys = userPlaylistKeys;
         }
 
         public long ListId { get; }
@@ -1171,5 +1195,8 @@ namespace SXMPlaylist.ImportLists
         public string PlaylistRatingKey { get; }
         public DateTime LastSyncUtc { get; }
         public IReadOnlyDictionary<string, string> TrackCache { get; }
+
+        // Plex Home username -> playlist ratingKey for the fan-out copies.
+        public IReadOnlyDictionary<string, string> UserPlaylistKeys { get; }
     }
 }

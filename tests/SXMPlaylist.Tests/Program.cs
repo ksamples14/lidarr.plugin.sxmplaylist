@@ -134,6 +134,12 @@ internal static class Program
         TestPlexRepeatedTrackUsesPersistedCache();
         TestPlexRetriesTransientSearchFailure();
         TestPlexCacheIsolationBetweenLists();
+        TestPlexFanOutCreatesPlaylistForFullAccountHomeUser();
+        TestPlexFanOutSkipsPinProtectedUser();
+        TestPlexFanOutUsesSwitchFallbackWhenNoSharedToken();
+        TestPlexFanOutOwnerSyncSurvivesHomeUsersFailure();
+        TestPlexFanOutCoversSharedUsersOutsideHome();
+        TestPlexFanOutSkipsUsersWithoutMusicShare();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} TEST(S) FAILED");
@@ -2466,6 +2472,157 @@ internal static class Program
         Assert("cache 2 contains only Track B", cache2.Count == 1 && cache2.ContainsKey("Bee Gees||Stayin' Alive"));
         Assert("cache 1 does not contain Track B", !cache1.ContainsKey("Bee Gees||Stayin' Alive"));
         Assert("cache 2 does not contain Track A", !cache2.ContainsKey("Kool & The Gang||Celebration"));
+    }
+
+    private static void TestPlexFanOutCreatesPlaylistForFullAccountHomeUser()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out creates a playlist copy for a shared/full-account user");
+
+        var httpClient = NewPlexEnvironment();
+        // Plex.tv: the owner (admin) plus a full-account member "vsa191" with library access.
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        httpClient.Respond("/api/v2/home/users",
+            "{\"MediaContainer\":{\"User\":[" +
+            "{\"id\":\"owner1\",\"uuid\":\"u-owner\",\"title\":\"owner\",\"username\":\"owner\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"1\"}," +
+            "{\"id\":\"user1\",\"uuid\":\"u-vsa\",\"title\":\"vsa191\",\"username\":\"vsa191\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"0\"}" +
+            "]}}");
+        // shared_servers (XML) exposes vsa191's direct server access token and music library share.
+        httpClient.Respond("/api/servers/mach1/shared_servers",
+            "<?xml version=\"1.0\"?><MediaContainer>" +
+            "<SharedServer id=\"100\" userID=\"user1\" username=\"vsa191\" accessToken=\"vsa-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "</MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("owner playlist synced", result.OwnerPlaylistRatingKey == "500");
+        Assert("full-account user playlist key persisted", result.UserPlaylistRatingKeys["user1"] == "500");
+        Assert("no users skipped", result.SkippedUsers.Count == 0);
+        Assert("owner account did not trigger a home-user switch", !httpClient.RequestUrls.Any(u => u.Contains("/home/users/u-owner/switch")));
+    }
+
+    private static void TestPlexFanOutSkipsPinProtectedUser()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out skips PIN-protected home users that need a switch");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        // The PIN-protected user is a home member NOT in shared_servers, so a switch would be needed.
+        httpClient.Respond("/api/v2/home/users",
+            "{\"MediaContainer\":{\"User\":[" +
+            "{\"id\":\"owner1\",\"uuid\":\"u-owner\",\"title\":\"owner\",\"username\":\"owner\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"1\"}," +
+            "{\"id\":\"user1\",\"uuid\":\"u-vsa\",\"title\":\"vsa191\",\"username\":\"vsa191\",\"restricted\":\"0\",\"protected\":\"1\",\"admin\":\"0\"}" +
+            "]}}");
+        // No shared_servers entry for the PIN-protected user -> switch would be needed, so skip.
+        httpClient.Respond("/api/servers/mach1/shared_servers", "<?xml version=\"1.0\"?><MediaContainer></MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("owner playlist still synced", result.OwnerPlaylistRatingKey == "500");
+        Assert("PIN-protected user skipped", result.SkippedUsers.Count == 1 && result.SkippedUsers[0].StartsWith("vsa191"));
+        Assert("no switch attempted for PIN-protected user", !httpClient.RequestUrls.Any(u => u.Contains("/home/users/u-vsa/switch")));
+    }
+
+    private static void TestPlexFanOutUsesSwitchFallbackWhenNoSharedToken()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out falls back to switch + resources when shared_servers has no token");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        // A managed (restricted) home member who is NOT in shared_servers -> switch + resources.
+        httpClient.Respond("/api/v2/home/users",
+            "{\"MediaContainer\":{\"User\":[" +
+            "{\"id\":\"owner1\",\"uuid\":\"u-owner\",\"title\":\"owner\",\"username\":\"owner\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"1\"}," +
+            "{\"id\":\"user1\",\"uuid\":\"u-vsa\",\"title\":\"vsa191\",\"username\":\"vsa191\",\"restricted\":\"1\",\"protected\":\"0\",\"admin\":\"0\"}" +
+            "]}}");
+        // No shared_servers entry -> switch + resources exchange.
+        httpClient.Respond("/api/servers/mach1/shared_servers", "<?xml version=\"1.0\"?><MediaContainer></MediaContainer>");
+        httpClient.Respond("/api/v2/home/users/u-vsa/switch", "{\"authToken\":\"switched-plex-tv-token\"}");
+        httpClient.Respond("/api/v2/resources",
+            "{\"MediaContainer\":{\"Device\":[{\"clientIdentifier\":\"mach1\",\"accessToken\":\"vsa-server-token\"}]}}");
+
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("switch endpoint was called for the managed user", httpClient.RequestUrls.Any(u => u.Contains("/home/users/u-vsa/switch")));
+        Assert("resources exchange used the switched token", httpClient.RequestUrls.Any(u => u.Contains("/api/v2/resources")));
+        Assert("playlist key persisted for the managed user", result.UserPlaylistRatingKeys["user1"] == "500");
+        Assert("no users skipped", result.SkippedUsers.Count == 0);
+    }
+
+    private static void TestPlexFanOutCoversSharedUsersOutsideHome()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out creates playlists for shared users outside the Plex Home");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        // Only the owner is a home user; the shared list has two external users.
+        httpClient.Respond("/api/v2/home/users",
+            "{\"MediaContainer\":{\"User\":[" +
+            "{\"id\":\"owner1\",\"uuid\":\"u-owner\",\"title\":\"owner\",\"username\":\"owner\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"1\"}" +
+            "]}}");
+        httpClient.Respond("/api/servers/mach1/shared_servers",
+            "<?xml version=\"1.0\"?><MediaContainer>" +
+            "<SharedServer id=\"100\" userID=\"ext1\" username=\"andyp396\" accessToken=\"andy-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "<SharedServer id=\"101\" userID=\"ext2\" username=\"jd9241\" accessToken=\"jd-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "</MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("external shared user 1 got a playlist copy", result.UserPlaylistRatingKeys["ext1"] == "500");
+        Assert("external shared user 2 got a playlist copy", result.UserPlaylistRatingKeys["ext2"] == "500");
+        Assert("no switch calls for shared users with direct tokens", !httpClient.RequestUrls.Any(u => u.Contains("/switch")));
+        Assert("no users skipped", result.SkippedUsers.Count == 0);
+    }
+
+    private static void TestPlexFanOutSkipsUsersWithoutMusicShare()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out skips users without the music library shared");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        httpClient.Respond("/api/v2/home/users",
+            "{\"MediaContainer\":{\"User\":[" +
+            "{\"id\":\"owner1\",\"uuid\":\"u-owner\",\"title\":\"owner\",\"username\":\"owner\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"1\"}" +
+            "]}}");
+        // ext1 has music shared; ext2 has only movies (no Music section).
+        httpClient.Respond("/api/servers/mach1/shared_servers",
+            "<?xml version=\"1.0\"?><MediaContainer>" +
+            "<SharedServer id=\"100\" userID=\"ext1\" username=\"andyp396\" accessToken=\"andy-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "<SharedServer id=\"101\" userID=\"ext2\" username=\"jd9241\" accessToken=\"jd-server-token\">" +
+            "<Section id=\"7\" key=\"7\" title=\"Movies\" type=\"movie\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "</MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("music-shared user got a playlist copy", result.UserPlaylistRatingKeys.ContainsKey("ext1"));
+        Assert("user without music share got no playlist copy", !result.UserPlaylistRatingKeys.ContainsKey("ext2"));
+        Assert("user without music share not surfaced as skipped", !result.SkippedUsers.Any(s => s.StartsWith("jd9241")));
+    }
+
+    private static void TestPlexFanOutOwnerSyncSurvivesHomeUsersFailure()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out owner sync survives a plex.tv home-users failure");
+
+        var httpClient = NewPlexEnvironment();
+        // plex.tv endpoints return 404 (no Respond registered) -> fan-out is skipped.
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("owner playlist still synced when plex.tv is unreachable", result.OwnerPlaylistRatingKey == "500");
+        Assert("no skipped users surfaced on enumeration failure", result.SkippedUsers.Count == 0);
     }
 
     private static PlayEventRecord PlayEvent(string playId, string artist, string song, long eventId = 1)

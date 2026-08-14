@@ -10,6 +10,7 @@ using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Notifications;
 using NzbDrone.Core.Notifications.Plex.Server;
+using System.Xml.Linq;
 
 namespace SXMPlaylist.ImportLists
 {
@@ -36,6 +37,11 @@ namespace SXMPlaylist.ImportLists
         private const int AddBatchSize = 100;
         private const int SearchAttempts = 3;
         private static readonly int[] RetryDelaysMs = { 0, 700, 1500 };
+
+        private const string PlexTvBaseUrl = "https://plex.tv";
+        private const string PlexClientIdentifier = "lidarr.sxmplaylist";
+        private const string PlexProduct = "Lidarr.Plugin.SXMPlaylist";
+        private const string PlexPlatform = "Web";
 
         private readonly IHttpClient _httpClient;
         private readonly INotificationFactory _notificationFactory;
@@ -100,8 +106,10 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
-        public void Sync(long listId, string playlistTitle, IReadOnlyList<PlayEventRecord> events)
+        public PlexSyncResult Sync(long listId, string playlistTitle, IReadOnlyList<PlayEventRecord> events)
         {
+            var result = new PlexSyncResult();
+
             // Reset per-pass connection caches. The track cache is managed externally by the caller:
             // ClearTrackCache() before the list sync, SeedTrackCache() from the persisted per-list
             // cache, then ExportTrackCache() to persist after.
@@ -111,14 +119,14 @@ namespace SXMPlaylist.ImportLists
             if (events == null || events.Count == 0)
             {
                 _logger.Debug("Companion Plex playlist '{0}' has no plays in the window; skipping", playlistTitle);
-                return;
+                return result;
             }
 
             var plex = FindPlexSettings();
             if (plex == null)
             {
                 _logger.Debug("Companion Plex playlist '{0}' enabled but no Plex Media Server connection is configured", playlistTitle);
-                return;
+                return result;
             }
 
             var baseUrl = BuildBaseUrl(plex);
@@ -126,14 +134,14 @@ namespace SXMPlaylist.ImportLists
             if (string.IsNullOrWhiteSpace(machineId))
             {
                 _logger.Warn("Could not determine Plex machine identifier; skipping companion playlist '{0}'", playlistTitle);
-                return;
+                return result;
             }
 
             var sectionIds = GetMusicSectionIds(baseUrl, plex);
             if (sectionIds.Count == 0)
             {
                 _logger.Warn("No Plex music library found; skipping companion playlist '{0}'", playlistTitle);
-                return;
+                return result;
             }
 
             var ratingKeys = ResolveRatingKeys(baseUrl, plex, sectionIds, events);
@@ -141,19 +149,537 @@ namespace SXMPlaylist.ImportLists
             if (ratingKeys.Count == 0)
             {
                 _logger.Debug("No companion playlist '{0}' tracks matched the Plex library; leaving playlist untouched", playlistTitle);
-                return;
+                return result;
             }
 
             var playlistRatingKey = EnsurePlaylist(baseUrl, plex, machineId, playlistTitle);
             if (playlistRatingKey.IsNullOrWhiteSpace())
             {
                 _logger.Warn("Could not find or create Plex playlist '{0}'", playlistTitle);
-                return;
+                return result;
             }
 
             ReplaceItems(baseUrl, plex, playlistRatingKey!, machineId, ratingKeys);
 
+            result.OwnerPlaylistRatingKey = playlistRatingKey!;
             _logger.Info("Synced companion Plex playlist '{0}' with {1} tracks", playlistTitle, ratingKeys.Count);
+
+            // Fan out a copy of the playlist to every user with library access (shared users like
+            // vsa191) plus any Plex Home members without a share, each in their own Playlists tab.
+            // Owner-created playlists only auto-appear for managed users, so everyone else needs a
+            // playlist created in their own account.
+            FanOutToSharedUsers(plex, playlistTitle, machineId, ratingKeys, result);
+
+            return result;
+        }
+
+        // Creates/updates the same playlist in every user's account (except the owner,
+        // whose playlist was already synced). The target set is every user with library access
+        // (shared_servers), since those are the accounts that can actually see and use the playlist;
+        // Plex Home members who aren't in shared_servers (e.g. managed sub-accounts without a share)
+        // are still included via the home-user switch API. Best-effort: unreachable users
+        // (PIN-protected, no library access, plex.tv failures) are skipped with a warning and never
+        // fail the owner sync.
+        private void FanOutToSharedUsers(PlexServerSettings plex, string playlistTitle, string machineId, List<string> ratingKeys, PlexSyncResult result)
+        {
+            if (plex.AuthToken.IsNullOrWhiteSpace())
+            {
+                return;
+            }
+
+            string? ownerUserId;
+            try
+            {
+                ownerUserId = GetOwnerUserId(plex.AuthToken!);
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not resolve the Plex owner id; falling back to the admin flag");
+                ownerUserId = null;
+            }
+
+            // shared_servers (XML) is the primary target list AND token source: every user with
+            // library access plus their direct server access token in one call.
+            List<PlexSharedUser> sharedUsers;
+            try
+            {
+                sharedUsers = GetSharedServerUsers(plex.AuthToken!, machineId);
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not read Plex shared users; skipping companion playlist fan-out for '{0}'", playlistTitle);
+                return;
+            }
+
+            // Home members supplement the shared list (managed sub-accounts don't appear in
+            // shared_servers). They need the switch + resources exchange when they have no share.
+            List<PlexHomeUser> homeUsers;
+            try
+            {
+                homeUsers = GetHomeUsers(plex.AuthToken!);
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Could not enumerate Plex Home users; continuing with shared users only");
+                homeUsers = new List<PlexHomeUser>();
+            }
+
+            var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sharedByUserId = sharedUsers.ToDictionary(u => u.UserId, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var user in sharedUsers)
+            {
+                if (ShouldSkipUser(user.UserId, user.Username, ownerUserId) != null)
+                {
+                    continue;
+                }
+
+                // Only users with the music library shared can see (and use) the companion playlist;
+                // everyone else would get an empty, pointless playlist in their account.
+                if (!user.HasMusicShare)
+                {
+                    _logger.Debug("Skipping Plex user '{0}' for companion playlist '{1}': no music library share", user.Username, playlistTitle);
+                    continue;
+                }
+
+                handled.Add(user.UserId);
+                SyncPlaylistForUser(plex, playlistTitle, machineId, ratingKeys, result, user.Username, user.UserId, user.AccessToken, user.IsProtected);
+            }
+
+            foreach (var homeUser in homeUsers)
+            {
+                if (ShouldSkipUser(homeUser.Id, homeUser.Title, ownerUserId) != null || handled.Contains(homeUser.Id))
+                {
+                    continue;
+                }
+
+                var shared = sharedByUserId.TryGetValue(homeUser.Id, out var sharedUser) ? sharedUser : null;
+                if (shared != null && !shared.HasMusicShare)
+                {
+                    _logger.Debug("Skipping Plex home user '{0}' for companion playlist '{1}': no music library share", homeUser.Title, playlistTitle);
+                    continue;
+                }
+
+                var token = shared?.AccessToken;
+                if (token.IsNullOrWhiteSpace())
+                {
+                    try
+                    {
+                        token = GetUserServerToken(homeUser, plex.AuthToken!, machineId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Debug(ex, "Could not obtain a server token for Plex home user '{0}'", homeUser.Title);
+                        token = null;
+                    }
+                }
+
+                handled.Add(homeUser.Id);
+                SyncPlaylistForUser(plex, playlistTitle, machineId, ratingKeys, result, homeUser.Title, homeUser.Id, token, homeUser.IsProtected);
+            }
+        }
+
+        private void SyncPlaylistForUser(PlexServerSettings plex, string playlistTitle, string machineId, List<string> ratingKeys, PlexSyncResult result, string displayName, string userId, string? userToken, bool isProtected)
+        {
+            if (userToken.IsNullOrWhiteSpace())
+            {
+                var reason = isProtected
+                    ? "PIN-protected home user cannot be switched"
+                    : "no server access token could be obtained";
+                result.SkippedUsers.Add($"{displayName}: {reason}");
+                _logger.Warn("Could not obtain a Plex server token for user '{0}'; skipping companion playlist '{1}'", displayName, playlistTitle);
+                return;
+            }
+
+            var userPlex = CloneWithToken(plex, userToken!);
+            var userBaseUrl = BuildBaseUrl(userPlex);
+            try
+            {
+                var userKey = EnsurePlaylist(userBaseUrl, userPlex, machineId, playlistTitle);
+                if (userKey.IsNullOrWhiteSpace())
+                {
+                    result.SkippedUsers.Add($"{displayName}: could not find or create the playlist");
+                    _logger.Warn("Could not find or create playlist '{0}' for user '{1}'", playlistTitle, displayName);
+                    return;
+                }
+
+                ReplaceItems(userBaseUrl, userPlex, userKey!, machineId, ratingKeys);
+                result.UserPlaylistRatingKeys[userId] = userKey!;
+                _logger.Info("Synced companion Plex playlist '{0}' to user '{1}' with {2} tracks", playlistTitle, displayName, ratingKeys.Count);
+            }
+            catch (Exception ex)
+            {
+                result.SkippedUsers.Add($"{displayName}: playlist sync failed");
+                _logger.Warn(ex, "Companion Plex playlist '{0}' sync failed for user '{1}'", playlistTitle, displayName);
+            }
+        }
+
+        // The owner account is identified by its plex.tv user id (resolved from the token's identity).
+        // IsAdmin is used only as a fallback when the id lookup fails, matching Plex Home's single-admin
+        // model so a full-account member isn't incorrectly skipped.
+        private static string? ShouldSkipUser(string userId, string displayName, string? ownerUserId)
+        {
+            if (ownerUserId.IsNotNullOrWhiteSpace() && userId == ownerUserId)
+            {
+                return "owner account";
+            }
+
+            return null;
+        }
+
+        private static PlexServerSettings CloneWithToken(PlexServerSettings source, string token)
+        {
+            return new PlexServerSettings
+            {
+                Host = source.Host,
+                Port = source.Port,
+                UseSsl = source.UseSsl,
+                UrlBase = source.UrlBase,
+                AuthToken = token
+            };
+        }
+
+        private sealed class PlexHomeUser
+        {
+            public string Id { get; set; } = "";
+            public string Uuid { get; set; } = "";
+            public string Title { get; set; } = "";
+            public string Username { get; set; } = "";
+            public string Email { get; set; } = "";
+            public bool IsRestricted { get; set; }
+            public bool IsProtected { get; set; }
+            public bool IsAdmin { get; set; }
+        }
+
+        private sealed class PlexTvDevice
+        {
+            public string ClientIdentifier { get; set; } = "";
+            public string AccessToken { get; set; } = "";
+        }
+
+        // GET https://plex.tv/api/v2/home/users with the owner token lists every member of the
+        // Plex Home: the admin/owner, managed (restricted) sub-accounts, and full accounts with
+        // their own plex.tv identity. Restricted=1 identifies managed users; protected=1 means a
+        // PIN is set (which the switch API needs and we cannot supply for non-managed users).
+        private static List<PlexHomeUser> ParseHomeUsers(string content)
+        {
+            var result = new List<PlexHomeUser>();
+            if (content.IsNullOrWhiteSpace())
+            {
+                return result;
+            }
+
+            var json = JToken.Parse(content);
+            var users = ToJArray(json?["MediaContainer"]?["User"] ?? json?["users"]);
+            if (users == null)
+            {
+                return result;
+            }
+
+            foreach (var u in users)
+            {
+                result.Add(new PlexHomeUser
+                {
+                    Id = u["id"]?.Value<string>() ?? "",
+                    Uuid = u["uuid"]?.Value<string>() ?? "",
+                    Title = u["title"]?.Value<string>() ?? u["username"]?.Value<string>() ?? "",
+                    Username = u["username"]?.Value<string>() ?? "",
+                    Email = u["email"]?.Value<string>() ?? "",
+                    IsRestricted = IsFlag(u, "restricted"),
+                    IsProtected = IsFlag(u, "protected"),
+                    IsAdmin = IsFlag(u, "admin")
+                });
+            }
+
+            return result;
+        }
+
+        // Some Plex endpoints serialize a singleton collection as a bare object instead of an array.
+        private static JArray? ToJArray(JToken? token)
+        {
+            switch (token)
+            {
+                case null:
+                    return null;
+                case JArray array:
+                    return array;
+                case JObject obj:
+                    return new JArray(obj);
+                default:
+                    return null;
+            }
+        }
+
+        private static bool IsFlag(JToken token, string property)
+        {
+            var value = token[property]?.Value<string>();
+            if (value.IsNullOrWhiteSpace())
+            {
+                return false;
+            }
+
+            return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<PlexTvDevice> ParseResources(string content)
+        {
+            var result = new List<PlexTvDevice>();
+            if (content.IsNullOrWhiteSpace())
+            {
+                return result;
+            }
+
+            var json = JToken.Parse(content);
+            var devices = ToJArray(json?["MediaContainer"]?["Device"]);
+            if (devices == null)
+            {
+                return result;
+            }
+
+            foreach (var d in devices)
+            {
+                result.Add(new PlexTvDevice
+                {
+                    ClientIdentifier = d["clientIdentifier"]?.Value<string>() ?? d["clientidentifier"]?.Value<string>() ?? "",
+                    AccessToken = d["accessToken"]?.Value<string>() ?? ""
+                });
+            }
+
+            return result;
+        }
+
+        private string? GetHomeUsersJson(string ownerToken)
+        {
+            var request = new HttpRequest($"{PlexTvBaseUrl}/api/v2/home/users", HttpAccept.Json);
+            AddPlexTvHeaders(request, ownerToken);
+            return ExecutePlexTv(request);
+        }
+
+        private string? GetOwnerUserIdJson(string ownerToken)
+        {
+            var request = new HttpRequest($"{PlexTvBaseUrl}/api/v2/user", HttpAccept.Json);
+            AddPlexTvHeaders(request, ownerToken);
+            return ExecutePlexTv(request);
+        }
+
+        private string? GetSharedServersJson(string machineId, string ownerToken)
+        {
+            var request = new HttpRequest($"{PlexTvBaseUrl}/api/servers/{Uri.EscapeDataString(machineId)}/shared_servers", HttpAccept.Json);
+            AddPlexTvHeaders(request, ownerToken);
+            return ExecutePlexTv(request);
+        }
+
+        private string? SwitchHomeUser(string uuid, string ownerToken)
+        {
+            var request = new HttpRequest($"{PlexTvBaseUrl}/api/v2/home/users/{Uri.EscapeDataString(uuid)}/switch", HttpAccept.Json)
+            {
+                Method = HttpMethod.Post
+            };
+            request.Headers.ContentType = "application/x-www-form-urlencoded";
+            AddPlexTvHeaders(request, ownerToken);
+            return ExecutePlexTv(request);
+        }
+
+        private string? GetResourcesJson(string switchedToken)
+        {
+            var request = new HttpRequest($"{PlexTvBaseUrl}/api/v2/resources?includeHttps=1&includeRelay=1", HttpAccept.Json);
+            AddPlexTvHeaders(request, switchedToken);
+            return ExecutePlexTv(request);
+        }
+
+        private static void AddPlexTvHeaders(HttpRequest request, string token)
+        {
+            request.Headers.Add("X-Plex-Token", token);
+            request.Headers.Add("X-Plex-Client-Identifier", PlexClientIdentifier);
+            request.Headers.Add("X-Plex-Product", PlexProduct);
+            request.Headers.Add("X-Plex-Platform", PlexPlatform);
+        }
+
+        private string? ExecutePlexTv(HttpRequest request)
+        {
+            for (var attempt = 0; attempt < SearchAttempts; attempt++)
+            {
+                try
+                {
+                    var response = _httpClient.Execute(request);
+                    if (response.StatusCode == System.Net.HttpStatusCode.OK && response.Content.IsNotNullOrWhiteSpace())
+                    {
+                        return response.Content;
+                    }
+
+                    if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    {
+                        _logger.Warn("Plex.tv rejected the token; cannot sync companion playlists to Plex Home users");
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug(ex, "Plex.tv request failed: {0}", request.Url);
+                }
+
+                if (attempt < SearchAttempts - 1)
+                {
+                    Thread.Sleep(RetryDelaysMs[Math.Min(attempt + 1, RetryDelaysMs.Length - 1)]);
+                }
+            }
+
+            return null;
+        }
+
+        private List<PlexHomeUser> GetHomeUsers(string ownerToken)
+        {
+            var content = GetHomeUsersJson(ownerToken);
+            if (content.IsNullOrWhiteSpace())
+            {
+                throw new InvalidOperationException("Plex.tv returned no home users payload");
+            }
+
+            return ParseHomeUsers(content!);
+        }
+
+        private string? GetOwnerUserId(string ownerToken)
+        {
+            var content = GetOwnerUserIdJson(ownerToken);
+            if (content.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var json = JToken.Parse(content!);
+            return json?["id"]?.Value<string>();
+        }
+
+        // Resolves a home member's server access token via the home-user switch + resources exchange.
+        // Used only for home members who don't appear in shared_servers (managed sub-accounts).
+        // PIN-protected users can't be switched without their PIN, so they resolve to null and are
+        // skipped by the caller.
+        private string? GetUserServerToken(PlexHomeUser user, string ownerToken, string machineId)
+        {
+            if (user.IsProtected)
+            {
+                _logger.Debug("Plex home user '{0}' is PIN-protected; cannot switch to obtain a server token", user.Title);
+                return null;
+            }
+
+            var switchedContent = SwitchHomeUser(user.Uuid, ownerToken);
+            if (switchedContent.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var authToken = ExtractAuthToken(switchedContent!);
+            if (authToken.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var resourcesContent = GetResourcesJson(authToken!);
+            if (resourcesContent.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var devices = ParseResources(resourcesContent!);
+            var match = devices.FirstOrDefault(d => string.Equals(d.ClientIdentifier, machineId, StringComparison.OrdinalIgnoreCase));
+            if (match == null)
+            {
+                _logger.Debug("Plex resources for home user '{0}' had no device matching machineId '{1}'", user.Title, machineId);
+            }
+
+            return match?.AccessToken;
+        }
+
+        // Fetches shared_servers once per sync pass and returns every user with library access plus
+        // their direct server access token. This legacy endpoint returns XML regardless of the Accept
+        // header: <MediaContainer><SharedServer id=".." username=".." userID=".." accessToken="..">.
+        private List<PlexSharedUser> GetSharedServerUsers(string ownerToken, string machineId)
+        {
+            var result = new List<PlexSharedUser>();
+            var content = GetSharedServersJson(machineId, ownerToken);
+            if (content.IsNullOrWhiteSpace())
+            {
+                return result;
+            }
+
+            var document = XDocument.Parse(content!);
+            var root = document.Root;
+            if (root == null)
+            {
+                return result;
+            }
+
+            foreach (var server in root.Elements("SharedServer"))
+            {
+                var userId = server.Attribute("userID")?.Value ?? "";
+                var username = server.Attribute("username")?.Value ?? server.Attribute("title")?.Value ?? "";
+                var token = server.Attribute("accessToken")?.Value ?? "";
+                if (userId.IsNullOrWhiteSpace())
+                {
+                    continue;
+                }
+
+                result.Add(new PlexSharedUser
+                {
+                    UserId = userId,
+                    Username = username,
+                    AccessToken = token,
+                    IsProtected = server.Attribute("protected")?.Value == "1",
+                    HasMusicShare = HasMusicSection(server)
+                });
+            }
+
+            return result;
+        }
+
+        // The shared_servers payload lists every library section shared with a user, each with a
+        // shared="1"/"0" flag. The music library is the artist-typed section titled "Music" (the
+        // same type the plugin resolves tracks against). A user only gets a companion playlist when
+        // the music library is actually shared with them; creating playlists for users without
+        // music access produces empty, useless playlists.
+        private static bool HasMusicSection(XElement server)
+        {
+            foreach (var section in server.Elements("Section"))
+            {
+                var type = section.Attribute("type")?.Value ?? "";
+                var title = section.Attribute("title")?.Value ?? "";
+                var shared = section.Attribute("shared")?.Value;
+                if (!string.Equals(type, "artist", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(title, "Music", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (shared == "1")
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private sealed class PlexSharedUser
+        {
+            public string UserId { get; set; } = "";
+            public string Username { get; set; } = "";
+            public string AccessToken { get; set; } = "";
+            public bool IsProtected { get; set; }
+
+            // True when the user's share includes the music (artist) library.
+            public bool HasMusicShare { get; set; }
+        }
+
+        private static string? ExtractAuthToken(string content)
+        {
+            if (content.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var json = JToken.Parse(content);
+            return json?["authToken"]?.Value<string>()
+                   ?? json?["user"]?["authToken"]?.Value<string>();
         }
 
         private List<string> ResolveRatingKeys(string baseUrl, PlexServerSettings plex, List<long> sectionIds, IReadOnlyList<PlayEventRecord> events)
@@ -570,5 +1096,21 @@ namespace SXMPlaylist.ImportLists
 
             return builder.ToString().Trim();
         }
+    }
+
+    // Result of a companion playlist sync: the owner's playlist rating key (created/updated with the
+    // Lidarr-configured token) plus per-home-user playlist keys for every other Plex Home member the
+    // plugin was able to reach. Users that couldn't be reached (PIN-protected, no library access, or
+    // plex.tv failures) are listed in SkippedUsers so the caller can surface them without failing.
+    public class PlexSyncResult
+    {
+        public string OwnerPlaylistRatingKey { get; set; } = "";
+
+        // Plex Home user id -> playlist ratingKey created in that user's account. Keyed by the stable
+        // user id (not the display name, which can collide or change).
+        public Dictionary<string, string> UserPlaylistRatingKeys { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        // Plex Home users that were skipped, each as "username: reason".
+        public List<string> SkippedUsers { get; } = new();
     }
 }

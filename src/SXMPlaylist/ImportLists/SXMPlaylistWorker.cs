@@ -238,9 +238,20 @@ namespace SXMPlaylist.ImportLists
                         _plexClient.SeedTrackCache(state.TrackCache);
                     }
 
-                    _plexClient.Sync(definition.Id, playlistTitle, events);
+                    var syncResult = _plexClient.Sync(definition.Id, playlistTitle, events);
 
-                    _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, state?.PlaylistRatingKey ?? "", DateTime.UtcNow, _plexClient.ExportTrackCache());
+                    // Only persist state when the owner playlist was actually found or created: a
+                    // failed pass leaves the stored rating key intact so the next cycle retries instead
+                    // of being throttled out by a fresh LastSyncUtc.
+                    if (syncResult.OwnerPlaylistRatingKey.IsNotNullOrWhiteSpace())
+                    {
+                        _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, syncResult.OwnerPlaylistRatingKey, DateTime.UtcNow, _plexClient.ExportTrackCache(), syncResult.UserPlaylistRatingKeys);
+                    }
+
+                    if (syncResult.SkippedUsers.Count > 0)
+                    {
+                        _logger.Warn("Companion Plex playlist '{0}' skipped {1} Plex Home user(s): {2}", playlistTitle, syncResult.SkippedUsers.Count, string.Join(", ", syncResult.SkippedUsers));
+                    }
                 }
                 catch (Exception ex)
                 {
