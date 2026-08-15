@@ -4,6 +4,7 @@ using System.Data.SQLite;
 using System.IO;
 using System.Linq;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 
@@ -856,7 +857,7 @@ namespace SXMPlaylist.ImportLists
             return result;
         }
 
-        public void UpsertPlexPlaylistState(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string>? trackCache = null, IReadOnlyDictionary<string, string>? userPlaylistKeys = null)
+        public void UpsertPlexPlaylistState(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, PlexTrackCacheRecord>? trackCache = null, IReadOnlyDictionary<string, string>? userPlaylistKeys = null)
         {
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
@@ -868,11 +869,11 @@ namespace SXMPlaylist.ImportLists
             command.Parameters.AddWithValue("@ratingKey", playlistRatingKey);
             command.Parameters.AddWithValue("@utc", lastSyncUtc.ToString("O"));
             command.Parameters.AddWithValue("@cache", SerializeTrackCache(trackCache));
-            command.Parameters.AddWithValue("@userKeys", SerializeTrackCache(userPlaylistKeys));
+            command.Parameters.AddWithValue("@userKeys", SerializeStringMap(userPlaylistKeys));
             command.ExecuteNonQuery();
         }
 
-        private static string SerializeTrackCache(IReadOnlyDictionary<string, string>? trackCache)
+        private static string SerializeTrackCache(IReadOnlyDictionary<string, PlexTrackCacheRecord>? trackCache)
         {
             if (trackCache == null || trackCache.Count == 0)
             {
@@ -882,22 +883,54 @@ namespace SXMPlaylist.ImportLists
             return JsonConvert.SerializeObject(trackCache);
         }
 
-        private static Dictionary<string, string> DeserializeTrackCache(string? json)
+        private static Dictionary<string, PlexTrackCacheRecord> DeserializeTrackCache(string? json)
         {
             if (json.IsNullOrWhiteSpace())
             {
-                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                return new Dictionary<string, PlexTrackCacheRecord>(StringComparer.OrdinalIgnoreCase);
             }
 
             try
             {
-                return JsonConvert.DeserializeObject<Dictionary<string, string>>(json!)
-                       ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var parsed = JObject.Parse(json!);
+                var result = new Dictionary<string, PlexTrackCacheRecord>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var property in parsed.Properties())
+                {
+                    if (property.Value.Type == JTokenType.String)
+                    {
+                        var ratingKey = property.Value.Value<string>();
+                        if (ratingKey.IsNotNullOrWhiteSpace())
+                        {
+                            result[property.Name] = new PlexTrackCacheRecord(ratingKey!, null, null, null, null, "cache", "unknown");
+                        }
+                    }
+                    else if (property.Value.Type == JTokenType.Object)
+                    {
+                        var record = property.Value.ToObject<PlexTrackCacheRecord>();
+                        if (record?.RatingKey.IsNotNullOrWhiteSpace() == true)
+                        {
+                            result[property.Name] = record;
+                        }
+                    }
+                }
+
+                return result;
             }
             catch (Exception)
             {
-                return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                return new Dictionary<string, PlexTrackCacheRecord>(StringComparer.OrdinalIgnoreCase);
             }
+        }
+
+        private static string SerializeStringMap(IReadOnlyDictionary<string, string>? values)
+        {
+            if (values == null || values.Count == 0)
+            {
+                return "{}";
+            }
+
+            return JsonConvert.SerializeObject(values);
         }
 
         private static Dictionary<string, string> DeserializeStringMap(string? json)
@@ -1323,6 +1356,28 @@ namespace SXMPlaylist.ImportLists
         public string Confidence { get; }
     }
 
+    public class PlexTrackCacheRecord
+    {
+        public PlexTrackCacheRecord(string ratingKey, string? artist, string? title, string? album, string? guid, string matchMethod, string confidence)
+        {
+            RatingKey = ratingKey;
+            Artist = artist;
+            Title = title;
+            Album = album;
+            Guid = guid;
+            MatchMethod = matchMethod;
+            Confidence = confidence;
+        }
+
+        public string RatingKey { get; }
+        public string? Artist { get; }
+        public string? Title { get; }
+        public string? Album { get; }
+        public string? Guid { get; }
+        public string MatchMethod { get; }
+        public string Confidence { get; }
+    }
+
     public class ChannelInfo
     {
         public ChannelInfo(string deeplink, string name, string? number)
@@ -1370,7 +1425,7 @@ namespace SXMPlaylist.ImportLists
 
     public class PlexPlaylistStateRecord
     {
-        public PlexPlaylistStateRecord(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, string> trackCache, IReadOnlyDictionary<string, string> userPlaylistKeys)
+        public PlexPlaylistStateRecord(long listId, string playlistTitle, string playlistRatingKey, DateTime lastSyncUtc, IReadOnlyDictionary<string, PlexTrackCacheRecord> trackCache, IReadOnlyDictionary<string, string> userPlaylistKeys)
         {
             ListId = listId;
             PlaylistTitle = playlistTitle;
@@ -1384,7 +1439,7 @@ namespace SXMPlaylist.ImportLists
         public string PlaylistTitle { get; }
         public string PlaylistRatingKey { get; }
         public DateTime LastSyncUtc { get; }
-        public IReadOnlyDictionary<string, string> TrackCache { get; }
+        public IReadOnlyDictionary<string, PlexTrackCacheRecord> TrackCache { get; }
 
         // Plex Home username -> playlist ratingKey for the fan-out copies.
         public IReadOnlyDictionary<string, string> UserPlaylistKeys { get; }

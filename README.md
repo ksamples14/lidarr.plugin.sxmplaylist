@@ -11,12 +11,13 @@
 3. [How It Works](#how-it-works)
 4. [Album Resolution](#album-resolution)
 5. [Channel List](#channel-list)
-6. [Play History](#play-history)
-7. [Multiple Lists & API Limiting](#multiple-lists--api-limiting)
-8. [Troubleshooting](#troubleshooting)
-9. [Building From Source](#building-from-source)
-10. [API Usage Notes](#api-usage-notes)
-11. [Roadmap](#roadmap)
+6. [Companion Plex Playlists](#companion-plex-playlists)
+7. [Play History](#play-history)
+8. [Multiple Lists & API Limiting](#multiple-lists--api-limiting)
+9. [Troubleshooting](#troubleshooting)
+10. [Building From Source](#building-from-source)
+11. [API Usage Notes](#api-usage-notes)
+12. [Roadmap](#roadmap)
 
 ## Installation
 
@@ -46,7 +47,14 @@
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Channel | *(empty, required)* | A dropdown of every SiriusXM channel xmplaylist tracks (e.g. "36 - Alt Nation"). One list = one channel — add one import list per channel you want to monitor. |
+| Channel | *(empty, required)* | A dropdown of every SiriusXM channel xmplaylist tracks (e.g. "36 - Alt Nation"). Multiple lists can target the same channel if each selects a different show. |
+| Show | Channel | Optional show filter from SiriusXM EPG data. Leave as Channel to import the full channel. |
+| Require MusicBrainz ID | No | Only import albums that already have a MusicBrainz album ID. Title-only fallbacks can still be retried later. |
+| Minimum Plays | 1 | Minimum number of times a track must have aired in the selected history window before its album is imported. |
+| Albums Per Day | 24 | Maximum new albums added per day, spread across 24 hours. Set to `0` for unlimited. |
+| Release Priority | Singles | When both single and album releases exist for a recording, choose which release type to prefer. |
+| Companion Plex Playlist | No | Create and maintain a Plex playlist mirroring this import list's recent plays. Requires a Plex connection in Lidarr's Settings > Connect. |
+| Plex Playlist History Days | 1 | Number of days of play history to include in the companion Plex playlist, capped by the 1-year local retention window. |
 
 The Channel dropdown populates itself automatically whenever you open the Add/Edit dialog — no separate button to press. It's backed by a small cache (see [Channel List](#channel-list) below) so opening the dialog doesn't hit xmplaylist.com every time.
 
@@ -59,6 +67,7 @@ SXM Playlist runs a background worker that checks each configured channel about 
 1. **Capture.** The worker checks each channel's play feed every hour and records the plays it hasn't seen before.
 2. **Resolve.** Each new track's album is looked up in the background, retried up to 3 times before giving up.
 3. **Present.** Lidarr polls each import list hourly; the list returns resolved tracks from the last 25 hours, which Lidarr adds to your library. Duplicate plays are skipped.
+4. **Playlist.** If enabled, the worker periodically mirrors recent plays from that list into a companion Plex playlist.
 
 <details>
 <summary>How the feed is captured (technical detail)</summary>
@@ -85,17 +94,30 @@ xmplaylist's own frontend derives its channel picker from `/api/station` (distin
 
 The fetched list is cached (in the same history database) rather than re-fetched every time the Add/Edit dialog opens. It's treated as stale after 24 hours — SiriusXM's lineup doesn't change often — at which point the next dialog open refreshes it automatically before serving the dropdown. If that refresh fails (network hiccup, xmplaylist down), the plugin falls back to whatever was cached rather than leaving the dropdown empty.
 
+## Companion Plex Playlists
+
+When **Companion Plex Playlist** is enabled on an import list, the background worker builds a Plex playlist from that list's recent SXM play events. The playlist uses newest plays first and collapses duplicate Plex rating keys so repeated airings do not produce repeated playlist entries.
+
+The plugin finds Plex configuration through Lidarr's normal Connect settings. It talks to Plex through Plex HTTP APIs and does not read Plex's database directly. If Plex Home or shared users have access to the music library, the plugin can fan out playlist copies for those users. Plex.tv account discovery is cached for 24 hours, and companion playlist syncs run about every 6 hours.
+
+Each playlist sync records an audit row per SXM play considered in `PlexPlaylistTrackMatches`. Audit rows include SXM play identity, MusicBrainz recording/ISRC trace fields when known, Plex rating key, Plex artist/title/album/guid, match method, and confidence. These rows are retained for the same 1-year window as play history.
+
+Plex search results are cached per import list in `PlexPlaylistState.TrackCacheJson` to avoid re-searching the same artist/title pair every sync. The cache stores the Plex rating key plus the Plex metadata used for audit rows. Older string-only cache rows are still readable and are upgraded naturally the next time a playlist is synced after a fresh Plex search.
+
 ## Play History
 
-The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album and MusicBrainz IDs once resolved, plus a 3-strike failure counter) and a per-channel "last captured" marker. This serves three purposes:
+The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album and MusicBrainz IDs once resolved, plus a 3-strike failure counter), per-channel "last captured" markers, companion Plex playlist state, and playlist match audit rows. This serves four purposes:
 
 - **Dedup** — duplicate plays are skipped, so overlapping capture windows never duplicate an import.
 - **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks become presentable to Lidarr for the next 25 hours.
-- **Future feature** — the play history will power a planned per-station Plex playlist feature, so it's kept independently of whatever Lidarr decides to do with the artist.
+- **Plex playlists** — companion playlists use play history to mirror what aired on a channel or show.
+- **Auditability** — playlist match rows explain which SXM play mapped to which Plex track, with match method and confidence.
 
-Play rows older than **1 year** are pruned by the background worker, along with tracks whose plays have fallen out of the window.
+Play rows older than **1 year** are pruned by the background worker, along with tracks, play events, show windows, and Plex playlist audit rows whose timestamps have fallen out of the window.
 
 The database uses `System.Data.SQLite` — the same SQLite provider Lidarr itself ships with — referenced from `lib/` the same way as the other host DLLs, so no new native binary is bundled with the plugin (see [Building From Source](#building-from-source)).
+
+The plugin does not assume Lidarr uses SQLite or Postgres internally, and it does not read Lidarr's application database directly. Its durable plugin state lives in its own SQLite database under `SXMPlaylist/history.db`.
 
 ## Multiple Lists & API Limiting
 
@@ -149,8 +171,10 @@ lidarr.plugin.sxmplaylist/
 │       ├── SXMPlaylistRequestBuilder.cs        # shared HttpRequest construction (headers)
 │       ├── SXMPlaylistStationBackfill.cs       # cursor pagination to cover the capture window
 │       ├── SXMPlaylistFeed.cs                  # xmplaylist feed JSON models
-│       ├── SXMPlaylistHistoryStore.cs          # SQLite: plays, tracks, channel state (WAL)
+│       ├── SXMPlaylistHistoryStore.cs          # SQLite: plays, tracks, Plex state/audit (WAL)
 │       ├── SXMPlaylistAlbumResolver.cs         # Deezer/MusicBrainz/Apple album lookup
+│       ├── SXMPlaylistPlexClient.cs            # Plex matching, playlist sync, fan-out
+│       ├── SXMPlaylistTitleNormalizer.cs       # shared title suffix stripping
 │       ├── SXMPlaylistRefreshScheduler.cs      # RefreshArtistCommand after newly-monitored albums
 │       ├── SXMPlaylistChannelDirectory.cs      # /api/station channel list lookup
 │       └── SXMPlaylistFeedCache.cs            # shared in-process HTTP cache (limits API hits)
@@ -167,10 +191,11 @@ lidarr.plugin.sxmplaylist/
 - Lidarr matches artists (and unresolved albums) by name, so accuracy depends on consistent naming
 - Deezer's API (`api.deezer.com`), Apple's iTunes Lookup API (`itunes.apple.com`), and MusicBrainz's web service (`musicbrainz.org/ws/2`) are all free and require no authentication either — see [Album Resolution](#album-resolution)
 - `/api/station` (no channel suffix) is a separate endpoint from `/api/station/{channel}` — it lists every channel instead of that channel's plays — see [Channel List](#channel-list)
+- Plex playlist sync uses the Plex server API and Plex.tv account APIs when fan-out to shared/Home users is needed. Plex.tv user discovery is cached for 24 hours; playlist track search results are cached per import list.
 
 ## Roadmap
 
-- **Plex playlist per station.** Build a per-station Plex playlist from play history, so what's playing on a channel in Lidarr's library can be listened to as a Plex playlist.
+- **Plex match confidence improvements.** Use the collected playlist audit data to improve matching where Plex exposes enough portable identity data. Current Plex GUIDs are generally opaque `plex://track/...` values, so MusicBrainz-aware matching remains a future enhancement rather than an assumption.
 - **Additional metadata providers (Last.fm, Discogs).** Album resolution currently tries Deezer/MusicBrainz then Apple. Adding more sources would catch tracks neither of those has, especially lesser-known or non-mainstream artists.
 
 ## License

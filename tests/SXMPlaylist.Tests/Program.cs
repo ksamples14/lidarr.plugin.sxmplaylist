@@ -104,6 +104,7 @@ internal static class Program
         TestStoreUpsertsTrackAndResolvesToPresentable();
         TestStorePersistsResolutionTraceIdentifiers();
         TestStoreRecordsPlexPlaylistTrackMatches();
+        TestStoreReadsLegacyPlexTrackCache();
         TestStoreThreeStrikesExcludesTrack();
         TestStorePresentableWindowExpires();
         TestStoreRequireMbidFiltersBeforeLimit();
@@ -1843,6 +1844,32 @@ internal static class Program
         Assert("confidence persisted", reader.GetString(8) == "high");
     }
 
+    private static void TestStoreReadsLegacyPlexTrackCache()
+    {
+        Console.WriteLine("\n[Test] Store reads legacy string-only Plex track cache rows");
+
+        var folder = NewFolder();
+        _ = new SXMPlaylistHistoryStore(folder);
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        using (var connection = new SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var command = new SQLiteCommand(
+                "INSERT INTO PlexPlaylistState (ListId, PlaylistTitle, PlaylistRatingKey, LastSyncUtc, TrackCacheJson, UserPlaylistKeysJson) " +
+                "VALUES (42, 'SXM Alt Nation', '500', @utc, '{\"Kool & The Gang||Celebration\":\"100\"}', '{}')",
+                connection);
+            command.Parameters.AddWithValue("@utc", DateTime.UtcNow.ToString("O"));
+            command.ExecuteNonQuery();
+        }
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var state = store.GetPlexPlaylistState(42);
+
+        Assert("legacy cache state read", state != null);
+        Assert("legacy rating key preserved", state!.TrackCache["Kool & The Gang||Celebration"].RatingKey == "100");
+        Assert("legacy cache confidence marked unknown", state.TrackCache["Kool & The Gang||Celebration"].Confidence == "unknown");
+    }
+
     private static void TestStorePresentableWindowExpires()
     {
         Console.WriteLine("\n[Test] A resolved track falls out of the presentation window after 25 hours");
@@ -2563,11 +2590,15 @@ internal static class Program
 
         var httpClient = NewPlexEnvironment(trackTitle: "Celebration", trackArtist: "Kool & The Gang");
         var client = NewPlexClient(httpClient);
-        client.SeedTrackCache(new Dictionary<string, string> { ["Kool & The Gang||Celebration"] = "100" });
+        client.SeedTrackCache(new Dictionary<string, PlexTrackCacheRecord>
+        {
+            ["Kool & The Gang||Celebration"] = new("100", "Kool & The Gang", "Celebration", "Celebrate!", "plex://track/100", "exact-title-artist", "high")
+        });
         client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
 
         Assert("no library search request when the pair is cached", !httpClient.RequestUrls.Any(u => u.Contains("/library/sections/1/all")));
-        Assert("cached rating key exported for persistence", client.ExportTrackCache()["Kool & The Gang||Celebration"] == "100");
+        Assert("cached rating key exported for persistence", client.ExportTrackCache()["Kool & The Gang||Celebration"].RatingKey == "100");
+        Assert("cached Plex metadata exported for audit", client.ExportTrackCache()["Kool & The Gang||Celebration"].Guid == "plex://track/100");
     }
 
     private static void TestPlexRetriesTransientSearchFailure()
