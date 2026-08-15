@@ -93,7 +93,7 @@ The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db
 - **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks become presentable to Lidarr for the next 25 hours.
 - **Future feature** — the play history will power a planned per-station Plex playlist feature, so it's kept independently of whatever Lidarr decides to do with the artist.
 
-Play rows older than **180 days** are pruned by the background worker, along with tracks whose plays have fallen out of the window.
+Play rows older than **1 year** are pruned by the background worker, along with tracks whose plays have fallen out of the window.
 
 The database uses `System.Data.SQLite` — the same SQLite provider Lidarr itself ships with — referenced from `lib/` the same way as the other host DLLs, so no new native binary is bundled with the plugin (see [Building From Source](#building-from-source)).
 

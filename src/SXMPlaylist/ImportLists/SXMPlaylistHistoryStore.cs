@@ -27,7 +27,7 @@ namespace SXMPlaylist.ImportLists
     /// </summary>
     public class SXMPlaylistHistoryStore
     {
-        public static readonly TimeSpan PlayRetention = TimeSpan.FromDays(180);
+        public static readonly TimeSpan PlayRetention = TimeSpan.FromDays(365);
         public static readonly TimeSpan CaptureInterval = TimeSpan.FromHours(1);
         public static readonly TimeSpan PresentationWindow = TimeSpan.FromHours(25);
         public static readonly int MaxResolutionFailures = 3;
@@ -178,6 +178,9 @@ namespace SXMPlaylist.ImportLists
                 "Album TEXT, " +
                 "ArtistMusicBrainzId TEXT, " +
                 "AlbumMusicBrainzId TEXT, " +
+                "RecordingMusicBrainzId TEXT, " +
+                "Isrc TEXT, " +
+                "ResolutionMethod TEXT, " +
                 "ResolvedUtc TEXT, " +
                 "NextRetryUtc TEXT, " +
                 "RetryAttempts INTEGER NOT NULL DEFAULT 0)",
@@ -190,6 +193,9 @@ namespace SXMPlaylist.ImportLists
             // of rows). Idempotent: skips when the column already exists, safe to run every start.
             var addedNextRetry = EnsureColumn(connection, "Tracks", "NextRetryUtc", "TEXT");
             var addedRetryAttempts = EnsureColumn(connection, "Tracks", "RetryAttempts", "INTEGER NOT NULL DEFAULT 0");
+            EnsureColumn(connection, "Tracks", "RecordingMusicBrainzId", "TEXT");
+            EnsureColumn(connection, "Tracks", "Isrc", "TEXT");
+            EnsureColumn(connection, "Tracks", "ResolutionMethod", "TEXT");
 
             // Only when this is a genuine first migration (a column was just added): historical
             // no-MBID rows have NextRetryUtc = NULL, which GetDueRetries would treat as immediately
@@ -292,6 +298,38 @@ namespace SXMPlaylist.ImportLists
             // Upgrade databases created before the track cache / user keys columns existed (idempotent).
             EnsureColumn(connection, "PlexPlaylistState", "TrackCacheJson", "TEXT NOT NULL DEFAULT '{}'");
             EnsureColumn(connection, "PlexPlaylistState", "UserPlaylistKeysJson", "TEXT NOT NULL DEFAULT '{}'");
+
+            using (var command = new SQLiteCommand(
+                "CREATE TABLE IF NOT EXISTS PlexPlaylistTrackMatches (" +
+                "Id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                "ListId INTEGER NOT NULL, " +
+                "SyncUtc TEXT NOT NULL, " +
+                "PlayId TEXT NOT NULL, " +
+                "SxmTrackId TEXT, " +
+                "Channel TEXT NOT NULL, " +
+                "Artist TEXT NOT NULL, " +
+                "Song TEXT NOT NULL, " +
+                "TimestampUtc TEXT NOT NULL, " +
+                "RecordingMusicBrainzId TEXT, " +
+                "Isrc TEXT, " +
+                "PlexRatingKey TEXT, " +
+                "PlexArtist TEXT, " +
+                "PlexTitle TEXT, " +
+                "PlexAlbum TEXT, " +
+                "PlexGuid TEXT, " +
+                "MatchMethod TEXT NOT NULL, " +
+                "Confidence TEXT NOT NULL)",
+                connection))
+            {
+                command.ExecuteNonQuery();
+            }
+
+            using (var command = new SQLiteCommand(
+                "CREATE INDEX IF NOT EXISTS IX_PlexPlaylistTrackMatches_List_Time ON PlexPlaylistTrackMatches (ListId, SyncUtc)",
+                connection))
+            {
+                command.ExecuteNonQuery();
+            }
         }
 
         // Adds a column to an existing table if it isn't present. Used to upgrade databases created
@@ -550,6 +588,9 @@ namespace SXMPlaylist.ImportLists
                 "Album = CASE WHEN @priority = @singles THEN @album ELSE Album END, " +
                 "ArtistMusicBrainzId = CASE WHEN @priority = @singles THEN @artistMbid ELSE ArtistMusicBrainzId END, " +
                 "AlbumMusicBrainzId = CASE WHEN @priority = @singles THEN @albumMbid ELSE AlbumMusicBrainzId END, " +
+                "RecordingMusicBrainzId = COALESCE(@recordingMbid, RecordingMusicBrainzId), " +
+                "Isrc = COALESCE(@isrc, Isrc), " +
+                "ResolutionMethod = COALESCE(@resolutionMethod, ResolutionMethod), " +
                 "ResolvedUtc = @resolvedUtc, " +
                 "NextRetryUtc = CASE WHEN EXISTS (SELECT 1 FROM TrackResolutions r WHERE r.TrackId = Tracks.TrackId AND r.AlbumMusicBrainzId IS NULL) THEN @nextRetry ELSE NULL END " +
                 "WHERE TrackId = @trackId",
@@ -561,6 +602,9 @@ namespace SXMPlaylist.ImportLists
                 command.Parameters.AddWithValue("@album", (object?)resolution.Album ?? DBNull.Value);
                 command.Parameters.AddWithValue("@artistMbid", (object?)resolution.ArtistMusicBrainzId ?? DBNull.Value);
                 command.Parameters.AddWithValue("@albumMbid", (object?)resolution.AlbumMusicBrainzId ?? DBNull.Value);
+                command.Parameters.AddWithValue("@recordingMbid", (object?)resolution.RecordingMusicBrainzId ?? DBNull.Value);
+                command.Parameters.AddWithValue("@isrc", (object?)resolution.Isrc ?? DBNull.Value);
+                command.Parameters.AddWithValue("@resolutionMethod", (object?)resolution.ResolutionMethod ?? DBNull.Value);
                 command.Parameters.AddWithValue("@resolvedUtc", resolvedAt.ToString("O"));
                 command.Parameters.AddWithValue("@nextRetry", resolvedAt.Add(RetryInterval).ToString("O"));
                 command.Parameters.AddWithValue("@trackId", trackId);
@@ -920,6 +964,12 @@ namespace SXMPlaylist.ImportLists
                 command.ExecuteNonQuery();
             }
 
+            using (var command = new SQLiteCommand("DELETE FROM PlexPlaylistTrackMatches WHERE SyncUtc < @cutoff", connection, transaction))
+            {
+                command.Parameters.AddWithValue("@cutoff", cutoff.ToString("O"));
+                command.ExecuteNonQuery();
+            }
+
             transaction.Commit();
         }
 
@@ -956,9 +1006,9 @@ namespace SXMPlaylist.ImportLists
 
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
-                "SELECT PlayEventId, PlayId, Channel, TrackId, Artist, Song, TimestampUtc, ProgramId, ShowName, ShowStartUtc, ShowEndUtc " +
-                "FROM PlayEvents WHERE Channel = @channel AND TimestampUtc >= @since AND TimestampUtc < @until" + showFilter +
-                " ORDER BY TimestampUtc",
+                "SELECT p.PlayEventId, p.PlayId, p.Channel, p.TrackId, p.Artist, p.Song, p.TimestampUtc, p.ProgramId, p.ShowName, p.ShowStartUtc, p.ShowEndUtc, t.RecordingMusicBrainzId, t.Isrc " +
+                "FROM PlayEvents p LEFT JOIN Tracks t ON t.TrackId = p.TrackId WHERE p.Channel = @channel AND p.TimestampUtc >= @since AND p.TimestampUtc < @until" + showFilter +
+                " ORDER BY p.TimestampUtc",
                 connection);
             command.Parameters.AddWithValue("@channel", channel);
             command.Parameters.AddWithValue("@since", sinceUtc.ToString("O"));
@@ -982,10 +1032,52 @@ namespace SXMPlaylist.ImportLists
                     reader.IsDBNull(7) ? null : reader.GetString(7),
                     reader.IsDBNull(8) ? null : reader.GetString(8),
                     reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9)).ToUniversalTime(),
-                    reader.IsDBNull(10) ? null : DateTime.Parse(reader.GetString(10)).ToUniversalTime()));
+                    reader.IsDBNull(10) ? null : DateTime.Parse(reader.GetString(10)).ToUniversalTime(),
+                    reader.IsDBNull(11) ? null : reader.GetString(11),
+                    reader.IsDBNull(12) ? null : reader.GetString(12)));
             }
 
             return results;
+        }
+
+        public void RecordPlexPlaylistTrackMatches(long listId, DateTime syncUtc, IReadOnlyList<PlexPlaylistTrackMatchRecord> matches)
+        {
+            if (matches == null || matches.Count == 0)
+            {
+                return;
+            }
+
+            using var connection = OpenConnection();
+            using var transaction = connection.BeginTransaction();
+            foreach (var match in matches)
+            {
+                using var command = new SQLiteCommand(
+                    "INSERT INTO PlexPlaylistTrackMatches (ListId, SyncUtc, PlayId, SxmTrackId, Channel, Artist, Song, TimestampUtc, RecordingMusicBrainzId, Isrc, PlexRatingKey, PlexArtist, PlexTitle, PlexAlbum, PlexGuid, MatchMethod, Confidence) " +
+                    "VALUES (@listId, @syncUtc, @playId, @sxmTrackId, @channel, @artist, @song, @timestampUtc, @recordingMbid, @isrc, @plexRatingKey, @plexArtist, @plexTitle, @plexAlbum, @plexGuid, @matchMethod, @confidence)",
+                    connection,
+                    transaction);
+
+                command.Parameters.AddWithValue("@listId", listId);
+                command.Parameters.AddWithValue("@syncUtc", syncUtc.ToString("O"));
+                command.Parameters.AddWithValue("@playId", match.PlayId);
+                command.Parameters.AddWithValue("@sxmTrackId", (object?)match.SxmTrackId ?? DBNull.Value);
+                command.Parameters.AddWithValue("@channel", match.Channel);
+                command.Parameters.AddWithValue("@artist", match.Artist);
+                command.Parameters.AddWithValue("@song", match.Song);
+                command.Parameters.AddWithValue("@timestampUtc", match.TimestampUtc.ToString("O"));
+                command.Parameters.AddWithValue("@recordingMbid", (object?)match.RecordingMusicBrainzId ?? DBNull.Value);
+                command.Parameters.AddWithValue("@isrc", (object?)match.Isrc ?? DBNull.Value);
+                command.Parameters.AddWithValue("@plexRatingKey", (object?)match.PlexRatingKey ?? DBNull.Value);
+                command.Parameters.AddWithValue("@plexArtist", (object?)match.PlexArtist ?? DBNull.Value);
+                command.Parameters.AddWithValue("@plexTitle", (object?)match.PlexTitle ?? DBNull.Value);
+                command.Parameters.AddWithValue("@plexAlbum", (object?)match.PlexAlbum ?? DBNull.Value);
+                command.Parameters.AddWithValue("@plexGuid", (object?)match.PlexGuid ?? DBNull.Value);
+                command.Parameters.AddWithValue("@matchMethod", match.MatchMethod);
+                command.Parameters.AddWithValue("@confidence", match.Confidence);
+                command.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
         }
 
         // Null if the channel list has never been cached.
@@ -1144,7 +1236,9 @@ namespace SXMPlaylist.ImportLists
             string? programId,
             string? showName,
             DateTime? showStartUtc,
-            DateTime? showEndUtc)
+            DateTime? showEndUtc,
+            string? recordingMusicBrainzId = null,
+            string? isrc = null)
         {
             PlayEventId = playEventId;
             PlayId = playId;
@@ -1157,6 +1251,8 @@ namespace SXMPlaylist.ImportLists
             ShowName = showName;
             ShowStartUtc = showStartUtc;
             ShowEndUtc = showEndUtc;
+            RecordingMusicBrainzId = recordingMusicBrainzId;
+            Isrc = isrc;
         }
 
         public long PlayEventId { get; }
@@ -1170,6 +1266,61 @@ namespace SXMPlaylist.ImportLists
         public string? ShowName { get; }
         public DateTime? ShowStartUtc { get; }
         public DateTime? ShowEndUtc { get; }
+        public string? RecordingMusicBrainzId { get; }
+        public string? Isrc { get; }
+    }
+
+    public class PlexPlaylistTrackMatchRecord
+    {
+        public PlexPlaylistTrackMatchRecord(
+            string playId,
+            string? sxmTrackId,
+            string channel,
+            string artist,
+            string song,
+            DateTime timestampUtc,
+            string? recordingMusicBrainzId,
+            string? isrc,
+            string? plexRatingKey,
+            string? plexArtist,
+            string? plexTitle,
+            string? plexAlbum,
+            string? plexGuid,
+            string matchMethod,
+            string confidence)
+        {
+            PlayId = playId;
+            SxmTrackId = sxmTrackId;
+            Channel = channel;
+            Artist = artist;
+            Song = song;
+            TimestampUtc = timestampUtc;
+            RecordingMusicBrainzId = recordingMusicBrainzId;
+            Isrc = isrc;
+            PlexRatingKey = plexRatingKey;
+            PlexArtist = plexArtist;
+            PlexTitle = plexTitle;
+            PlexAlbum = plexAlbum;
+            PlexGuid = plexGuid;
+            MatchMethod = matchMethod;
+            Confidence = confidence;
+        }
+
+        public string PlayId { get; }
+        public string? SxmTrackId { get; }
+        public string Channel { get; }
+        public string Artist { get; }
+        public string Song { get; }
+        public DateTime TimestampUtc { get; }
+        public string? RecordingMusicBrainzId { get; }
+        public string? Isrc { get; }
+        public string? PlexRatingKey { get; }
+        public string? PlexArtist { get; }
+        public string? PlexTitle { get; }
+        public string? PlexAlbum { get; }
+        public string? PlexGuid { get; }
+        public string MatchMethod { get; }
+        public string Confidence { get; }
     }
 
     public class ChannelInfo
@@ -1190,18 +1341,31 @@ namespace SXMPlaylist.ImportLists
     {
         public static readonly AlbumResolution NotFound = new(false, null, null, null);
 
-        public AlbumResolution(bool resolved, string? album, string? artistMusicBrainzId, string? albumMusicBrainzId)
+        public AlbumResolution(
+            bool resolved,
+            string? album,
+            string? artistMusicBrainzId,
+            string? albumMusicBrainzId,
+            string? recordingMusicBrainzId = null,
+            string? isrc = null,
+            string? resolutionMethod = null)
         {
             Resolved = resolved;
             Album = album;
             ArtistMusicBrainzId = artistMusicBrainzId;
             AlbumMusicBrainzId = albumMusicBrainzId;
+            RecordingMusicBrainzId = recordingMusicBrainzId;
+            Isrc = isrc;
+            ResolutionMethod = resolutionMethod;
         }
 
         public bool Resolved { get; }
         public string? Album { get; }
         public string? ArtistMusicBrainzId { get; }
         public string? AlbumMusicBrainzId { get; }
+        public string? RecordingMusicBrainzId { get; }
+        public string? Isrc { get; }
+        public string? ResolutionMethod { get; }
     }
 
     public class PlexPlaylistStateRecord

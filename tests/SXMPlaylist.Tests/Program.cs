@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Linq.Expressions;
 using System.Threading;
+using System.Data.SQLite;
 using FluentValidation.Results;
 using NLog;
 using NzbDrone.Common.EnvironmentInfo;
@@ -101,6 +102,8 @@ internal static class Program
         TestStoreAssociatesPlayEventsWithShowWindows();
         TestStorePlayEventsCanBeQueriedByRangeAndShow();
         TestStoreUpsertsTrackAndResolvesToPresentable();
+        TestStorePersistsResolutionTraceIdentifiers();
+        TestStoreRecordsPlexPlaylistTrackMatches();
         TestStoreThreeStrikesExcludesTrack();
         TestStorePresentableWindowExpires();
         TestStoreRequireMbidFiltersBeforeLimit();
@@ -108,6 +111,7 @@ internal static class Program
         TestStoreLimitCapsPresentationRows();
         TestStorePruneRemovesOldData();
         TestStorePruneRemovesOldPlayEventsAndShowWindows();
+        TestStorePruneRemovesOldPlexPlaylistTrackMatches();
         TestStoreHistoryRetentionFiltersQueryOnly();
         TestStoreSchedulesRetryForNoMbidTrack();
         TestStoreRetryGivesUpAfterMaxAttempts();
@@ -128,6 +132,7 @@ internal static class Program
         TestWorkerIdlesWithNoChannels();
 
         TestPlexExactTitleMatch();
+        TestPlexSyncReturnsTrackMatchAudit();
         TestPlexFeatCreditStrippedFromArtist();
         TestPlexFuzzyTitleVersionMatch();
         TestPlexRetriesSearchWithStrippedTitleSuffix();
@@ -825,6 +830,9 @@ internal static class Program
         Assert("resolved to a real title", resolution.Album == "No Code");
         Assert("album MBID attached", resolution.AlbumMusicBrainzId == "album-mbid-1");
         Assert("artist MBID attached", resolution.ArtistMusicBrainzId == "artist-mbid-1");
+        Assert("recording MBID attached", resolution.RecordingMusicBrainzId == "rec-1");
+        Assert("ISRC attached", resolution.Isrc == "USSM19601763");
+        Assert("resolution method records ISRC path", resolution.ResolutionMethod == "isrc");
         Assert("Deezer, ISRC, and recording endpoints were each called once", httpClient.CallCount == 3);
     }
 
@@ -1765,6 +1773,76 @@ internal static class Program
         Assert("track excluded from due set after 3 failures", store.GetDueTracks(10).Count == 0);
     }
 
+    private static void TestStorePersistsResolutionTraceIdentifiers()
+    {
+        Console.WriteLine("\n[Test] Store persists trace identifiers from track resolution");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1", "recording-mbid-1", "USSM19601763", "isrc"), now);
+
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        using var connection = new SQLiteConnection($"Data Source={dbPath};Version=3;");
+        connection.Open();
+        using var command = new SQLiteCommand("SELECT RecordingMusicBrainzId, Isrc, ResolutionMethod FROM Tracks WHERE TrackId = 'track1'", connection);
+        using var reader = command.ExecuteReader();
+
+        Assert("trace row exists", reader.Read());
+        Assert("recording MBID persisted", reader.GetString(0) == "recording-mbid-1");
+        Assert("ISRC persisted", reader.GetString(1) == "USSM19601763");
+        Assert("resolution method persisted", reader.GetString(2) == "isrc");
+    }
+
+    private static void TestStoreRecordsPlexPlaylistTrackMatches()
+    {
+        Console.WriteLine("\n[Test] Store records Plex playlist track match audit rows");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var syncUtc = DateTime.UtcNow;
+        var playUtc = syncUtc.AddMinutes(-5);
+
+        store.RecordPlexPlaylistTrackMatches(42, syncUtc, new[]
+        {
+            new PlexPlaylistTrackMatchRecord(
+                "play1",
+                "track1",
+                "altnation",
+                "Kool & The Gang",
+                "Celebration",
+                playUtc,
+                "recording-mbid-1",
+                "USDE12345678",
+                "100",
+                "Kool & The Gang",
+                "Celebration",
+                "Celebrate!",
+                "mbid://plex-guid-1",
+                "exact-title-artist",
+                "high")
+        });
+
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        using var connection = new SQLiteConnection($"Data Source={dbPath};Version=3;");
+        connection.Open();
+        using var command = new SQLiteCommand("SELECT ListId, PlayId, SxmTrackId, RecordingMusicBrainzId, Isrc, PlexRatingKey, PlexGuid, MatchMethod, Confidence FROM PlexPlaylistTrackMatches", connection);
+        using var reader = command.ExecuteReader();
+
+        Assert("audit row exists", reader.Read());
+        Assert("list id persisted", reader.GetInt64(0) == 42);
+        Assert("play id persisted", reader.GetString(1) == "play1");
+        Assert("SXM track id persisted", reader.GetString(2) == "track1");
+        Assert("recording MBID persisted in audit", reader.GetString(3) == "recording-mbid-1");
+        Assert("ISRC persisted in audit", reader.GetString(4) == "USDE12345678");
+        Assert("Plex rating key persisted", reader.GetString(5) == "100");
+        Assert("Plex guid persisted", reader.GetString(6) == "mbid://plex-guid-1");
+        Assert("match method persisted", reader.GetString(7) == "exact-title-artist");
+        Assert("confidence persisted", reader.GetString(8) == "high");
+    }
+
     private static void TestStorePresentableWindowExpires()
     {
         Console.WriteLine("\n[Test] A resolved track falls out of the presentation window after 25 hours");
@@ -1867,7 +1945,7 @@ internal static class Program
 
     private static void TestStorePruneRemovesOldPlayEventsAndShowWindows()
     {
-        Console.WriteLine("\n[Test] Prune drops old play events and show windows after 180 days");
+        Console.WriteLine("\n[Test] Prune drops old play events and show windows after the retention window");
 
         var store = NewHistoryStore();
         var old = DateTime.UtcNow - SXMPlaylistHistoryStore.PlayRetention - TimeSpan.FromDays(1);
@@ -1892,6 +1970,37 @@ internal static class Program
         Assert("fresh show window kept", store.GetShowWindowForPlay("altnation", fresh)?.ProgramId == "new-show");
     }
 
+    private static void TestStorePruneRemovesOldPlexPlaylistTrackMatches()
+    {
+        Console.WriteLine("\n[Test] Prune drops old Plex playlist audit rows after the retention window");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        var oldSync = now - SXMPlaylistHistoryStore.PlayRetention - TimeSpan.FromDays(1);
+        var freshSync = now - TimeSpan.FromDays(1);
+
+        store.RecordPlexPlaylistTrackMatches(42, oldSync, new[]
+        {
+            new PlexPlaylistTrackMatchRecord("old", null, "altnation", "Artist", "Old Song", oldSync, null, null, null, null, null, null, null, "unmatched", "none")
+        });
+        store.RecordPlexPlaylistTrackMatches(42, freshSync, new[]
+        {
+            new PlexPlaylistTrackMatchRecord("fresh", null, "altnation", "Artist", "Fresh Song", freshSync, null, null, "100", "Artist", "Fresh Song", null, null, "exact-title-artist", "high")
+        });
+
+        store.Prune();
+
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        using var connection = new SQLiteConnection($"Data Source={dbPath};Version=3;");
+        connection.Open();
+        using var command = new SQLiteCommand("SELECT PlayId FROM PlexPlaylistTrackMatches ORDER BY PlayId", connection);
+        using var reader = command.ExecuteReader();
+
+        Assert("fresh audit row kept", reader.Read() && reader.GetString(0) == "fresh");
+        Assert("old audit row pruned", !reader.Read());
+    }
+
     private static void TestStoreHistoryRetentionFiltersQueryOnly()
     {
         Console.WriteLine("\n[Test] History retention days filters query results only");
@@ -1910,7 +2019,7 @@ internal static class Program
 
         Assert("one-day query hides the old play", oneDayList.Count == 0);
         Assert("three-day query includes the old play", threeDayList.Any(t => t.TrackId == "oldTrack"));
-        Assert("global 180-day prune keeps the old play", store.GetPlays("altnation", DateTime.MinValue).Count == 1);
+        Assert("global retention prune keeps the old play", store.GetPlays("altnation", DateTime.MinValue).Count == 1);
     }
 
     private static void TestStoreSchedulesRetryForNoMbidTrack()
@@ -2371,6 +2480,24 @@ internal static class Program
         client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
 
         Assert("exact match adds the Plex track", HasPlaylistItem(httpClient, "100"));
+    }
+
+    private static void TestPlexSyncReturnsTrackMatchAudit()
+    {
+        Console.WriteLine("\n[Test] Plex sync returns playlist track match audit details");
+
+        var httpClient = NewPlexEnvironment();
+        var client = NewPlexClient(httpClient);
+        var result = client.Sync(42, "SXM Alt Nation", new[]
+        {
+            new PlayEventRecord(1, "p1", "altnation", "track1", "Kool & The Gang", "Celebration", DateTime.UtcNow, null, null, null, null, "recording-mbid-1", "USDE12345678")
+        });
+
+        var match = result.TrackMatches.SingleOrDefault();
+        Assert("one audit match returned", match != null);
+        Assert("audit carries SXM trace identifiers", match!.SxmTrackId == "track1" && match.RecordingMusicBrainzId == "recording-mbid-1" && match.Isrc == "USDE12345678");
+        Assert("audit carries Plex match details", match.PlexRatingKey == "100" && match.PlexArtist == "Kool & The Gang" && match.PlexTitle == "Celebration");
+        Assert("audit records match confidence", match.MatchMethod == "exact-title-artist" && match.Confidence == "high");
     }
 
     private static void TestPlexFeatCreditStrippedFromArtist()

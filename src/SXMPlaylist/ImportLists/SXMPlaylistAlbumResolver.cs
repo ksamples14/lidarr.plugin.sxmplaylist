@@ -273,7 +273,7 @@ namespace SXMPlaylist.ImportLists
 
             foreach (var priority in ReleasePriorities.Where(p => !results.ContainsKey(p)))
             {
-                results[priority] = new AlbumResolution(true, albumTitle, null, null);
+                results[priority] = new AlbumResolution(true, albumTitle, null, null, resolutionMethod: "title-only");
             }
         }
 
@@ -287,6 +287,7 @@ namespace SXMPlaylist.ImportLists
 
             var releaseCandidates = new JArray();
             string? recordingArtistMbid = null;
+            string? selectedRecordingMbid = null;
             var artistRejected = 0;
             var titleRejected = 0;
             var noRecordings = 0;
@@ -363,6 +364,8 @@ namespace SXMPlaylist.ImportLists
                         continue;
                     }
 
+                    selectedRecordingMbid ??= recordingId;
+
                     var artistCredits = fullRecording?["artist-credit"] as JArray;
                     if (recordingArtistMbid == null && artistCredits is { Count: 1 })
                     {
@@ -396,7 +399,7 @@ namespace SXMPlaylist.ImportLists
             foreach (var priority in ReleasePriorities)
             {
                 var releaseGroup = SelectBestReleaseGroup(syntheticRecording, recordingArtistMbid, filter.WithReleasePriority(priority), _logger);
-                var resolution = BuildResolution(releaseGroup, recordingArtistMbid);
+                var resolution = BuildResolution(releaseGroup, recordingArtistMbid, selectedRecordingMbid, null, "recording-search");
                 if (resolution != null)
                 {
                     results[priority] = resolution;
@@ -437,7 +440,7 @@ namespace SXMPlaylist.ImportLists
             foreach (var priority in ReleasePriorities)
             {
                 var releaseGroup = SelectBestReleaseGroup(recording, artistMbid, filter.WithReleasePriority(priority), _logger);
-                var resolution = BuildResolution(releaseGroup, artistMbid);
+                var resolution = BuildResolution(releaseGroup, artistMbid, recordingId, isrc, "isrc");
                 if (resolution != null)
                 {
                     results[priority] = resolution;
@@ -452,14 +455,14 @@ namespace SXMPlaylist.ImportLists
             return results;
         }
 
-        private static AlbumResolution? BuildResolution(JToken? releaseGroup, string? artistMbid)
+        private static AlbumResolution? BuildResolution(JToken? releaseGroup, string? artistMbid, string? recordingMbid = null, string? isrc = null, string? resolutionMethod = null)
         {
             var albumTitle = releaseGroup?["title"]?.Value<string>();
             var albumMbid = releaseGroup?["id"]?.Value<string>();
 
             return albumTitle.IsNullOrWhiteSpace() || albumMbid.IsNullOrWhiteSpace()
                 ? null
-                : new AlbumResolution(true, albumTitle, artistMbid, albumMbid);
+                : new AlbumResolution(true, albumTitle, artistMbid, albumMbid, recordingMbid, isrc, resolutionMethod);
         }
 
         // Fallback after the exact ISRC path misses: search MusicBrainz release-groups by the
@@ -576,7 +579,7 @@ namespace SXMPlaylist.ImportLists
                 }
 
                 _logger.Debug("MusicBrainz title search selected '{0}' ({1}) for {2} / '{3}' using {4} priority", finalTitle, finalAlbumMbid, string.Join(" / ", artistCandidates), albumTitle, priority);
-                results[priority] = new AlbumResolution(true, finalTitle, artistMbid, finalAlbumMbid);
+                results[priority] = new AlbumResolution(true, finalTitle, artistMbid, finalAlbumMbid, resolutionMethod: "title-search");
             }
 
             if (results.Count == 0)

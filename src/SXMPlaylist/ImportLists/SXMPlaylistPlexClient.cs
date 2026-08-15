@@ -49,7 +49,7 @@ namespace SXMPlaylist.ImportLists
         private readonly Logger _logger;
 
         // Per-pass caches (reset per list sync or Sync call).
-        private readonly Dictionary<string, string?> _trackRatingKeyCache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, PlexTrackSearchResult?> _trackRatingKeyCache = new(StringComparer.OrdinalIgnoreCase);
         private string? _cachedMachineId;
         private List<long>? _cachedMusicSectionIds;
         private readonly CachedPlexTvValue<string?> _ownerUserIdCache = new();
@@ -75,7 +75,7 @@ namespace SXMPlaylist.ImportLists
         {
             foreach (var pair in cache)
             {
-                _trackRatingKeyCache[pair.Key] = pair.Value;
+                _trackRatingKeyCache[pair.Key] = new PlexTrackSearchResult(pair.Value, null, null, null, null, "cache", "unknown");
             }
         }
 
@@ -86,9 +86,9 @@ namespace SXMPlaylist.ImportLists
             var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var pair in _trackRatingKeyCache)
             {
-                if (pair.Value.IsNotNullOrWhiteSpace())
+                if (pair.Value?.RatingKey.IsNotNullOrWhiteSpace() == true)
                 {
-                    result[pair.Key] = pair.Value!;
+                    result[pair.Key] = pair.Value.RatingKey;
                 }
             }
 
@@ -148,7 +148,7 @@ namespace SXMPlaylist.ImportLists
                 return result;
             }
 
-            var ratingKeys = ResolveRatingKeys(baseUrl, plex, sectionIds, events);
+            var ratingKeys = ResolveRatingKeys(baseUrl, plex, sectionIds, events, result.TrackMatches);
 
             if (ratingKeys.Count == 0)
             {
@@ -919,7 +919,7 @@ namespace SXMPlaylist.ImportLists
                    ?? json?["user"]?["authToken"]?.Value<string>();
         }
 
-        private List<string> ResolveRatingKeys(string baseUrl, PlexServerSettings plex, List<long> sectionIds, IReadOnlyList<PlayEventRecord> events)
+        private List<string> ResolveRatingKeys(string baseUrl, PlexServerSettings plex, List<long> sectionIds, IReadOnlyList<PlayEventRecord> events, List<PlexPlaylistTrackMatchRecord> audit)
         {
             var result = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -936,10 +936,12 @@ namespace SXMPlaylist.ImportLists
                 }
 
                 var song = songValue!;
+                var auditPlay = plays.First();
 
                 // Try each credited artist (a duet/feature row carries one artist) and take the
                 // first that matches the Plex library.
-                string? ratingKey = null;
+                PlexTrackSearchResult? match = null;
+                PlayEventRecord? matchedPlay = null;
                 foreach (var play in plays)
                 {
                     if (play.Artist.IsNullOrWhiteSpace())
@@ -954,23 +956,59 @@ namespace SXMPlaylist.ImportLists
                         _trackRatingKeyCache[cacheKey] = cached;
                     }
 
-                    if (cached.IsNotNullOrWhiteSpace())
+                    if (cached?.RatingKey.IsNotNullOrWhiteSpace() == true)
                     {
-                        ratingKey = cached;
+                        match = cached;
+                        matchedPlay = play;
                         break;
                     }
                 }
 
-                if (ratingKey.IsNotNullOrWhiteSpace() && seen.Add(ratingKey!))
+                if (match?.RatingKey.IsNotNullOrWhiteSpace() == true)
                 {
-                    result.Add(ratingKey!);
+                    audit.Add(BuildAuditRecord(matchedPlay ?? auditPlay, song, match));
+                }
+                else
+                {
+                    audit.Add(BuildAuditRecord(auditPlay, song, null));
+                }
+
+                if (match?.RatingKey.IsNotNullOrWhiteSpace() == true && seen.Add(match.RatingKey))
+                {
+                    result.Add(match.RatingKey);
                 }
             }
 
             return result;
         }
 
-        private string? SearchTrack(string baseUrl, PlexServerSettings plex, List<long> sectionIds, string artist, string song)
+        private static PlexPlaylistTrackMatchRecord BuildAuditRecord(PlayEventRecord play, string song, PlexTrackSearchResult? match)
+        {
+            return new PlexPlaylistTrackMatchRecord(
+                play.PlayId,
+                play.TrackId,
+                play.Channel,
+                play.Artist,
+                song,
+                play.TimestampUtc,
+                play.RecordingMusicBrainzId,
+                play.Isrc,
+                match?.RatingKey,
+                match?.Artist,
+                match?.Title,
+                match?.Album,
+                match?.Guid,
+                match?.MatchMethod ?? "unmatched",
+                match?.Confidence ?? "none");
+        }
+
+        private string? FirstPlexGuid(JToken match)
+        {
+            var guid = match["Guid"] as JArray;
+            return guid?.FirstOrDefault()?["id"]?.Value<string>() ?? match["guid"]?.Value<string>();
+        }
+
+        private PlexTrackSearchResult? SearchTrack(string baseUrl, PlexServerSettings plex, List<long> sectionIds, string artist, string song)
         {
             // Two-tier matching (curatorr-inspired): try an exact title match first, then a fuzzy
             // match that also tolerates version/remaster/live suffixes.
@@ -1015,7 +1053,7 @@ namespace SXMPlaylist.ImportLists
             return null;
         }
 
-        private static string? MatchTitle(JArray matches, string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy)
+        private PlexTrackSearchResult? MatchTitle(JArray matches, string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy)
         {
             foreach (var match in matches)
             {
@@ -1036,7 +1074,20 @@ namespace SXMPlaylist.ImportLists
                                   ?? match["originalTitle"]?.Value<string>();
                 if (matchArtist.IsNotNullOrWhiteSpace() && ArtistMatches(matchArtist!, artistKeys))
                 {
-                    return match["ratingKey"]?.Value<string>();
+                    var ratingKey = match["ratingKey"]?.Value<string>();
+                    if (ratingKey.IsNullOrWhiteSpace())
+                    {
+                        return null;
+                    }
+
+                    return new PlexTrackSearchResult(
+                        ratingKey!,
+                        matchArtist,
+                        matchTitle,
+                        match["parentTitle"]?.Value<string>(),
+                        FirstPlexGuid(match),
+                        fuzzy ? "fuzzy-title-artist" : "exact-title-artist",
+                        fuzzy ? "medium" : "high");
                 }
             }
 
@@ -1393,5 +1444,29 @@ namespace SXMPlaylist.ImportLists
 
         // Plex Home users that were skipped, each as "username: reason".
         public List<string> SkippedUsers { get; } = new();
+
+        public List<PlexPlaylistTrackMatchRecord> TrackMatches { get; } = new();
+    }
+
+    internal class PlexTrackSearchResult
+    {
+        public PlexTrackSearchResult(string ratingKey, string? artist, string? title, string? album, string? guid, string matchMethod, string confidence)
+        {
+            RatingKey = ratingKey;
+            Artist = artist;
+            Title = title;
+            Album = album;
+            Guid = guid;
+            MatchMethod = matchMethod;
+            Confidence = confidence;
+        }
+
+        public string RatingKey { get; }
+        public string? Artist { get; }
+        public string? Title { get; }
+        public string? Album { get; }
+        public string? Guid { get; }
+        public string MatchMethod { get; }
+        public string Confidence { get; }
     }
 }

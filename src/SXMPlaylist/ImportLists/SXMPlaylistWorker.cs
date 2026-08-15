@@ -256,7 +256,9 @@ namespace SXMPlaylist.ImportLists
                     // of being throttled out by a fresh LastSyncUtc.
                     if (syncResult.OwnerPlaylistRatingKey.IsNotNullOrWhiteSpace())
                     {
-                        _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, syncResult.OwnerPlaylistRatingKey, DateTime.UtcNow, _plexClient.ExportTrackCache(), syncResult.UserPlaylistRatingKeys);
+                        var syncUtc = DateTime.UtcNow;
+                        _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, syncResult.OwnerPlaylistRatingKey, syncUtc, _plexClient.ExportTrackCache(), syncResult.UserPlaylistRatingKeys);
+                        _historyStore.RecordPlexPlaylistTrackMatches(definition.Id, syncUtc, syncResult.TrackMatches);
                     }
 
                     if (syncResult.SkippedUsers.Count > 0)
