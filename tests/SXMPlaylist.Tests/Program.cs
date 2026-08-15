@@ -130,11 +130,13 @@ internal static class Program
         TestPlexExactTitleMatch();
         TestPlexFeatCreditStrippedFromArtist();
         TestPlexFuzzyTitleVersionMatch();
+        TestPlexRetriesSearchWithStrippedTitleSuffix();
         TestPlexMultiArtistPlayMatchesPrimaryArtist();
         TestPlexRepeatedTrackUsesPersistedCache();
         TestPlexRetriesTransientSearchFailure();
         TestPlexCacheIsolationBetweenLists();
         TestPlexFanOutCreatesPlaylistForFullAccountHomeUser();
+        TestPlexFanOutCachesPlexTvUserDiscovery();
         TestPlexFanOutSkipsPinProtectedUser();
         TestPlexFanOutUsesSwitchFallbackWhenNoSharedToken();
         TestPlexFanOutOwnerSyncSurvivesHomeUsersFailure();
@@ -2393,6 +2395,25 @@ internal static class Program
         Assert("version-suffixed title matched via fuzzy tier", HasPlaylistItem(httpClient, "100"));
     }
 
+    private static void TestPlexRetriesSearchWithStrippedTitleSuffix()
+    {
+        Console.WriteLine("\n[Test] Plex search retries with stripped title suffixes");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        httpClient.Respond("artist=Prince&title=When%20Doves%20Cry&", TrackMatchJson("When Doves Cry", "Prince"));
+        httpClient.Respond("/playlists?playlistType=audio", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"SXM Alt Nation\",\"ratingKey\":\"500\"}]}}");
+        httpClient.Respond("/playlists/500/items", "{\"MediaContainer\":{\"Metadata\":[{\"ratingKey\":\"999\"}]}}");
+
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Prince", "When Doves Cry (84)") });
+
+        Assert("year-suffixed title matched after stripped-title search", HasPlaylistItem(httpClient, "100"));
+        Assert("raw title was searched first", httpClient.RequestUrls.Any(u => u.Contains("title=When%20Doves%20Cry%20%2884%29")));
+        Assert("stripped title was searched after raw title", httpClient.RequestUrls.Any(u => u.Contains("title=When%20Doves%20Cry&")));
+    }
+
     private static void TestPlexMultiArtistPlayMatchesPrimaryArtist()
     {
         Console.WriteLine("\n[Test] Plex match tries each credited artist and adds one playlist entry");
@@ -2505,6 +2526,33 @@ internal static class Program
         Assert("full-account user playlist key persisted", result.UserPlaylistRatingKeys["user1"] == "500");
         Assert("no users skipped", result.SkippedUsers.Count == 0);
         Assert("owner account did not trigger a home-user switch", !httpClient.RequestUrls.Any(u => u.Contains("/home/users/u-owner/switch")));
+    }
+
+    private static void TestPlexFanOutCachesPlexTvUserDiscovery()
+    {
+        Console.WriteLine("\n[Test] Plex fan-out caches plex.tv user discovery for the daily window");
+
+        var httpClient = NewPlexEnvironment();
+        httpClient.Respond("/api/v2/user", "{\"id\":\"owner1\",\"username\":\"owner\"}");
+        httpClient.Respond("/api/v2/home/users",
+            "{\"MediaContainer\":{\"User\":[" +
+            "{\"id\":\"owner1\",\"uuid\":\"u-owner\",\"title\":\"owner\",\"username\":\"owner\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"1\"}," +
+            "{\"id\":\"user1\",\"uuid\":\"u-vsa\",\"title\":\"vsa191\",\"username\":\"vsa191\",\"restricted\":\"0\",\"protected\":\"0\",\"admin\":\"0\"}" +
+            "]}}");
+        httpClient.Respond("/api/servers/mach1/shared_servers",
+            "<?xml version=\"1.0\"?><MediaContainer>" +
+            "<SharedServer id=\"100\" userID=\"user1\" username=\"vsa191\" accessToken=\"vsa-server-token\">" +
+            "<Section id=\"19\" key=\"19\" title=\"Music\" type=\"artist\" shared=\"1\"/>" +
+            "</SharedServer>" +
+            "</MediaContainer>");
+
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
+
+        Assert("owner id fetched once", httpClient.RequestUrls.Count(u => u.Contains("/api/v2/user")) == 1);
+        Assert("shared servers fetched once", httpClient.RequestUrls.Count(u => u.Contains("/api/servers/mach1/shared_servers")) == 1);
+        Assert("home users fetched once", httpClient.RequestUrls.Count(u => u.Contains("/api/v2/home/users")) == 1);
     }
 
     private static void TestPlexFanOutSkipsPinProtectedUser()

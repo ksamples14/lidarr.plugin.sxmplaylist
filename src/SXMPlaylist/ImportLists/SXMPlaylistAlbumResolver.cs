@@ -594,8 +594,7 @@ namespace SXMPlaylist.ImportLists
         // "Three Cheers for Sweet Revenge" otherwise.
         private static string BuildTitleSearchQuery(string artist, string albumTitle)
         {
-            var stripped = EditionSuffixPattern.Replace(albumTitle, " ");
-            stripped = YearSuffixPattern.Replace(stripped, " ").Trim();
+            var stripped = SXMPlaylistTitleNormalizer.StripEditionAndYearSuffixes(albumTitle);
             if (stripped.IsNullOrWhiteSpace())
             {
                 stripped = albumTitle;
@@ -608,8 +607,7 @@ namespace SXMPlaylist.ImportLists
 
         private static string BuildRecordingSearchQuery(string artist, string song)
         {
-            var stripped = EditionSuffixPattern.Replace(song, " ");
-            stripped = YearSuffixPattern.Replace(stripped, " ").Trim();
+            var stripped = SXMPlaylistTitleNormalizer.StripEditionAndYearSuffixes(song);
             if (stripped.IsNullOrWhiteSpace())
             {
                 stripped = song;
@@ -661,25 +659,9 @@ namespace SXMPlaylist.ImportLists
         private const double TitleMatchThreshold = 0.85;
         private const double ArtistMatchFloor = 0.6;
 
-        // Edition qualifiers stripped before scoring/querying so "Three Cheers (Deluxe)" matches
-        // MusicBrainz's clean "Three Cheers for Sweet Revenge".
-        private static readonly Regex EditionSuffixPattern = new(
-            @"[\(\[\{]\s*(deluxe|remaster(ed)?|edition|anniversary|special|expanded|bonus|complete|acoustic|live|demo|radio edit|extended|instrumental|mono|stereo|explicit|clean|version|single|promo)\b[^\)\]\}]*[\)\]\}]",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-        // SiriusXM/xmplaylist annotate each title with the year in parens, e.g. "Emergency (85)".
-        // MusicBrainz's clean title is just "Emergency"; strip the bare year before querying and
-        // scoring so "(85)" can't push a real match below the title threshold. Anchored to the end
-        // of the title so mid-title parenthesized numbers that aren't years (e.g. "Jump (12)") are
-        // left alone.
-        private static readonly Regex YearSuffixPattern = new(
-            @"[\(\[\{]\s*(?:(?:19|20)\d{2}|\d{2})\s*[\)\]\}]\s*$",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
         private static string NormalizeForMatch(string value)
         {
-            value = EditionSuffixPattern.Replace(value, " ");
-            value = YearSuffixPattern.Replace(value, " ");
+            value = SXMPlaylistTitleNormalizer.StripEditionAndYearSuffixes(value);
 
             // Strip diacritics (Beyoncé -> Beyonce, Mötley Crüe -> Motley Crue).
             var normalized = value.Normalize(System.Text.NormalizationForm.FormD);

@@ -31,6 +31,7 @@
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistImport.cs" Link="SXMPlaylistImport.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistRequestGenerator.cs" Link="SXMPlaylistRequestGenerator.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistRequestBuilder.cs" Link="SXMPlaylistRequestBuilder.cs" />
+    <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistTitleNormalizer.cs" Link="SXMPlaylistTitleNormalizer.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistStationBackfill.cs" Link="SXMPlaylistStationBackfill.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistHistoryStore.cs" Link="SXMPlaylistHistoryStore.cs" />
     <Compile Include="..\..\src\SXMPlaylist\ImportLists\SXMPlaylistAlbumResolver.cs" Link="SXMPlaylistAlbumResolver.cs" />

@@ -32,7 +32,8 @@ namespace SXMPlaylist.ImportLists
         private static readonly TimeSpan BackfillWindow = TimeSpan.FromHours(2);
         private static readonly TimeSpan ShowScheduleRefreshInterval = TimeSpan.FromHours(24);
         private static readonly TimeSpan LoopInterval = TimeSpan.FromSeconds(60);
-        private static readonly TimeSpan PlexSyncInterval = TimeSpan.FromMinutes(15);
+        private static readonly TimeSpan PlexSyncInterval = TimeSpan.FromHours(6);
+        private static readonly TimeSpan CompanionCleanupInterval = TimeSpan.FromHours(24);
         private const int ResolutionBatchSize = 50;
         private const int RetryBatchSize = 15;
 
@@ -50,6 +51,7 @@ namespace SXMPlaylist.ImportLists
         private readonly object _lifecycleLock = new();
         private CancellationTokenSource? _cancellationTokenSource;
         private Task? _loopTask;
+        private DateTime _lastCompanionCleanupUtc = DateTime.MinValue;
 
         public SXMPlaylistWorker(
             IHttpClient httpClient,
@@ -268,7 +270,11 @@ namespace SXMPlaylist.ImportLists
                 }
             }
 
-            CleanupOrphanedCompanionPlaylists(token, allSxmListIds, plexLists);
+            if (DateTime.UtcNow - _lastCompanionCleanupUtc >= CompanionCleanupInterval)
+            {
+                CleanupOrphanedCompanionPlaylists(token, allSxmListIds, plexLists);
+                _lastCompanionCleanupUtc = DateTime.UtcNow;
+            }
         }
 
         // Deletes companion playlists that are no longer wanted:

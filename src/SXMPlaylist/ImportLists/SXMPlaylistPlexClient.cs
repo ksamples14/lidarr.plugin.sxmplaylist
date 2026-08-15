@@ -37,6 +37,7 @@ namespace SXMPlaylist.ImportLists
         private const int AddBatchSize = 100;
         private const int SearchAttempts = 3;
         private static readonly int[] RetryDelaysMs = { 0, 700, 1500 };
+        private static readonly TimeSpan PlexTvUserCacheInterval = TimeSpan.FromHours(24);
 
         private const string PlexTvBaseUrl = "https://plex.tv";
         private const string PlexClientIdentifier = "lidarr.sxmplaylist";
@@ -51,6 +52,9 @@ namespace SXMPlaylist.ImportLists
         private readonly Dictionary<string, string?> _trackRatingKeyCache = new(StringComparer.OrdinalIgnoreCase);
         private string? _cachedMachineId;
         private List<long>? _cachedMusicSectionIds;
+        private readonly CachedPlexTvValue<string?> _ownerUserIdCache = new();
+        private readonly CachedPlexTvValue<List<PlexSharedUser>> _sharedUsersCache = new();
+        private readonly CachedPlexTvValue<List<PlexHomeUser>> _homeUsersCache = new();
 
         public SXMPlaylistPlexClient(IHttpClient httpClient, INotificationFactory notificationFactory, Logger logger)
         {
@@ -484,13 +488,11 @@ namespace SXMPlaylist.ImportLists
 
                 // Distinguish "plex.tv unreachable" (no payload) from "valid response, no users":
                 // the former must not be treated as an authoritative empty set.
-                var content = GetSharedServersJson(machineId!, plex.AuthToken!);
-                if (content.IsNullOrWhiteSpace())
+                if (!TryGetSharedServerUsers(plex.AuthToken!, machineId!, out var users))
                 {
                     return null;
                 }
 
-                var users = ParseSharedServerUsers(content!);
                 return users
                     .GroupBy(u => u.UserId, StringComparer.OrdinalIgnoreCase)
                     .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
@@ -524,6 +526,15 @@ namespace SXMPlaylist.ImportLists
             public bool IsRestricted { get; set; }
             public bool IsProtected { get; set; }
             public bool IsAdmin { get; set; }
+        }
+
+        private sealed class CachedPlexTvValue<T>
+        {
+            public string OwnerToken { get; set; } = "";
+            public string MachineId { get; set; } = "";
+            public DateTime CachedUtc { get; set; } = DateTime.MinValue;
+            public bool HasValue { get; set; }
+            public T? Value { get; set; }
         }
 
         private sealed class PlexTvDevice
@@ -704,17 +715,29 @@ namespace SXMPlaylist.ImportLists
 
         private List<PlexHomeUser> GetHomeUsers(string ownerToken)
         {
+            if (IsPlexTvCacheFresh(_homeUsersCache, ownerToken, null))
+            {
+                return _homeUsersCache.Value!.ToList();
+            }
+
             var content = GetHomeUsersJson(ownerToken);
             if (content.IsNullOrWhiteSpace())
             {
                 throw new InvalidOperationException("Plex.tv returned no home users payload");
             }
 
-            return ParseHomeUsers(content!);
+            var users = ParseHomeUsers(content!);
+            CachePlexTvValue(_homeUsersCache, ownerToken, null, users);
+            return users;
         }
 
         private string? GetOwnerUserId(string ownerToken)
         {
+            if (IsPlexTvCacheFresh(_ownerUserIdCache, ownerToken, null))
+            {
+                return _ownerUserIdCache.Value;
+            }
+
             var content = GetOwnerUserIdJson(ownerToken);
             if (content.IsNullOrWhiteSpace())
             {
@@ -722,7 +745,9 @@ namespace SXMPlaylist.ImportLists
             }
 
             var json = JToken.Parse(content!);
-            return json?["id"]?.Value<string>();
+            var ownerUserId = json?["id"]?.Value<string>();
+            CachePlexTvValue(_ownerUserIdCache, ownerToken, null, ownerUserId);
+            return ownerUserId;
         }
 
         // Resolves a home member's server access token via the home-user switch + resources exchange.
@@ -770,13 +795,45 @@ namespace SXMPlaylist.ImportLists
         // header: <MediaContainer><SharedServer id=".." username=".." userID=".." accessToken="..">.
         private List<PlexSharedUser> GetSharedServerUsers(string ownerToken, string machineId)
         {
+            TryGetSharedServerUsers(ownerToken, machineId, out var users);
+            return users;
+        }
+
+        private bool TryGetSharedServerUsers(string ownerToken, string machineId, out List<PlexSharedUser> users)
+        {
+            if (IsPlexTvCacheFresh(_sharedUsersCache, ownerToken, machineId))
+            {
+                users = _sharedUsersCache.Value!.ToList();
+                return true;
+            }
+
             var content = GetSharedServersJson(machineId, ownerToken);
             if (content.IsNullOrWhiteSpace())
             {
-                return new List<PlexSharedUser>();
+                users = new List<PlexSharedUser>();
+                return false;
             }
 
-            return ParseSharedServerUsers(content!);
+            users = ParseSharedServerUsers(content!);
+            CachePlexTvValue(_sharedUsersCache, ownerToken, machineId, users);
+            return true;
+        }
+
+        private static bool IsPlexTvCacheFresh<T>(CachedPlexTvValue<T> cache, string ownerToken, string? machineId)
+        {
+            return cache.HasValue
+                   && string.Equals(cache.OwnerToken, ownerToken, StringComparison.Ordinal)
+                   && string.Equals(cache.MachineId, machineId ?? "", StringComparison.OrdinalIgnoreCase)
+                   && DateTime.UtcNow - cache.CachedUtc < PlexTvUserCacheInterval;
+        }
+
+        private static void CachePlexTvValue<T>(CachedPlexTvValue<T> cache, string ownerToken, string? machineId, T value)
+        {
+            cache.OwnerToken = ownerToken;
+            cache.MachineId = machineId ?? "";
+            cache.CachedUtc = DateTime.UtcNow;
+            cache.Value = value;
+            cache.HasValue = true;
         }
 
         private static List<PlexSharedUser> ParseSharedServerUsers(string content)
@@ -917,36 +974,41 @@ namespace SXMPlaylist.ImportLists
         {
             // Two-tier matching (curatorr-inspired): try an exact title match first, then a fuzzy
             // match that also tolerates version/remaster/live suffixes.
+            var titleSearchTerms = GetTitleSearchTerms(song);
+
             foreach (var sectionId in sectionIds)
             {
-                var url = $"{baseUrl}/library/sections/{sectionId}/all?type=10&artist={Uri.EscapeDataString(artist)}&title={Uri.EscapeDataString(song)}&X-Plex-Container-Size=25";
-                var response = Get(url, plex);
-
-                if (response == null)
-                {
-                    continue;
-                }
-
-                var matches = response["MediaContainer"]?["Metadata"] as JArray;
-                if (matches == null)
-                {
-                    continue;
-                }
-
                 var exactTitle = NormalizeTitleExact(song);
                 var fuzzyTitle = NormalizeTitleFuzzy(song);
                 var artistKeys = NormalizeArtistKeys(artist);
 
-                var exactHit = MatchTitle(matches, exactTitle, artistKeys, fuzzy: false);
-                if (exactHit != null)
+                foreach (var titleSearchTerm in titleSearchTerms)
                 {
-                    return exactHit;
-                }
+                    var url = $"{baseUrl}/library/sections/{sectionId}/all?type=10&artist={Uri.EscapeDataString(artist)}&title={Uri.EscapeDataString(titleSearchTerm)}&X-Plex-Container-Size=25";
+                    var response = Get(url, plex);
 
-                var fuzzyHit = MatchTitle(matches, fuzzyTitle, artistKeys, fuzzy: true);
-                if (fuzzyHit != null)
-                {
-                    return fuzzyHit;
+                    if (response == null)
+                    {
+                        continue;
+                    }
+
+                    var matches = response["MediaContainer"]?["Metadata"] as JArray;
+                    if (matches == null)
+                    {
+                        continue;
+                    }
+
+                    var exactHit = MatchTitle(matches, exactTitle, artistKeys, fuzzy: false);
+                    if (exactHit != null)
+                    {
+                        return exactHit;
+                    }
+
+                    var fuzzyHit = MatchTitle(matches, fuzzyTitle, artistKeys, fuzzy: true);
+                    if (fuzzyHit != null)
+                    {
+                        return fuzzyHit;
+                    }
                 }
             }
 
@@ -1257,15 +1319,31 @@ namespace SXMPlaylist.ImportLists
         // "(acoustic)" or "(Fade Out)".
         private static string NormalizeTitleExact(string value) => Normalize(StripFeat(value));
 
+        private static IReadOnlyList<string> GetTitleSearchTerms(string value)
+        {
+            var terms = new List<string>();
+            AddTitleSearchTerm(terms, value);
+
+            var stripped = SXMPlaylistTitleNormalizer.StripTrailingParentheticalSuffixes(StripFeat(value));
+            AddTitleSearchTerm(terms, stripped);
+
+            return terms;
+        }
+
+        private static void AddTitleSearchTerm(List<string> terms, string value)
+        {
+            var term = value.Trim();
+            if (term.IsNotNullOrWhiteSpace() && !terms.Contains(term, StringComparer.OrdinalIgnoreCase))
+            {
+                terms.Add(term);
+            }
+        }
+
         // Fuzzy title tier: also strips trailing parenthetical/bracket version suffixes
         // (Remastered), (Live), [Remix], (from the series ...) so a version mismatch still matches.
         private static string NormalizeTitleFuzzy(string value)
         {
-            var result = StripFeat(value);
-            result = Regex.Replace(result, @"\s*\([^)]*\)\s*$", "", RegexOptions.IgnoreCase);
-            result = Regex.Replace(result, @"\s*\([^)]*\)\s*$", "", RegexOptions.IgnoreCase);
-            result = Regex.Replace(result, @"\s*\[[^\]]*\]\s*$", "", RegexOptions.IgnoreCase);
-            return Normalize(result);
+            return Normalize(SXMPlaylistTitleNormalizer.StripTrailingParentheticalSuffixes(StripFeat(value)));
         }
 
         // Strips featured-artist credits appended to a primary name: "(feat. X)", "(ft. X)",
