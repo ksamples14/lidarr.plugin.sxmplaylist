@@ -33,6 +33,12 @@ internal static class Program
     {
         Console.WriteLine("=== SXMPlaylist Tests ===");
 
+        // The resolver's MusicBrainz throttle paces real requests at 1 req/s; the test HTTP client
+        // is fake, so the pacing only wastes wall time. Zero it (and the retry backoff) up front.
+        SXMPlaylistAlbumResolver.MusicBrainzMinInterval = TimeSpan.Zero;
+        SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = TimeSpan.Zero;
+        SXMPlaylistPlexClient.RetryDelaysMs = new[] { 0, 0, 0 };
+
         TestBackfillStopsAtCutoff();
         TestBackfillStopsAtMaxPages();
         TestChannelDirectoryFetchesAndParses();
@@ -92,6 +98,8 @@ internal static class Program
         TestAlbumResolutionTitleSearchStripsEditionSuffixInQuery();
         TestAlbumResolutionRecordingSearchStripsYearSuffix();
         TestAlbumResolutionRecordingSearchUsesDeezerArtistForFragmentedNames();
+        TestAlbumResolutionRecordingSearchStopsOnSameArtistCompilationCandidate();
+        TestAlbumResolutionRecordingSearchContinuesPastVaOnlyCandidate();
         TestAlbumResolutionFilterExcludesDisallowedRelease();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
@@ -120,6 +128,8 @@ internal static class Program
         TestStoreNewPlayResetsRetryClock();
         TestStoreRetryFailureRenewsPresentationWindow();
         TestStoreMigrationAddsRetryColumnsIdempotently();
+        TestStoreMigrationAddsSongKeyColumnsAndBackfills();
+        TestStoreMigrationRecreatesPlexPlaylistTrackMatchesWithUnique();
 
         TestWorkerCapturesDueChannel();
         TestWorkerCapturesPlayEventShowAttribution();
@@ -136,6 +146,7 @@ internal static class Program
         TestPlexSyncReturnsTrackMatchAudit();
         TestPlexFeatCreditStrippedFromArtist();
         TestPlexFuzzyTitleVersionMatch();
+        TestPlexPrefersAlbumMatchWhenAvailable();
         TestPlexRetriesSearchWithStrippedTitleSuffix();
         TestPlexMultiArtistPlayMatchesPrimaryArtist();
         TestPlexRepeatedTrackUsesPersistedCache();
@@ -1581,6 +1592,89 @@ internal static class Program
         Assert("recording search ran once on the canonical artist", httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording?query=")) == 1);
     }
 
+    private static void TestAlbumResolutionRecordingSearchStopsOnSameArtistCompilationCandidate()
+    {
+        Console.WriteLine("\n[Test] Recording search stops on a candidate whose only eligible release is a same-artist compilation (pass-2 gate)");
+
+        // Feed fragments "Kool & The Gang" into ["Kool"]; candidates are tried in order, so
+        // "Kool" is candidate 1. Its recording carries ONLY a same-artist compilation whose
+        // secondary type (Compilation) the metadata profile excludes — SelectBestReleaseGroup's
+        // fallback pass would accept it, so HasEligibleReleaseGroup must stop the loop here.
+        // Without the pass-2 mirror, the loop would continue to "Kool & The Gang" (candidate 2)
+        // and let a wrong-artist studio album win.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
+            "{\"recordings\":[{\"id\":\"rec-1\",\"title\":\"Emergency\"," +
+            "\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool\"}}]}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"kool-mbid\",\"name\":\"Kool\"}}]," +
+            "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"The Very Best of Kool\",\"primary-type\":\"Album\"," +
+            "\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2001-01-01\"}}]}");
+
+        var noCompilations = new AlbumTypeFilter(
+            new HashSet<string> { "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities(
+            "Kool & The Gang",
+            "Emergency",
+            new Dictionary<string, string>(),
+            noCompilations,
+            new List<string> { "Kool" });
+
+        Assert("loop stopped at the compilation-only candidate (one search call)",
+            httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording?query=")) == 1);
+        Assert("same-artist compilation fallback selected via the pass-2 gate",
+            results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "comp-mbid");
+    }
+
+    private static void TestAlbumResolutionRecordingSearchContinuesPastVaOnlyCandidate()
+    {
+        Console.WriteLine("\n[Test] Recording search continues past a VA-compilation-only candidate to the next artist");
+
+        // Candidate 1 ("Kool") only has Various Artists compilations — hard-excluded, so the loop
+        // must NOT stop on it; candidate 2 ("Kool & The Gang") carries the real studio album.
+        // Both searches hit the same recording?query= endpoint, so responses are sequenced in
+        // call order. Both recordings belong to the same band (koolgang-mbid): the fragmented
+        // candidate's detail sets the shared recordingArtistMbid, which must still match the
+        // studio album's credit once the loop reaches candidate 2.
+        var httpClient = new FakeHttpClient();
+        httpClient.RespondSequence("musicbrainz.org/ws/2/recording?query=",
+            (HttpStatusCode.OK, "{\"recordings\":[{\"id\":\"rec-va\",\"title\":\"Emergency\"," +
+                "\"artist-credit\":[{\"artist\":{\"id\":\"koolgang-mbid\",\"name\":\"Kool\"}}]}]}"),
+            (HttpStatusCode.OK, "{\"recordings\":[{\"id\":\"rec-2\",\"title\":\"Emergency\"," +
+                "\"artist-credit\":[{\"artist\":{\"id\":\"koolgang-mbid\",\"name\":\"Kool & The Gang\"}}]}]}"));
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-va",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"koolgang-mbid\",\"name\":\"Kool\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"va-mbid\",\"name\":\"Various Artists\"}}]," +
+            "\"release-group\":{\"id\":\"va-comp-mbid\",\"title\":\"Hip-Hop Hits\",\"primary-type\":\"Album\"," +
+            "\"secondary-types\":[\"Compilation\"],\"first-release-date\":\"2001-01-01\"}}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-2",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"koolgang-mbid\",\"name\":\"Kool & The Gang\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"koolgang-mbid\",\"name\":\"Kool & The Gang\"}}]," +
+            "\"release-group\":{\"id\":\"emergency-album\",\"title\":\"Emergency\",\"primary-type\":\"Album\"," +
+            "\"first-release-date\":\"1984-01-01\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var results = resolver.ResolveAllPriorities(
+            "Kool & The Gang",
+            "Emergency",
+            new Dictionary<string, string>(),
+            null,
+            new List<string> { "Kool" });
+
+        Assert("loop continued past the VA-only candidate (two search calls)",
+            httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording?query=")) == 2);
+        Assert("studio album from the correct artist selected",
+            results[ReleasePriorityMode.Albums].AlbumMusicBrainzId == "emergency-album");
+    }
+
     private static void TestMusicBrainzBusyIsRetried()
     {
         Console.WriteLine("\n[Test] MusicBrainz 503 'busy' is retried instead of failing immediately");
@@ -1761,17 +1855,15 @@ internal static class Program
 
     private static void TestStoreThreeStrikesExcludesTrack()
     {
-        Console.WriteLine("\n[Test] A track stops being retried after 3 failed attempts");
+        Console.WriteLine("\n[Test] A permanent failure marks the track resolved and excludes it from retry");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.RecordTrackFailure("track1");
-        store.RecordTrackFailure("track1");
-        store.RecordTrackFailure("track1");
+        store.RecordPermanentFailure("track1", null);
 
-        Assert("track excluded from due set after 3 failures", store.GetDueTracks(10).Count == 0);
+        Assert("permanent failure makes the track resolved", store.GetDueTracks(10).Count == 0);
     }
 
     private static void TestStorePersistsResolutionTraceIdentifiers()
@@ -2051,34 +2143,34 @@ internal static class Program
 
     private static void TestStoreSchedulesRetryForNoMbidTrack()
     {
-        Console.WriteLine("\n[Test] A no-MBID resolution schedules a retry 12h out, not immediately");
+        Console.WriteLine("\n[Test] A transient failure schedules a retry at the retry interval, not immediately");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
+        // Simulate a transient failure: sets Resolved=0, NextRetryUtc = now + interval
+        store.RecordTransientFailure("track1", now);
 
-        Assert("not due yet within the 12h window", store.GetDueRetries(10, now).Count == 0);
-        Assert("due after the retry interval", store.GetDueRetries(10, now + SXMPlaylistHistoryStore.RetryInterval + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "track1"));
+        Assert("not due yet within the 12h window", store.GetDueTracks(10, now).Count == 0);
+        Assert("due after the retry interval", store.GetDueTracks(10, now + SXMPlaylistHistoryStore.RetryInterval + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreRetryGivesUpAfterMaxAttempts()
     {
-        Console.WriteLine("\n[Test] no-MBID retry stops after exhausting the attempt budget");
+        Console.WriteLine("\n[Test] Transient retry stops after exhausting the attempt budget");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
 
         for (var i = 0; i < SXMPlaylistHistoryStore.MaxRetryAttempts; i++)
         {
-            store.RecordRetryFailure("track1", now);
+            store.RecordTransientFailure("track1", now);
         }
 
-        Assert("excluded once attempts exhausted", !store.GetDueRetries(10, now + TimeSpan.FromDays(10)).Any(t => t.TrackId == "track1"));
+        Assert("excluded once attempts exhausted", store.GetDueTracks(10).Count == 0);
     }
 
     private static void TestStoreRetrySuccessClearsRetryState()
@@ -2089,35 +2181,33 @@ internal static class Program
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
-        store.RecordRetryFailure("track1", now);
+        store.RecordTransientFailure("track1", now);
 
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1"), now + TimeSpan.FromHours(1));
 
-        Assert("MBID track no longer due for retry", !store.GetDueRetries(10, now + TimeSpan.FromDays(1)).Any(t => t.TrackId == "track1"));
+        Assert("MBID track no longer due for retry", store.GetDueTracks(10).Count == 0);
         Assert("still presentable after renewal", store.GetPresentableTracks("altnation", now + TimeSpan.FromHours(1) - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreNewPlayResetsRetryClock()
     {
-        Console.WriteLine("\n[Test] A fresh play of a no-MBID track resets its retry clock");
+        Console.WriteLine("\n[Test] A fresh play of a track resets NextRetryUtc so it's immediately due");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
-        store.RecordRetryFailure("track1", now);
+        store.RecordTransientFailure("track1", now);
 
-        // A later replay re-inserts the track: retry clock resets, immediately due again.
+        // A later replay triggers UpsertTrack ON CONFLICT, which sets Failures=0 and NextRetryUtc=NULL
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now + TimeSpan.FromHours(1));
 
-        Assert("replay makes it due again immediately", store.GetDueRetries(10, now + TimeSpan.FromHours(1) + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "track1"));
+        Assert("replay makes it due again immediately", store.GetDueTracks(10).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreRetryFailureRenewsPresentationWindow()
     {
-        Console.WriteLine("\n[Test] A failed retry renews ResolvedUtc so the track stays presentable");
+        Console.WriteLine("\n[Test] A transient failure renews ResolvedUtc so the track stays presentable");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
@@ -2125,12 +2215,11 @@ internal static class Program
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
 
-        // Fail a retry past the 25h presentation window; the track-resolution row must be renewed
-        // too, because presentation now joins the per-priority resolution cache.
+        // A transient failure past the 25h presentation window; ResolvedUtc gets renewed.
         var retryFailureTime = now + SXMPlaylistHistoryStore.PresentationWindow + TimeSpan.FromHours(1);
-        store.RecordRetryFailure("track1", retryFailureTime);
+        store.RecordTransientFailure("track1", retryFailureTime);
 
-        Assert("track still presentable after failed retry renewed the window", store.GetPresentableTracks("altnation", retryFailureTime - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
+        Assert("track still presentable after transient failure renewed the window", store.GetPresentableTracks("altnation", retryFailureTime - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreMigrationAddsRetryColumnsIdempotently()
@@ -2166,17 +2255,189 @@ internal static class Program
 
         // The migration backfill must stagger the legacy no-MBID row out by a full retry interval
         // (not make it immediately due), so a rollout doesn't flood MusicBrainz.
-        Assert("legacy no-MBID row not immediately due after migration", !store.GetDueRetries(10, DateTime.UtcNow).Any(t => t.TrackId == "legacy"));
-        Assert("legacy no-MBID row due after one interval", store.GetDueRetries(10, DateTime.UtcNow + SXMPlaylistHistoryStore.RetryInterval + TimeSpan.FromMinutes(1)).Any(t => t.TrackId == "legacy"));
+        // Legacy rows that were Resolved=1 with no AlbumMusicBrainzId used to go through the retry
+        // sweep; now they're permanent since title-floor is no longer retried. So they should
+        // never appear in GetDueTracks.
+        Assert("legacy no-MBID row never due after migration", !store.GetDueTracks(10).Any(t => t.TrackId == "legacy"));
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, DateTime.UtcNow);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), DateTime.UtcNow);
 
-        Assert("retry columns usable on migrated DB", store.GetDueRetries(10, DateTime.UtcNow + SXMPlaylistHistoryStore.RetryInterval).Any(t => t.TrackId == "track1"));
+        // New track with no resolution attempt is due immediately (NextRetryUtc IS NULL).
+        Assert("new track due on fresh schema", store.GetDueTracks(10).Any(t => t.TrackId == "track1"));
+
+        // Resolve the track so the second init doesn't re-pick it up.
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1"), DateTime.UtcNow);
 
         // Constructing the store again (every start) must not throw, and must not re-stagger rows.
         var store2 = new SXMPlaylistHistoryStore(folder);
         Assert("second initialize is idempotent", store2.GetDueTracks(10).Count == 0);
+    }
+
+    private static void TestStoreMigrationAddsSongKeyColumnsAndBackfills()
+    {
+        Console.WriteLine("\n[Test] Creating the store on an old-schema DB adds SongKey to Plays/Tracks and backfills it");
+
+        var folder = NewFolder();
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        Directory.CreateDirectory(Path.Combine(folder.AppDataFolder, "SXMPlaylist"));
+
+        // Build an old-schema DB (no SongKey on either table) with pre-existing plays + a track.
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var createPlays = new System.Data.SQLite.SQLiteCommand(
+                "CREATE TABLE Plays (PlayId TEXT NOT NULL, Channel TEXT NOT NULL, Artist TEXT NOT NULL, " +
+                "Song TEXT NOT NULL, TimestampUtc TEXT NOT NULL, PRIMARY KEY (PlayId, Artist))",
+                connection);
+            createPlays.ExecuteNonQuery();
+
+            using var createTracks = new System.Data.SQLite.SQLiteCommand(
+                "CREATE TABLE Tracks (TrackId TEXT PRIMARY KEY, Channel TEXT NOT NULL, ArtistsJson TEXT NOT NULL, " +
+                "Song TEXT NOT NULL, DeezerUrl TEXT, AppleMusicUrl TEXT, TimestampUtc TEXT NOT NULL, " +
+                "Resolved INTEGER NOT NULL DEFAULT 0, Failures INTEGER NOT NULL DEFAULT 0, Album TEXT, " +
+                "ArtistMusicBrainzId TEXT, AlbumMusicBrainzId TEXT, ResolvedUtc TEXT)",
+                connection);
+            createTracks.ExecuteNonQuery();
+
+            var ts = DateTime.UtcNow.AddHours(-2).ToString("O");
+            using var play1 = new System.Data.SQLite.SQLiteCommand(
+                "INSERT INTO Plays VALUES ('legacy-p1', 'altnation', 'Artist', '  Repeat Song  ', @ts)", connection);
+            play1.Parameters.AddWithValue("@ts", ts);
+            play1.ExecuteNonQuery();
+
+            using var play2 = new System.Data.SQLite.SQLiteCommand(
+                "INSERT INTO Plays VALUES ('legacy-p2', 'altnation', 'Artist', '  Repeat Song  ', @ts)", connection);
+            play2.Parameters.AddWithValue("@ts", ts);
+            play2.ExecuteNonQuery();
+
+            using var track = new System.Data.SQLite.SQLiteCommand(
+                "INSERT INTO Tracks (TrackId, Channel, ArtistsJson, Song, TimestampUtc) " +
+                "VALUES ('legacy-track', 'altnation', '[\"Artist\"]', '  Repeat Song  ', @ts)", connection);
+            track.Parameters.AddWithValue("@ts", ts);
+            track.ExecuteNonQuery();
+        }
+
+        var store = new SXMPlaylistHistoryStore(folder);
+
+        // The backfill must normalize with the same lower(trim(...)) semantics the C# writes use,
+        // so the minimumPlays EXISTS filter (SongKey = SongKey) matches legacy rows.
+        string? backfilledPlayKey = null;
+        string? backfilledTrackKey = null;
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var readPlay = new System.Data.SQLite.SQLiteCommand("SELECT SongKey FROM Plays WHERE PlayId = 'legacy-p1'", connection);
+            backfilledPlayKey = readPlay.ExecuteScalar() as string;
+            using var readTrack = new System.Data.SQLite.SQLiteCommand("SELECT SongKey FROM Tracks WHERE TrackId = 'legacy-track'", connection);
+            backfilledTrackKey = readTrack.ExecuteScalar() as string;
+        }
+
+        Assert("legacy play row backfilled with normalized SongKey", backfilledPlayKey == "repeat song");
+        Assert("legacy track row backfilled with normalized SongKey", backfilledTrackKey == "repeat song");
+
+        // The minimumPlays filter must work on the migrated DB: two legacy plays for the same
+        // song satisfy minimumPlays = 2, and the legacy track is presented.
+        store.MarkTrackResolved("legacy-track", new AlbumResolution(true, "Repeat Album", null, "repeat-mbid"), DateTime.UtcNow);
+        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow.AddHours(-3), 20, minimumPlays: 2);
+        Assert("minimumPlays=2 filter matches backfilled SongKey rows", presentable.Count == 1 && presentable[0].TrackId == "legacy-track");
+
+        // Re-initializing (every start) must not throw, must not re-run the backfill, and must
+        // keep the migrated data queryable. (The track is resolved for Singles only, so
+        // GetDueTracks still lists it for the Albums priority — that is correct behavior, not a
+        // migration artifact.)
+        var store2 = new SXMPlaylistHistoryStore(folder);
+        var presentableAfterReinit = store2.GetPresentableTracks("altnation", DateTime.UtcNow.AddHours(-3), 20, minimumPlays: 2);
+        Assert("second initialize keeps backfilled data queryable", presentableAfterReinit.Count == 1 && presentableAfterReinit[0].TrackId == "legacy-track");
+    }
+
+    private static void TestStoreMigrationRecreatesPlexPlaylistTrackMatchesWithUnique()
+    {
+        Console.WriteLine("\n[Test] Creating the store on an old-schema DB adds the UNIQUE constraint to PlexPlaylistTrackMatches and dedupes existing rows");
+
+        var folder = NewFolder();
+        var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
+        Directory.CreateDirectory(Path.Combine(folder.AppDataFolder, "SXMPlaylist"));
+
+        // Build an old-schema PlexPlaylistTrackMatches (no UNIQUE) with a genuine duplicate row
+        // (same ListId + SyncUtc + PlayId twice), plus the old supporting index. The SyncUtc
+        // string is captured for reuse later (a fresh DateTime.UtcNow would differ by microseconds
+        // and legitimately not collide with the migrated rows).
+        string legacySyncUtc = DateTime.UtcNow.AddHours(-1).ToString("O");
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var create = new System.Data.SQLite.SQLiteCommand(
+                "CREATE TABLE PlexPlaylistTrackMatches (" +
+                "Id INTEGER PRIMARY KEY AUTOINCREMENT, ListId INTEGER NOT NULL, SyncUtc TEXT NOT NULL, " +
+                "PlayId TEXT NOT NULL, SxmTrackId TEXT, Channel TEXT NOT NULL, Artist TEXT NOT NULL, " +
+                "Song TEXT NOT NULL, TimestampUtc TEXT NOT NULL, RecordingMusicBrainzId TEXT, Isrc TEXT, " +
+                "PlexRatingKey TEXT, PlexArtist TEXT, PlexTitle TEXT, PlexAlbum TEXT, PlexGuid TEXT, " +
+                "MatchMethod TEXT NOT NULL, Confidence TEXT NOT NULL)",
+                connection);
+            create.ExecuteNonQuery();
+
+            using var index = new System.Data.SQLite.SQLiteCommand(
+                "CREATE INDEX IX_PlexPlaylistTrackMatches_List_Time ON PlexPlaylistTrackMatches (ListId, SyncUtc)", connection);
+            index.ExecuteNonQuery();
+
+            var ts = DateTime.UtcNow.AddHours(-2).ToString("O");
+            using var insert = new System.Data.SQLite.SQLiteCommand(
+                "INSERT INTO PlexPlaylistTrackMatches (ListId, SyncUtc, PlayId, Channel, Artist, Song, TimestampUtc, MatchMethod, Confidence) " +
+                "VALUES (5, @syncUtc, 'p1', 'altnation', 'Artist', 'Song', @ts, 'isrc', 'high'), " +
+                "(5, @syncUtc, 'p2', 'altnation', 'Artist', 'Song2', @ts, 'isrc', 'high'), " +
+                "(5, @syncUtc, 'p1', 'altnation', 'Artist', 'Song', @ts, 'isrc', 'high')",
+                connection);
+            insert.Parameters.AddWithValue("@syncUtc", legacySyncUtc);
+            insert.Parameters.AddWithValue("@ts", ts);
+            insert.ExecuteNonQuery();
+        }
+
+        var store = new SXMPlaylistHistoryStore(folder);
+
+        // The migration must collapse the duplicate (3 rows -> 2) instead of failing the copy.
+        long rowCount = 0;
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var count = new System.Data.SQLite.SQLiteCommand("SELECT COUNT(*) FROM PlexPlaylistTrackMatches", connection);
+            rowCount = (long)count.ExecuteScalar();
+        }
+
+        Assert("duplicate audit rows collapsed during migration", rowCount == 2);
+
+        // The constraint must now be live: recording the same (ListId, SyncUtc, PlayId) again is
+        // ignored (INSERT OR IGNORE + UNIQUE) instead of adding another row. Reuse the exact
+        // SyncUtc string the legacy rows were written with.
+        store.RecordPlexPlaylistTrackMatches(5, DateTime.Parse(legacySyncUtc, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind), new[]
+        {
+            new PlexPlaylistTrackMatchRecord("p1", null, "altnation", "Artist", "Song", DateTime.UtcNow.AddHours(-2), null, null, null, null, null, null, null, "isrc", "high")
+        });
+
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var count = new System.Data.SQLite.SQLiteCommand("SELECT COUNT(*) FROM PlexPlaylistTrackMatches", connection);
+            rowCount = (long)count.ExecuteScalar();
+        }
+
+        Assert("INSERT OR IGNORE respects the migrated UNIQUE constraint", rowCount == 2);
+
+        // The supporting index must survive the DROP/recreate (the index name is queried by the
+        // audit read path).
+        bool indexExists = false;
+        using (var connection = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            connection.Open();
+            using var check = new System.Data.SQLite.SQLiteCommand(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'IX_PlexPlaylistTrackMatches_List_Time'", connection);
+            indexExists = (long)check.ExecuteScalar() == 1;
+        }
+
+        Assert("supporting index recreated after table migration", indexExists);
+
+        // Re-initializing must not attempt the recreate again (SchemaInfo flag) and must not throw.
+        var store2 = new SXMPlaylistHistoryStore(folder);
+        Assert("second initialize skips the table recreate", store2.GetDueTracks(10).Count == 0);
     }
 
     private static void TestWorkerCapturesDueChannel()
@@ -2549,6 +2810,34 @@ internal static class Program
         Assert("version-suffixed title matched via fuzzy tier", HasPlaylistItem(httpClient, "100"));
     }
 
+    private static void TestPlexPrefersAlbumMatchWhenAvailable()
+    {
+        Console.WriteLine("\n[Test] Plex match prefers the track whose album matches the SXM-resolved album");
+
+        // Plex returns three "Fancy" tracks on different albums — the first is wrong
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        httpClient.Respond("/library/sections/1/all",
+            "{\"MediaContainer\":{\"Metadata\":[" +
+            "{\"title\":\"Fancy\",\"grandparentTitle\":\"Reba McEntire\",\"ratingKey\":\"100\",\"parentTitle\":\"20th Century Masters\"}," +
+            "{\"title\":\"Fancy\",\"grandparentTitle\":\"Reba McEntire\",\"ratingKey\":\"101\",\"parentTitle\":\"The Hits\"}," +
+            "{\"title\":\"Fancy\",\"grandparentTitle\":\"Reba McEntire\",\"ratingKey\":\"102\",\"parentTitle\":\"Rumor Has It\"}]}}");
+        httpClient.Respond("/playlists?playlistType=audio", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"SXM Alt Nation\",\"ratingKey\":\"500\"}]}}");
+        httpClient.Respond("/playlists/500/items", "{\"MediaContainer\":{\"Metadata\":[{\"ratingKey\":\"999\"}]}}");
+
+        var factory = new FakeNotificationFactory();
+        factory.AddPlexServer();
+        var client = new SXMPlaylistPlexClient(httpClient, factory, LogManager.GetLogger("Test"));
+
+        // SXM resolved to "The Hits" — should prefer the Plex track on that album
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "Reba McEntire", "Fancy", album: "The Hits") });
+
+        Assert("prefers album-matched track over first text match", HasPlaylistItem(httpClient, "101"));
+        Assert("does not match the wrong album track", !HasPlaylistItem(httpClient, "100"));
+        Assert("does not match the other wrong album track", !HasPlaylistItem(httpClient, "102"));
+    }
+
     private static void TestPlexRetriesSearchWithStrippedTitleSuffix()
     {
         Console.WriteLine("\n[Test] Plex search retries with stripped title suffixes");
@@ -2622,30 +2911,30 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
         httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
-        
+
         // Track A: Celebration by Kool & The Gang -> ratingKey 100
         httpClient.Respond("artist=Kool%20%26%20The%20Gang&title=Celebration",
             "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"Celebration\",\"grandparentTitle\":\"Kool & The Gang\",\"ratingKey\":\"100\"}]}}");
-        
+
         // Track B: Stayin' Alive by Bee Gees -> ratingKey 200
         httpClient.Respond("artist=Bee%20Gees&title=Stayin%27%20Alive",
             "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"Stayin' Alive\",\"grandparentTitle\":\"Bee Gees\",\"ratingKey\":\"200\"}]}}");
-        
+
         // Playlist 1
         httpClient.Respond("/playlists?playlistType=audio&title=List+1", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"List 1\",\"ratingKey\":\"501\"}]}}");
         httpClient.Respond("/playlists/501/items", "{\"MediaContainer\":{\"Metadata\":[]}}");
-        
+
         // Playlist 2
         httpClient.Respond("/playlists?playlistType=audio&title=List+2", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"List 2\",\"ratingKey\":\"502\"}]}}");
         httpClient.Respond("/playlists/502/items", "{\"MediaContainer\":{\"Metadata\":[]}}");
 
         var client = NewPlexClient(httpClient);
-        
+
         // Sync list 1 with Track A
         client.ClearTrackCache();
         client.Sync(1, "List 1", new[] { PlayEvent("p1", "Kool & The Gang", "Celebration") });
         var cache1 = client.ExportTrackCache();
-        
+
         // Sync list 2 with Track B
         client.ClearTrackCache();
         client.Sync(2, "List 2", new[] { PlayEvent("p2", "Bee Gees", "Stayin' Alive") });
@@ -2911,9 +3200,9 @@ internal static class Program
         Assert("all keys retained when plex.tv unreachable", retained.ContainsKey("user1") && retained["user1"] == "600");
     }
 
-    private static PlayEventRecord PlayEvent(string playId, string artist, string song, long eventId = 1)
+    private static PlayEventRecord PlayEvent(string playId, string artist, string song, long eventId = 1, string? album = null)
     {
-        return new PlayEventRecord(eventId, playId, "altnation", null, artist, song, DateTime.UtcNow, null, null, null, null);
+        return new PlayEventRecord(eventId, playId, "altnation", null, artist, song, DateTime.UtcNow, null, null, null, null, album: album);
     }
 
     private static SXMPlaylistPlexClient NewPlexClient(FakeHttpClient httpClient)

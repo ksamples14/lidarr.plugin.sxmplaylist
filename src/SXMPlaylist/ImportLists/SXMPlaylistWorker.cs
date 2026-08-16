@@ -15,17 +15,17 @@ using NzbDrone.Core.Profiles.Metadata;
 namespace SXMPlaylist.ImportLists
 {
     /// <summary>
-    /// <summary>
     /// Background worker, hosted by the plugin (see <c>SXMPlaylistPlugin</c>). It owns everything
     /// the import lists used to do inline:
     /// <list type="bullet">
     /// <item>watches Lidarr's import-list definitions for SXM Playlist channels (idle if none exist),</item>
     /// <item>captures each channel's feed (2h cursor backfill) when it's due (~hourly), recording plays and per-track resolution inputs,</item>
-    /// <item>resolves due tracks' albums (Deezer → MusicBrainz, Apple fallback) with a 3-strike give-up, throttled to MusicBrainz's 1 req/s,</item>
+    /// <item>resolves due tracks' albums across all release priorities (Deezer ISRC → MusicBrainz, recording/title-search fallbacks, Apple, title floor) with a 3-strike give-up, throttled to MusicBrainz's 1 req/s,</item>
+    /// <item>re-attempts unresolved tracks on a staggered retry schedule (NextRetryUtc),</item>
+    /// <item>syncs companion Plex playlists and prunes stale state,</item>
     /// <item>rolls the history forward (prune plays/tracks older than the retention window).</item>
     /// </list>
     /// The import lists themselves only query the DB for resolved-and-within-window tracks.
-    /// </summary>
     /// </summary>
     public class SXMPlaylistWorker
     {
@@ -35,7 +35,6 @@ namespace SXMPlaylist.ImportLists
         private static readonly TimeSpan PlexSyncInterval = TimeSpan.FromHours(6);
         private static readonly TimeSpan CompanionCleanupInterval = TimeSpan.FromHours(24);
         private const int ResolutionBatchSize = 50;
-        private const int RetryBatchSize = 15;
 
         private const string BaseUrl = "https://xmplaylist.com";
         private const string ImplementationName = "SXMPlaylistImport";
@@ -251,13 +250,19 @@ namespace SXMPlaylist.ImportLists
 
                     var syncResult = _plexClient.Sync(definition.Id, playlistTitle, events);
 
-                    // Only persist state when the owner playlist was actually found or created: a
-                    // failed pass leaves the stored rating key intact so the next cycle retries instead
-                    // of being throttled out by a fresh LastSyncUtc.
+                    // Persist state on success AND failure: a failed pass must still advance
+                    // LastSyncUtc so the next attempt lands on the 6-hour throttle boundary instead
+                    // of retrying every 60-second worker pass. On failure keep the previous rating
+                    // key (empty when the playlist was never created) so cleanup/prune still have
+                    // something to work with and the retry is throttled, not skipped.
+                    var syncUtc = DateTime.UtcNow;
+                    var ownerRatingKey = syncResult.OwnerPlaylistRatingKey.IsNotNullOrWhiteSpace()
+                        ? syncResult.OwnerPlaylistRatingKey
+                        : state?.PlaylistRatingKey ?? "";
+                    _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, ownerRatingKey, syncUtc, _plexClient.ExportTrackCache(), syncResult.UserPlaylistRatingKeys);
+
                     if (syncResult.OwnerPlaylistRatingKey.IsNotNullOrWhiteSpace())
                     {
-                        var syncUtc = DateTime.UtcNow;
-                        _historyStore.UpsertPlexPlaylistState(definition.Id, playlistTitle, syncResult.OwnerPlaylistRatingKey, syncUtc, _plexClient.ExportTrackCache(), syncResult.UserPlaylistRatingKeys);
                         _historyStore.RecordPlexPlaylistTrackMatches(definition.Id, syncUtc, syncResult.TrackMatches);
                     }
 
@@ -371,6 +376,7 @@ namespace SXMPlaylist.ImportLists
             RefreshShowWindows(channel);
 
             var captured = 0;
+            var batch = new List<CapturePlay>();
 
             foreach (var play in feed.Results)
             {
@@ -392,25 +398,12 @@ namespace SXMPlaylist.ImportLists
                     continue;
                 }
 
-                var isNew = false;
-                var showWindow = _historyStore.GetShowWindowForPlay(playChannel, play.Timestamp);
-                foreach (var artist in play.Track.Artists)
-                {
-                    if (artist.IsNullOrWhiteSpace())
-                    {
-                        continue;
-                    }
-
-                    isNew |= _historyStore.TryRecordPlay(play.Id!, playChannel, artist, song, play.Timestamp);
-                    isNew |= _historyStore.TryRecordPlayEvent(play.Id!, playChannel, trackId, artist, song, play.Timestamp, showWindow);
-                }
-
-                if (isNew)
-                {
-                    _historyStore.UpsertTrack(trackId!, playChannel, play.Track.Artists, song, deezerUrl, appleMusicUrl, play.Timestamp);
-                    captured++;
-                }
+                batch.Add(new CapturePlay(play.Id!, playChannel, trackId!, play.Track.Artists, song, play.Timestamp, deezerUrl, appleMusicUrl));
             }
+
+            // One connection + one transaction for the whole capture (see SXMPlaylistHistoryStore
+            // RecordCapture): plays, play events, show-window attribution, and track upserts.
+            captured = _historyStore.RecordCapture(batch);
 
             _historyStore.SetLastCaptureUtc(channel, DateTime.UtcNow);
             _logger.Debug("Captured {0} new plays for channel {1}", captured, channel);
@@ -449,25 +442,29 @@ namespace SXMPlaylist.ImportLists
         {
             var filtersByChannel = BuildFiltersByChannel();
 
-            // Phase 1: first-time resolution gets the full budget and runs first, so the retry
-            // backlog can never starve fresh tracks.
+            // Single queue: new captures (NextRetryUtc IS NULL) and transient-failure retries
+            // (NextRetryUtc <= now) are both picked up by GetDueTracks. Permanent failures are
+            // marked Resolved=1 and never re-queued.
             var due = _historyStore.GetDueTracks(ResolutionBatchSize);
             foreach (var track in due)
             {
                 token.ThrowIfCancellationRequested();
-                ResolveTrack(track, filtersByChannel, isRetry: false, token);
-            }
-
-            // Phase 2: no-MBID tracks due for a re-attempt, on a much smaller budget.
-            var dueRetries = _historyStore.GetDueRetries(RetryBatchSize, DateTime.UtcNow);
-            foreach (var track in dueRetries)
-            {
-                token.ThrowIfCancellationRequested();
-                ResolveTrack(track, filtersByChannel, isRetry: true, token);
+                try
+                {
+                    ResolveTrack(track, filtersByChannel, token);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn(ex, "Failed to resolve track {0}", track.TrackId);
+                }
             }
         }
 
-        private void ResolveTrack(PendingTrack track, Dictionary<string, AlbumTypeFilter> filtersByChannel, bool isRetry, CancellationToken token)
+        private void ResolveTrack(PendingTrack track, Dictionary<string, AlbumTypeFilter> filtersByChannel, CancellationToken token)
         {
             var links = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (track.DeezerUrl.IsNotNullOrWhiteSpace())
@@ -483,20 +480,12 @@ namespace SXMPlaylist.ImportLists
             var artist = track.Artists.FirstOrDefault() ?? "";
             var baseFilter = filtersByChannel.TryGetValue(track.Channel, out var f) ? f : AlbumTypeFilter.Unrestricted;
             var storedAny = false;
-            var retryIncomplete = false;
-            var resolutions = _albumResolver.ResolveAllPriorities(artist, track.Song, links, baseFilter, track.Artists);
+            var resolutions = _albumResolver.ResolveAllPriorities(artist, track.Song, links, baseFilter, track.Artists, token);
 
-            foreach (var releasePriority in new[] { ReleasePriorityMode.Singles, ReleasePriorityMode.Albums })
+            foreach (var releasePriority in SXMPlaylistAlbumResolver.ReleasePriorities)
             {
                 if (!resolutions.TryGetValue(releasePriority, out var resolution) || !resolution.Resolved)
                 {
-                    retryIncomplete = retryIncomplete || isRetry;
-                    continue;
-                }
-
-                if (isRetry && resolution.AlbumMusicBrainzId.IsNullOrWhiteSpace())
-                {
-                    retryIncomplete = true;
                     continue;
                 }
 
@@ -505,14 +494,23 @@ namespace SXMPlaylist.ImportLists
                 _logger.Debug("Resolved {0} album for {1} - {2}", releasePriority, artist, track.Song);
             }
 
-            if (isRetry && retryIncomplete)
+            if (!storedAny)
             {
-                _historyStore.RecordRetryFailure(track.TrackId, DateTime.UtcNow);
-                _logger.Debug("Retry {0} - {1} still has unresolved priority slots, will retry later", artist, track.Song);
-            }
-            else if (!storedAny)
-            {
-                _historyStore.RecordTrackFailure(track.TrackId);
+                // Gather the best album title from any priority that has one
+                var bestAlbumTitle = resolutions.Values
+                    .Select(r => r.Album)
+                    .FirstOrDefault(a => a.IsNotNullOrWhiteSpace());
+
+                if (_albumResolver.GetLastFailureTransient())
+                {
+                    _historyStore.RecordTransientFailure(track.TrackId, DateTime.UtcNow);
+                    _logger.Debug("Transient MB failure for {0} - {1}, will retry later", artist, track.Song);
+                }
+                else
+                {
+                    _historyStore.RecordPermanentFailure(track.TrackId, bestAlbumTitle);
+                    _logger.Debug("Permanent failure for {0} - {1}, marking as unrecoverable", artist, track.Song);
+                }
             }
         }
 

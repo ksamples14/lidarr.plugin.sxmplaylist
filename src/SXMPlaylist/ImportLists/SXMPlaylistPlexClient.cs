@@ -36,8 +36,16 @@ namespace SXMPlaylist.ImportLists
     {
         private const int AddBatchSize = 100;
         private const int SearchAttempts = 3;
-        private static readonly int[] RetryDelaysMs = { 0, 700, 1500 };
+        // Plex transient-failure backoff. Mutable so the test harness can zero it (the fake HTTP
+        // client never returns transient failures unless a test asks for them, and a real 700ms +
+        // 1500ms sleep per retry cycle would slow the suite).
+        internal static int[] RetryDelaysMs = { 0, 700, 1500 };
         private static readonly TimeSpan PlexTvUserCacheInterval = TimeSpan.FromHours(24);
+
+        // Cap on the persisted per-list track cache. Entries are (artist||title) -> Plex match
+        // records; a bounded cache keeps the per-list TrackCacheJson blob from growing without
+        // limit while still covering the commonly replayed rotation.
+        private const int MaxTrackCacheEntries = 2000;
 
         private const string PlexTvBaseUrl = "https://plex.tv";
         private const string PlexClientIdentifier = "lidarr.sxmplaylist";
@@ -71,6 +79,8 @@ namespace SXMPlaylist.ImportLists
 
         // Seeded from the persisted per-list cache (see SXMPlaylistHistoryStore) so repeated syncs
         // reuse already-matched (artist, title) -> ratingKey pairs instead of re-searching Plex.
+        // Persisted "unmatched" records are seeded too, so tracks absent from the Plex library are
+        // not re-searched on every sync.
         public void SeedTrackCache(IReadOnlyDictionary<string, PlexTrackCacheRecord> cache)
         {
             foreach (var pair in cache)
@@ -79,16 +89,30 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
-        // Returns the non-empty (artist||title) -> ratingKey pairs found this pass so the caller can
-        // persist them.
+        // Returns the (artist||title) -> record pairs found this pass so the caller can persist
+        // them. Both matches and misses are exported: a miss is a record with an empty RatingKey and
+        // MatchMethod "unmatched", which prevents re-searching the same absent track every sync. The
+        // cache is capped so a long lookback window cannot grow the persisted blob without bound —
+        // the newest entries are kept, so old misses age out naturally once the cap is exceeded.
         public IReadOnlyDictionary<string, PlexTrackCacheRecord> ExportTrackCache()
         {
             var result = new Dictionary<string, PlexTrackCacheRecord>(StringComparer.OrdinalIgnoreCase);
             foreach (var pair in _trackRatingKeyCache)
             {
-                if (pair.Value?.RatingKey.IsNotNullOrWhiteSpace() == true)
+                if (pair.Value != null)
                 {
                     result[pair.Key] = pair.Value;
+                }
+            }
+
+            // Dictionary enumeration follows insertion order (no removals in this cache), so the
+            // first entries are the oldest seeded ones; keep the newest MaxTrackCacheEntries.
+            if (result.Count > MaxTrackCacheEntries)
+            {
+                var toDrop = result.Count - MaxTrackCacheEntries;
+                foreach (var key in result.Keys.Take(toDrop).ToList())
+                {
+                    result.Remove(key);
                 }
             }
 
@@ -184,7 +208,12 @@ namespace SXMPlaylist.ImportLists
         // are still included via the home-user switch API. Best-effort: unreachable users
         // (PIN-protected, no library access, plex.tv failures) are skipped with a warning and never
         // fail the owner sync.
-        private void FanOutToSharedUsers(PlexServerSettings plex, string playlistTitle, string machineId, List<string> ratingKeys, PlexSyncResult result)
+        private void FanOutToSharedUsers(
+            PlexServerSettings plex,
+            string playlistTitle,
+            string machineId,
+            List<string> ratingKeys,
+            PlexSyncResult result)
         {
             if (plex.AuthToken.IsNullOrWhiteSpace())
             {
@@ -252,7 +281,7 @@ namespace SXMPlaylist.ImportLists
 
             foreach (var homeUser in homeUsers)
             {
-                if (ShouldSkipUser(homeUser.Id, homeUser.Title, ownerUserId) != null || handled.Contains(homeUser.Id))
+                if (ShouldSkipUser(homeUser.Id, homeUser.Title, ownerUserId, homeUser.IsAdmin) != null || handled.Contains(homeUser.Id))
                 {
                     continue;
                 }
@@ -283,7 +312,16 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
-        private void SyncPlaylistForUser(PlexServerSettings plex, string playlistTitle, string machineId, List<string> ratingKeys, PlexSyncResult result, string displayName, string userId, string? userToken, bool isProtected)
+        private void SyncPlaylistForUser(
+            PlexServerSettings plex,
+            string playlistTitle,
+            string machineId,
+            List<string> ratingKeys,
+            PlexSyncResult result,
+            string displayName,
+            string userId,
+            string? userToken,
+            bool isProtected)
         {
             if (userToken.IsNullOrWhiteSpace())
             {
@@ -321,14 +359,17 @@ namespace SXMPlaylist.ImportLists
         // The owner account is identified by its plex.tv user id (resolved from the token's identity).
         // IsAdmin is used only as a fallback when the id lookup fails, matching Plex Home's single-admin
         // model so a full-account member isn't incorrectly skipped.
-        private static string? ShouldSkipUser(string userId, string displayName, string? ownerUserId)
+        private static string? ShouldSkipUser(string userId, string displayName, string? ownerUserId, bool isAdmin = false)
         {
-            if (ownerUserId.IsNotNullOrWhiteSpace() && userId == ownerUserId)
+            if (ownerUserId.IsNotNullOrWhiteSpace())
             {
-                return "owner account";
+                return string.Equals(userId, ownerUserId, StringComparison.OrdinalIgnoreCase) ? "owner account" : null;
             }
 
-            return null;
+            // Owner-id lookup failed (e.g. plex.tv /api/v2/user unreachable). Plex Home has a single
+            // admin account; skip it rather than fanning the playlist out to the owner's own account
+            // (which cleanup/prune would later treat as a deletable user copy).
+            return isAdmin ? "owner account (admin fallback)" : null;
         }
 
         // Deletes a companion playlist and every fan-out copy previously created for it. Called by
@@ -404,7 +445,9 @@ namespace SXMPlaylist.ImportLists
         // - User absent from shared_servers entirely (fully unshared / removed) -> key dropped: we
         //   cannot manage that account anymore, and keeping a stale key risks collisions if the user
         //   is later re-added.
-        public IReadOnlyDictionary<string, string> PruneUnsharedPlaylistCopies(string playlistTitle, IReadOnlyDictionary<string, string> userPlaylistKeys)
+        public IReadOnlyDictionary<string, string> PruneUnsharedPlaylistCopies(
+            string playlistTitle,
+            IReadOnlyDictionary<string, string> userPlaylistKeys)
         {
             var retained = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (userPlaylistKeys.Count == 0)
@@ -919,7 +962,12 @@ namespace SXMPlaylist.ImportLists
                    ?? json?["user"]?["authToken"]?.Value<string>();
         }
 
-        private List<string> ResolveRatingKeys(string baseUrl, PlexServerSettings plex, List<long> sectionIds, IReadOnlyList<PlayEventRecord> events, List<PlexPlaylistTrackMatchRecord> audit)
+        private List<string> ResolveRatingKeys(
+            string baseUrl,
+            PlexServerSettings plex,
+            List<long> sectionIds,
+            IReadOnlyList<PlayEventRecord> events,
+            List<PlexPlaylistTrackMatchRecord> audit)
         {
             var result = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -952,8 +1000,14 @@ namespace SXMPlaylist.ImportLists
                     var cacheKey = $"{play.Artist}||{song}";
                     if (!_trackRatingKeyCache.TryGetValue(cacheKey, out var cached))
                     {
-                        cached = SearchTrack(baseUrl, plex, sectionIds, play.Artist, song);
-                        _trackRatingKeyCache[cacheKey] = cached;
+                        cached = SearchTrack(baseUrl, plex, sectionIds, play.Artist, song, play.RecordingMusicBrainzId, play.Album);
+
+                        // Persist misses too: an "unmatched" record (empty RatingKey) is cached and
+                        // exported so a track absent from the Plex library is not re-searched on
+                        // every 6h sync. The per-list cache is capped in ExportTrackCache so old
+                        // misses age out and get one re-search attempt once the library grows.
+                        _trackRatingKeyCache[cacheKey] = cached
+                            ?? new PlexTrackCacheRecord("", null, song, null, null, "unmatched", "none");
                     }
 
                     if (cached?.RatingKey.IsNotNullOrWhiteSpace() == true)
@@ -984,6 +1038,24 @@ namespace SXMPlaylist.ImportLists
 
         private static PlexPlaylistTrackMatchRecord BuildAuditRecord(PlayEventRecord play, string song, PlexTrackCacheRecord? match)
         {
+            // Determine MBID match status from the match record and play data.
+            // "verified" = BuildVerifiedRecord confirmed the mbid:// GUID matches the SXM recording MBID.
+            // "mismatch" = the GUID was checked against RecordingMusicBrainzId and didn't match (but text fell through fine).
+            // "unavailable" = no RecordingMusicBrainzId was available from the SXM resolution to compare.
+            string? mbidMatchStatus = null;
+            if (match?.Guid?.StartsWith("mbid://", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                mbidMatchStatus = "verified";
+            }
+            else if (play.RecordingMusicBrainzId.IsNotNullOrWhiteSpace())
+            {
+                mbidMatchStatus = "mismatch";
+            }
+            else
+            {
+                mbidMatchStatus = "unavailable";
+            }
+
             return new PlexPlaylistTrackMatchRecord(
                 play.PlayId,
                 play.TrackId,
@@ -999,7 +1071,8 @@ namespace SXMPlaylist.ImportLists
                 match?.Album,
                 match?.Guid,
                 match?.MatchMethod ?? "unmatched",
-                match?.Confidence ?? "none");
+                match?.Confidence ?? "none",
+                mbidMatchStatus);
         }
 
         private string? FirstPlexGuid(JToken match)
@@ -1008,10 +1081,13 @@ namespace SXMPlaylist.ImportLists
             return guid?.FirstOrDefault()?["id"]?.Value<string>() ?? match["guid"]?.Value<string>();
         }
 
-        private PlexTrackCacheRecord? SearchTrack(string baseUrl, PlexServerSettings plex, List<long> sectionIds, string artist, string song)
+        private PlexTrackCacheRecord? SearchTrack(string baseUrl, PlexServerSettings plex, List<long> sectionIds, string artist, string song, string? recordingMusicBrainzId = null, string? expectedAlbum = null)
         {
             // Two-tier matching (curatorr-inspired): try an exact title match first, then a fuzzy
-            // match that also tolerates version/remaster/live suffixes.
+            // match that also tolerates version/remaster/live suffixes. When a RecordingMusicBrainzId
+            // is available, verify the match by fetching the track's mbid:// GUID from Plex's
+            // metadata endpoint. If the first text match doesn't have the same MBID, iterate
+            // through remaining candidates to find an exact recording match.
             var titleSearchTerms = GetTitleSearchTerms(song);
 
             foreach (var sectionId in sectionIds)
@@ -1036,16 +1112,16 @@ namespace SXMPlaylist.ImportLists
                         continue;
                     }
 
-                    var exactHit = MatchTitle(matches, exactTitle, artistKeys, fuzzy: false);
+                    var exactHit = MatchTitle(matches, exactTitle, artistKeys, fuzzy: false, expectedAlbum);
                     if (exactHit != null)
                     {
-                        return exactHit;
+                        return VerifyOrFallback(baseUrl, plex, exactHit, matches, exactTitle, artistKeys, false, recordingMusicBrainzId);
                     }
 
-                    var fuzzyHit = MatchTitle(matches, fuzzyTitle, artistKeys, fuzzy: true);
+                    var fuzzyHit = MatchTitle(matches, fuzzyTitle, artistKeys, fuzzy: true, expectedAlbum);
                     if (fuzzyHit != null)
                     {
-                        return fuzzyHit;
+                        return VerifyOrFallback(baseUrl, plex, fuzzyHit, matches, fuzzyTitle, artistKeys, true, recordingMusicBrainzId);
                     }
                 }
             }
@@ -1053,45 +1129,165 @@ namespace SXMPlaylist.ImportLists
             return null;
         }
 
-        private PlexTrackCacheRecord? MatchTitle(JArray matches, string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy)
+        // After a text-based match, fetch the track's real mbid:// GUID from the metadata
+        // endpoint and verify it matches the SXM recording. If it doesn't match, iterate
+        // through all remaining text candidates to find one that does. Returns the first
+        // MBID-verified match, or the original text match if none verify.
+        private PlexTrackCacheRecord? VerifyOrFallback(
+            string baseUrl, PlexServerSettings plex,
+            PlexTrackCacheRecord firstHit, JArray allMatches,
+            string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy,
+            string? recordingMusicBrainzId)
         {
+            if (recordingMusicBrainzId.IsNullOrWhiteSpace())
+                return firstHit;
+
+            var verified = VerifyTrackMbid(baseUrl, plex, firstHit.RatingKey!, recordingMusicBrainzId!);
+            if (verified)
+                return BuildVerifiedRecord(firstHit, recordingMusicBrainzId!);
+
+            // First hit didn't match — collect all remaining text candidates and check each one
+            foreach (var match in allMatches)
+            {
+                var candidate = TryBuildMatch(match, normalizedTitle, artistKeys, fuzzy);
+                if (candidate == null) continue;
+                if (candidate.RatingKey == firstHit.RatingKey) continue; // already checked
+
+                if (VerifyTrackMbid(baseUrl, plex, candidate.RatingKey!, recordingMusicBrainzId!))
+                {
+                    return new PlexTrackCacheRecord(
+                        candidate.RatingKey,
+                        candidate.Artist,
+                        candidate.Title,
+                        candidate.Album,
+                        $"mbid://{recordingMusicBrainzId}",
+                        fuzzy ? "fuzzy-title-artist" : "exact-title-artist",
+                        "high");
+                }
+            }
+
+            // No MBID match found — return the original text hit
+            return firstHit;
+        }
+
+        // Fetch a Plex track's mbid:// GUID and compare to our RecordingMusicBrainzId.
+        private bool VerifyTrackMbid(string baseUrl, PlexServerSettings plex, string ratingKey, string recordingMusicBrainzId)
+        {
+            try
+            {
+                var url = $"{baseUrl}/library/metadata/{ratingKey}";
+                var response = Get(url, plex);
+                if (response == null) return false;
+
+                var track = response["MediaContainer"]?["Metadata"]?.FirstOrDefault() as JToken;
+                var guids = track?["Guid"] as JArray;
+                if (guids == null) return false;
+
+                foreach (var guidEntry in guids)
+                {
+                    var id = guidEntry["id"]?.Value<string>();
+                    if (id.IsNullOrWhiteSpace()) continue;
+
+                    // Strip "mbid://" prefix for comparison
+                    var mbid = id!.StartsWith("mbid://", StringComparison.OrdinalIgnoreCase)
+                        ? id.Substring(7)
+                        : id;
+
+                    if (string.Equals(mbid, recordingMusicBrainzId, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "MBID verification failed for ratingKey {0}", ratingKey);
+                return false;
+            }
+        }
+
+        // Rebuild the cache record with the verified mbid:// GUID and updated confidence.
+        private static PlexTrackCacheRecord BuildVerifiedRecord(PlexTrackCacheRecord original, string recordingMusicBrainzId)
+        {
+            return new PlexTrackCacheRecord(
+                original.RatingKey,
+                original.Artist,
+                original.Title,
+                original.Album,
+                $"mbid://{recordingMusicBrainzId}",
+                original.MatchMethod,
+                "high");
+        }
+
+        private PlexTrackCacheRecord? MatchTitle(JArray matches, string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy, string? expectedAlbum = null)
+        {
+            // Two passes when an expected album is available: first prefer candidates whose
+            // Plex album (parentTitle) matches the SXM-resolved album — this disambiguates
+            // multi-version songs ("Fancy" exists on 9 Reba McEntire albums). Fall back to any
+            // title+artist match when no candidate carries the expected album.
+            if (expectedAlbum.IsNotNullOrWhiteSpace())
+            {
+                var expectedAlbumKey = Normalize(expectedAlbum!);
+                foreach (var match in matches)
+                {
+                    var candidate = TryBuildMatch(match, normalizedTitle, artistKeys, fuzzy);
+                    if (candidate != null
+                        && candidate.Album.IsNotNullOrWhiteSpace()
+                        && Normalize(candidate.Album!) == expectedAlbumKey)
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
             foreach (var match in matches)
             {
-                var matchTitle = match["title"]?.Value<string>();
-                if (matchTitle.IsNullOrWhiteSpace())
+                var candidate = TryBuildMatch(match, normalizedTitle, artistKeys, fuzzy);
+                if (candidate != null)
                 {
-                    continue;
-                }
-
-                var candidateTitle = fuzzy ? NormalizeTitleFuzzy(matchTitle!) : NormalizeTitleExact(matchTitle!);
-                if (candidateTitle != normalizedTitle)
-                {
-                    continue;
-                }
-
-                var matchArtist = match["grandparentTitle"]?.Value<string>()
-                                  ?? match["artist"]?.Value<string>()
-                                  ?? match["originalTitle"]?.Value<string>();
-                if (matchArtist.IsNotNullOrWhiteSpace() && ArtistMatches(matchArtist!, artistKeys))
-                {
-                    var ratingKey = match["ratingKey"]?.Value<string>();
-                    if (ratingKey.IsNullOrWhiteSpace())
-                    {
-                        return null;
-                    }
-
-                    return new PlexTrackCacheRecord(
-                        ratingKey!,
-                        matchArtist,
-                        matchTitle,
-                        match["parentTitle"]?.Value<string>(),
-                        FirstPlexGuid(match),
-                        fuzzy ? "fuzzy-title-artist" : "exact-title-artist",
-                        fuzzy ? "medium" : "high");
+                    return candidate;
                 }
             }
 
             return null;
+        }
+
+        private PlexTrackCacheRecord? TryBuildMatch(JToken match, string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy)
+        {
+            var matchTitle = match["title"]?.Value<string>();
+            if (matchTitle.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var candidateTitle = fuzzy ? NormalizeTitleFuzzy(matchTitle!) : NormalizeTitleExact(matchTitle!);
+            if (candidateTitle != normalizedTitle)
+            {
+                return null;
+            }
+
+            var matchArtist = match["grandparentTitle"]?.Value<string>()
+                              ?? match["artist"]?.Value<string>()
+                              ?? match["originalTitle"]?.Value<string>();
+            if (matchArtist.IsNullOrWhiteSpace() || !ArtistMatches(matchArtist!, artistKeys))
+            {
+                return null;
+            }
+
+            var ratingKey = match["ratingKey"]?.Value<string>();
+            if (ratingKey.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            return new PlexTrackCacheRecord(
+                ratingKey!,
+                matchArtist,
+                matchTitle,
+                match["parentTitle"]?.Value<string>(),
+                FirstPlexGuid(match),
+                fuzzy ? "fuzzy-title-artist" : "exact-title-artist",
+                fuzzy ? "medium" : "high");
         }
 
         // Normalizes each credited artist into a set of comparison keys. Includes the whole
@@ -1361,7 +1557,11 @@ namespace SXMPlaylist.ImportLists
             }
             catch (Exception ex)
             {
-                _logger.Debug(ex, "Plex request failed: {0}", url);
+                // The URL may carry X-Plex-Token (appended above) — never write a credential to
+                // the log. Log the URL without the query token.
+                var tokenIdx = url.IndexOf("X-Plex-Token=", StringComparison.OrdinalIgnoreCase);
+                var safeUrl = tokenIdx >= 0 ? url[..tokenIdx].TrimEnd('?', '&') : url;
+                _logger.Debug(ex, "Plex request failed: {0}", safeUrl);
                 return null;
             }
         }

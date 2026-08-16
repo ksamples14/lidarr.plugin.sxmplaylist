@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NLog;
 using NzbDrone.Common.Extensions;
@@ -14,20 +15,27 @@ namespace SXMPlaylist.ImportLists
     /// xmplaylist only gives a song title, never a real album name. Every play's `links` block
     /// includes per-service URLs for that same track, some of which point at real, free, unauthenticated
     /// catalog data we can use to find the actual album:
-    /// 
-    /// 1. Deezer link -> Deezer's public API, which returns both an ISRC and Deezer's own album
-    /// title in the same call:
-    /// 1a. ISRC -> MusicBrainz's exact ISRC lookup -> a real MusicBrainz release-group. This is
-    /// the precise path: an ISRC identifies one specific recording, not a fuzzy text match,
-    /// so we can hand Lidarr real MusicBrainz IDs directly.
-    /// 1b. If that MusicBrainz path doesn't pan out (no ISRC, no MB match, no release-group),
-    /// fall back to Deezer's own album title - we already paid for that API call, no reason
-    /// to throw its answer away and spend a second call on Apple before trying it.
-    /// 2. Apple Music link -> iTunes Lookup API -> a real album title (no MusicBrainz ID). Used only
-    /// when there's no Deezer link at all, or Deezer's track has no album title either.
-    /// 
-    /// Results are cached by the caller (SXMPlaylistHistoryStore, keyed by track id) since the same
-    /// song replays constantly on a rotation-heavy station and its album never changes between plays.
+    ///
+    /// 1. Deezer link -&gt; Deezer's public API, which returns both an ISRC and Deezer's own album
+    ///    title in the same call:
+    ///    1a. ISRC -&gt; MusicBrainz's exact ISRC lookup -&gt; a real MusicBrainz release-group. This is
+    ///        the precise path: an ISRC identifies one specific recording, not a fuzzy text match,
+    ///        so we can hand Lidarr real MusicBrainz IDs directly.
+    ///    1b. If that MusicBrainz path doesn't pan out, fall back to a MusicBrainz recording search
+    ///        (artist candidates + song title), then a release-group title search (artist + Deezer's
+    ///        album title) before settling for Deezer's own album title - we already paid for that
+    ///        API call, no reason to throw its answer away and spend a second call on Apple before
+    ///        trying it.
+    /// 2. Apple Music link -&gt; iTunes Lookup API -&gt; a real album title (no MusicBrainz ID), then the
+    ///    same title-search fallback. Used only when there's no Deezer link at all, or Deezer's
+    ///    track has no album title either.
+    /// 3. Title floor -&gt; Deezer's or Apple's album title with no MusicBrainz ID; Lidarr resolves
+    ///    it via its own fuzzy search.
+    ///
+    /// Resolution is per release priority (Single vs Album), so a track can resolve to different
+    /// releases for different lists. Results are cached by the caller (SXMPlaylistHistoryStore,
+    /// keyed by track id + priority) since the same song replays constantly on a rotation-heavy
+    /// station and its album never changes between plays.
     /// </summary>
     public class SXMPlaylistAlbumResolver
     {
@@ -39,7 +47,10 @@ namespace SXMPlaylist.ImportLists
         // the artist's own release, not whichever "Summer Hits" compilation it also appears on.
         private const string VariousArtistsMbid = "89ad4ac3-39f7-470e-963a-56509c546377";
 
-        private static readonly TimeSpan MusicBrainzMinInterval = TimeSpan.FromSeconds(1.1);
+        // 1.1s pacing keeps the production worker inside MusicBrainz's 1 req/s fair-use limit.
+        // Mutable so the test harness can zero it (the fake HTTP client doesn't touch MusicBrainz,
+        // and 300+ throttled calls would otherwise make the suite take minutes).
+        internal static TimeSpan MusicBrainzMinInterval = TimeSpan.FromSeconds(1.1);
         private static readonly int MusicBrainzMaxRetries = 2;
         private const int MusicBrainzTitleSearchLimit = 25;
         private const int MusicBrainzRecordingSearchLimit = 10;
@@ -51,10 +62,11 @@ namespace SXMPlaylist.ImportLists
         internal static TimeSpan MusicBrainzRetryBackoff = TimeSpan.FromSeconds(2);
 
         private const string UserAgent = "SXMPlaylist-Lidarr-Plugin/1.0 (https://github.com/ksamples14/lidarr.plugin.sxmplaylist)";
-        private static readonly ReleasePriorityMode[] ReleasePriorities = { ReleasePriorityMode.Singles, ReleasePriorityMode.Albums };
+        internal static readonly ReleasePriorityMode[] ReleasePriorities = { ReleasePriorityMode.Singles, ReleasePriorityMode.Albums };
 
         private readonly IHttpClient _httpClient;
         private readonly Logger _logger;
+        private bool _hadTransientMbFailure;
 
         public SXMPlaylistAlbumResolver(IHttpClient httpClient, Logger logger)
         {
@@ -62,14 +74,35 @@ namespace SXMPlaylist.ImportLists
             _logger = logger;
         }
 
-        public AlbumResolution Resolve(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null, IReadOnlyList<string>? artistFragments = null)
+        // Returns true when the most recent ResolveAllPriorities call failed transiently (MB
+        // 503/429 that survived in-resolver sub-retries), false for permanent failures (404, no
+        // data, connection errors from non-MB providers, etc.). Only meaningful when
+        // ResolveAllPriorities returned no valid resolutions.
+        public bool GetLastFailureTransient()
+        {
+            return _hadTransientMbFailure;
+        }
+
+        public AlbumResolution Resolve(
+            string artist,
+            string song,
+            IReadOnlyDictionary<string, string> links,
+            AlbumTypeFilter? filter = null,
+            IReadOnlyList<string>? artistFragments = null,
+            CancellationToken token = default)
         {
             var effectiveFilter = filter ?? AlbumTypeFilter.Unrestricted;
-            var results = ResolveAllPriorities(artist, song, links, effectiveFilter, artistFragments);
+            var results = ResolveAllPriorities(artist, song, links, effectiveFilter, artistFragments, token);
             return results.TryGetValue(effectiveFilter.ReleasePriority, out var resolution) ? resolution : AlbumResolution.NotFound;
         }
 
-        public IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> ResolveAllPriorities(string artist, string song, IReadOnlyDictionary<string, string> links, AlbumTypeFilter? filter = null, IReadOnlyList<string>? artistFragments = null)
+        public IReadOnlyDictionary<ReleasePriorityMode, AlbumResolution> ResolveAllPriorities(
+            string artist,
+            string song,
+            IReadOnlyDictionary<string, string> links,
+            AlbumTypeFilter? filter = null,
+            IReadOnlyList<string>? artistFragments = null,
+            CancellationToken token = default)
         {
             var effectiveFilter = filter ?? AlbumTypeFilter.Unrestricted;
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
@@ -77,20 +110,30 @@ namespace SXMPlaylist.ImportLists
             string? appleAlbumTitle = null;
             string? deezerArtist = null;
             var appleLookupAttempted = false;
+            _hadTransientMbFailure = false;
 
             try
             {
-                var deezerTrack = GetDeezerTrack(artist, links);
+                token.ThrowIfCancellationRequested();
+                var deezerTrack = GetDeezerTrack(artist, links, token);
                 deezerAlbumTitle = deezerTrack?["album"]?["title"]?.Value<string>();
                 deezerArtist = deezerTrack?["artist"]?["name"]?.Value<string>();
 
-                foreach (var result in ResolveViaMusicBrainzAll(deezerTrack, effectiveFilter))
+                foreach (var result in ResolveViaMusicBrainzAll(deezerTrack, deezerArtist, effectiveFilter, token))
                 {
                     _logger.Debug("Resolved {0} via Deezer ISRC to {1} MusicBrainz album '{2}' ({3})", artist, result.Key, result.Value.Album, result.Value.AlbumMusicBrainzId);
                     results[result.Key] = result.Value;
                 }
             }
-            catch (Exception ex)
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (HttpException ex)
+            {
+                _logger.Debug(ex, "Deezer/MusicBrainz album lookup failed for {0} - {1}", artist, song);
+            }
+            catch (JsonReaderException ex)
             {
                 _logger.Debug(ex, "Deezer/MusicBrainz album lookup failed for {0} - {1}", artist, song);
             }
@@ -101,7 +144,8 @@ namespace SXMPlaylist.ImportLists
             {
                 try
                 {
-                    foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artistCandidates, song, effectiveFilter))
+                    token.ThrowIfCancellationRequested();
+                    foreach (var result in ResolveViaMusicBrainzRecordingSearchAll(artistCandidates, song, effectiveFilter, token))
                     {
                         if (!results.ContainsKey(result.Key))
                         {
@@ -110,23 +154,42 @@ namespace SXMPlaylist.ImportLists
                         }
                     }
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException)
                 {
+                    throw;
+                }
+                catch (HttpException ex)
+                {
+                    _hadTransientMbFailure = true;
+                    _logger.Debug(ex, "MusicBrainz recording search fallback failed for {0}; trying title search", artist);
+                }
+                catch (JsonReaderException ex)
+                {
+                    _hadTransientMbFailure = true;
                     _logger.Debug(ex, "MusicBrainz recording search fallback failed for {0}; trying title search", artist);
                 }
             }
 
-            AddMissingTitleSearchResults(results, artistCandidates, deezerAlbumTitle, effectiveFilter, "Deezer");
+            AddMissingTitleSearchResults(results, artistCandidates, deezerAlbumTitle, effectiveFilter, "Deezer", token);
 
             if (!HasAllPriorities(results) && links.ContainsKey("appleMusic"))
             {
                 try
                 {
+                    token.ThrowIfCancellationRequested();
                     appleLookupAttempted = true;
-                    appleAlbumTitle = GetAppleAlbumTitle(artist, links);
-                    AddMissingTitleSearchResults(results, artistCandidates, appleAlbumTitle, effectiveFilter, "Apple");
+                    appleAlbumTitle = GetAppleAlbumTitle(artist, links, token);
+                    AddMissingTitleSearchResults(results, artistCandidates, appleAlbumTitle, effectiveFilter, "Apple", token);
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (HttpException ex)
+                {
+                    _logger.Debug(ex, "Apple Music album lookup failed for {0} - {1}", artist, song);
+                }
+                catch (JsonReaderException ex)
                 {
                     _logger.Debug(ex, "Apple Music album lookup failed for {0} - {1}", artist, song);
                 }
@@ -138,6 +201,7 @@ namespace SXMPlaylist.ImportLists
             {
                 try
                 {
+                    token.ThrowIfCancellationRequested();
                     if (!appleLookupAttempted)
                     {
                         appleLookupAttempted = true;
@@ -146,7 +210,15 @@ namespace SXMPlaylist.ImportLists
 
                     AddTitleOnlyFallback(results, appleAlbumTitle);
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (HttpException ex)
+                {
+                    _logger.Debug(ex, "Apple Music title-only fallback failed for {0} - {1}", artist, song);
+                }
+                catch (JsonReaderException ex)
                 {
                     _logger.Debug(ex, "Apple Music title-only fallback failed for {0} - {1}", artist, song);
                 }
@@ -201,7 +273,7 @@ namespace SXMPlaylist.ImportLists
             return candidates;
         }
 
-        private JToken? GetDeezerTrack(string artist, IReadOnlyDictionary<string, string> links)
+        private JToken? GetDeezerTrack(string artist, IReadOnlyDictionary<string, string> links, CancellationToken token = default)
         {
             if (!links.TryGetValue("deezer", out var deezerUrl))
             {
@@ -215,13 +287,13 @@ namespace SXMPlaylist.ImportLists
                 return null;
             }
 
-            var track = GetJson($"https://api.deezer.com/track/{match.Groups[1].Value}");
+            var track = GetJson($"https://api.deezer.com/track/{match.Groups[1].Value}", token: token);
             var deezerAlbumTitle = track?["album"]?["title"]?.Value<string>();
             _logger.Debug("Deezer lookup for {0} returned album title '{1}'", artist, deezerAlbumTitle ?? "<none>");
             return track;
         }
 
-        private string? GetAppleAlbumTitle(string artist, IReadOnlyDictionary<string, string> links)
+        private string? GetAppleAlbumTitle(string artist, IReadOnlyDictionary<string, string> links, CancellationToken token = default)
         {
             if (!links.TryGetValue("appleMusic", out var appleUrl))
             {
@@ -234,13 +306,19 @@ namespace SXMPlaylist.ImportLists
                 return null;
             }
 
-            var lookup = GetJson($"https://itunes.apple.com/lookup?id={match.Groups[1].Value}");
+            var lookup = GetJson($"https://itunes.apple.com/lookup?id={match.Groups[1].Value}", token: token);
             var albumTitle = lookup?["results"]?.FirstOrDefault()?["collectionName"]?.Value<string>();
             _logger.Debug("Apple Music lookup for {0} returned album title '{1}'", artist, albumTitle ?? "<none>");
             return albumTitle;
         }
 
-        private void AddMissingTitleSearchResults(Dictionary<ReleasePriorityMode, AlbumResolution> results, IReadOnlyList<string> artistCandidates, string? albumTitle, AlbumTypeFilter filter, string source)
+        private void AddMissingTitleSearchResults(
+            Dictionary<ReleasePriorityMode, AlbumResolution> results,
+            IReadOnlyList<string> artistCandidates,
+            string? albumTitle,
+            AlbumTypeFilter filter,
+            string source,
+            CancellationToken token = default)
         {
             if (HasAllPriorities(results) || albumTitle.IsNullOrWhiteSpace())
             {
@@ -258,7 +336,11 @@ namespace SXMPlaylist.ImportLists
                     }
                 }
             }
-            catch (Exception ex)
+            catch (HttpException ex)
+            {
+                _logger.Debug(ex, "MusicBrainz {0} title search fallback failed for {1}", source, string.Join(" / ", artistCandidates));
+            }
+            catch (JsonReaderException ex)
             {
                 _logger.Debug(ex, "MusicBrainz {0} title search fallback failed for {1}", source, string.Join(" / ", artistCandidates));
             }
@@ -277,7 +359,11 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzRecordingSearchAll(IReadOnlyList<string> artistCandidates, string song, AlbumTypeFilter filter)
+        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzRecordingSearchAll(
+            IReadOnlyList<string> artistCandidates,
+            string song,
+            AlbumTypeFilter filter,
+            CancellationToken token = default)
         {
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
             if (artistCandidates == null || artistCandidates.Count == 0 || song.IsNullOrWhiteSpace())
@@ -305,8 +391,8 @@ namespace SXMPlaylist.ImportLists
                 var detailLookups = 0;
 
                 var query = BuildRecordingSearchQuery(artist, song);
-                ThrottleMusicBrainz();
-                var search = GetJson($"https://musicbrainz.org/ws/2/recording?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzRecordingSearchLimit}", musicBrainz: true);
+                ThrottleMusicBrainz(token);
+                var search = GetJson($"https://musicbrainz.org/ws/2/recording?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzRecordingSearchLimit}", musicBrainz: true, token);
                 var recordings = search?["recordings"] as JArray;
                 if (recordings == null || recordings.Count == 0)
                 {
@@ -354,10 +440,11 @@ namespace SXMPlaylist.ImportLists
 
                     detailLookups++;
 
-                    ThrottleMusicBrainz();
+                    ThrottleMusicBrainz(token);
                     var fullRecording = GetJson(
                         $"https://musicbrainz.org/ws/2/recording/{recordingId}?inc=releases+release-groups+artist-credits&fmt=json",
-                        musicBrainz: true);
+                        musicBrainz: true,
+                        token);
                     var releases = fullRecording?["releases"] as JArray;
                     if (releases == null || releases.Count == 0)
                     {
@@ -378,7 +465,12 @@ namespace SXMPlaylist.ImportLists
                     }
                 }
 
-                if (releaseCandidates.Count > 0)
+                // Only stop trying artist candidates when we actually accumulated a release that
+                // can survive release-group selection. releaseCandidates holds raw releases; the
+                // VA/compilation/profile gates run later inside SelectBestReleaseGroup, so a
+                // candidate whose only releases are VA compilations must not consume the budget
+                // and starve a later, correct artist candidate ("Kool" vs "Kool & The Gang").
+                if (releaseCandidates.Count > 0 && HasEligibleReleaseGroup(releaseCandidates, filter))
                 {
                     break;
                 }
@@ -409,7 +501,7 @@ namespace SXMPlaylist.ImportLists
             return results;
         }
 
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzAll(JToken? track, AlbumTypeFilter filter)
+        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzAll(JToken? track, string? deezerArtist, AlbumTypeFilter filter, CancellationToken token = default)
         {
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
             var isrc = track?["isrc"]?.Value<string>();
@@ -419,9 +511,16 @@ namespace SXMPlaylist.ImportLists
                 return results;
             }
 
-            ThrottleMusicBrainz();
-            var isrcResult = GetJson($"https://musicbrainz.org/ws/2/isrc/{isrc}?fmt=json", musicBrainz: true);
-            var recordingId = isrcResult?["recordings"]?.FirstOrDefault()?["id"]?.Value<string>();
+            ThrottleMusicBrainz(token);
+            var isrcResult = GetJson($"https://musicbrainz.org/ws/2/isrc/{isrc}?fmt=json", musicBrainz: true, token);
+
+            // MusicBrainz ISRC lookups can return multiple recordings (mis-credited duplicates,
+            // re-issues). Prefer the one whose artist-credit matches the played/Deezer artist so a
+            // wrong-artist recording can't be attached with real MBIDs; fall back to the first.
+            var recordings = isrcResult?["recordings"] as JArray;
+            var recordingId = recordings?
+                .FirstOrDefault(r => ArtistCreditMatches(r, deezerArtist))?["id"]?.Value<string>()
+                ?? recordings?.FirstOrDefault()?["id"]?.Value<string>();
 
             if (recordingId.IsNullOrWhiteSpace())
             {
@@ -429,10 +528,11 @@ namespace SXMPlaylist.ImportLists
                 return results;
             }
 
-            ThrottleMusicBrainz();
+            ThrottleMusicBrainz(token);
             var recording = GetJson(
                 $"https://musicbrainz.org/ws/2/recording/{recordingId}?inc=releases+release-groups+artist-credits&fmt=json",
-                musicBrainz: true);
+                musicBrainz: true,
+                token);
 
             var artistCredits = recording?["artist-credit"] as JArray;
             string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
@@ -455,7 +555,12 @@ namespace SXMPlaylist.ImportLists
             return results;
         }
 
-        private static AlbumResolution? BuildResolution(JToken? releaseGroup, string? artistMbid, string? recordingMbid = null, string? isrc = null, string? resolutionMethod = null)
+        private static AlbumResolution? BuildResolution(
+            JToken? releaseGroup,
+            string? artistMbid,
+            string? recordingMbid = null,
+            string? isrc = null,
+            string? resolutionMethod = null)
         {
             var albumTitle = releaseGroup?["title"]?.Value<string>();
             var albumMbid = releaseGroup?["id"]?.Value<string>();
@@ -469,7 +574,11 @@ namespace SXMPlaylist.ImportLists
         // artist + the album title we already got (from Deezer or Apple), gated by a fuzzy
         // artist-credit match and a title-similarity threshold so a same-titled album by a
         // different artist can't be attached. Returns real MBIDs when matches are confident.
-        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzTitleSearchAll(IReadOnlyList<string> artistCandidates, string? albumTitle, AlbumTypeFilter filter)
+        private Dictionary<ReleasePriorityMode, AlbumResolution> ResolveViaMusicBrainzTitleSearchAll(
+            IReadOnlyList<string> artistCandidates,
+            string? albumTitle,
+            AlbumTypeFilter filter,
+            CancellationToken token = default)
         {
             var results = new Dictionary<ReleasePriorityMode, AlbumResolution>();
             if (artistCandidates == null || artistCandidates.Count == 0 || albumTitle.IsNullOrWhiteSpace())
@@ -491,7 +600,7 @@ namespace SXMPlaylist.ImportLists
 
                 var query = BuildTitleSearchQuery(artist, albumTitle!);
                 ThrottleMusicBrainz();
-                var result = GetJson($"https://musicbrainz.org/ws/2/release?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzTitleSearchLimit}", musicBrainz: true);
+                var result = GetJson($"https://musicbrainz.org/ws/2/release?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzTitleSearchLimit}", musicBrainz: true, token);
 
                 var releases = result?["releases"] as JArray;
                 if (releases == null || releases.Count == 0)
@@ -639,18 +748,19 @@ namespace SXMPlaylist.ImportLists
         }
 
         // True when any credited artist on the release plausibly matches the played artist name.
-        private static bool ArtistCreditMatches(JToken release, string playedArtist)
+        private static bool ArtistCreditMatches(JToken release, string? playedArtist)
         {
             var credit = release["artist-credit"] as JArray;
-            if (credit == null || credit.Count == 0)
+            if (credit == null || credit.Count == 0 || playedArtist.IsNullOrWhiteSpace())
             {
+                // No artist data to compare against — can't reject on this basis.
                 return true;
             }
 
             foreach (var entry in credit)
             {
                 var name = entry["artist"]?["name"]?.Value<string>();
-                if (name.IsNotNullOrWhiteSpace() && ArtistSimilarity(name!, playedArtist) >= ArtistMatchFloor)
+                if (name.IsNotNullOrWhiteSpace() && ArtistSimilarity(name!, playedArtist!) >= ArtistMatchFloor)
                 {
                     return true;
                 }
@@ -721,8 +831,8 @@ namespace SXMPlaylist.ImportLists
         // album titles). Uses containment of the shorter name in the longer as a token-set proxy.
         private static double ArtistSimilarity(string a, string b)
         {
-            var na = NormalizeForMatch(a);
-            var nb = NormalizeForMatch(b);
+            var na = StripLeadingArticle(NormalizeForMatch(a));
+            var nb = StripLeadingArticle(NormalizeForMatch(b));
             if (string.IsNullOrEmpty(na) || string.IsNullOrEmpty(nb))
             {
                 return 0.0;
@@ -737,7 +847,36 @@ namespace SXMPlaylist.ImportLists
             var tokensB = nb.Split(' ').ToHashSet();
             var intersection = tokensA.Intersect(tokensB).Count();
             var union = tokensA.Union(tokensB).Count();
-            return union == 0 ? 0.0 : (double)intersection / union;
+
+            // Containment of the shorter name in the longer: "police" ⊂ "the police" (after the
+            // article strip) scores 1.0 even though the plain Jaccard would be 0.5 — leading
+            // articles are extremely common in artist names and must not fail the artist gate.
+            var tokenScore = union == 0 ? 0.0 : (double)intersection / union;
+            var smaller = Math.Min(tokensA.Count, tokensB.Count);
+            var containment = smaller == 0 ? 0.0 : (double)intersection / smaller;
+            return Math.Max(tokenScore, containment);
+        }
+
+        // Strips a leading "the/a/an" so "The Police" compares equal to "Police". Applied only to
+        // artist matching — album titles keep their articles.
+        private static string StripLeadingArticle(string normalized)
+        {
+            if (normalized.StartsWith("the ", StringComparison.Ordinal))
+            {
+                return normalized[4..];
+            }
+
+            if (normalized.StartsWith("a ", StringComparison.Ordinal))
+            {
+                return normalized[2..];
+            }
+
+            if (normalized.StartsWith("an ", StringComparison.Ordinal))
+            {
+                return normalized[3..];
+            }
+
+            return normalized;
         }
 
         private static int LevenshteinDistance(string a, string b)
@@ -765,7 +904,11 @@ namespace SXMPlaylist.ImportLists
             return dp[a.Length, b.Length];
         }
 
-        private static JToken? SelectBestReleaseGroup(JToken? recording, string? recordingArtistId, AlbumTypeFilter filter, Logger? logger = null)
+        private static JToken? SelectBestReleaseGroup(
+            JToken? recording,
+            string? recordingArtistId,
+            AlbumTypeFilter filter,
+            Logger? logger = null)
         {
             var releases = recording?["releases"] as JArray;
             if (releases == null || releases.Count == 0)
@@ -931,6 +1074,57 @@ namespace SXMPlaylist.ImportLists
             return hasEligible ? 0 : 2;
         }
 
+        // True when at least one accumulated release survives the gates SelectBestReleaseGroup will
+        // apply later (profile primary/status types, VA exclusion, and either an allowed secondary
+        // type or the same-artist compilation fallback). Used to decide whether a recording-search
+        // candidate is worth stopping on — see the early-break in
+        // ResolveViaMusicBrainzRecordingSearchAll.
+        private static bool HasEligibleReleaseGroup(IEnumerable<JToken> releaseCandidates, AlbumTypeFilter filter)
+        {
+            foreach (var release in releaseCandidates)
+            {
+                var releaseGroup = release["release-group"];
+                if (releaseGroup == null)
+                {
+                    continue;
+                }
+
+                var primaryType = releaseGroup["primary-type"]?.Value<string>() ?? "";
+                if (!filter.PrimaryTypes.Contains(primaryType))
+                {
+                    continue;
+                }
+
+                if (!filter.Statuses.Contains(release["status"]?.Value<string>() ?? ""))
+                {
+                    continue;
+                }
+
+                if (IsVariousArtistsRelease(release))
+                {
+                    continue;
+                }
+
+                // Pass 1: a secondary type allowed by the profile (no secondary types counts as
+                // Studio) — mirrors SelectBestReleaseGroup's first candidate pass.
+                if (SecondaryTypesAllowed(releaseGroup, filter.SecondaryTypes))
+                {
+                    return true;
+                }
+
+                // Pass 2: same-artist compilations whose secondary type the profile excludes are
+                // still eligible as a last resort (mirrors SelectBestReleaseGroup's fallback pass).
+                // Skipping this here would falsely continue the artist loop for compilation-only
+                // candidates and let the next candidate's budget starve the correct one.
+                if (!SecondaryTypesAllowed(releaseGroup, filter.SecondaryTypes) && IsCompilationReleaseGroup(releaseGroup))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         // Approved ranking ladder (PLAN §6.6): lower = better.
         private static int ReleaseStatusRank(string? status)
         {
@@ -1047,13 +1241,15 @@ namespace SXMPlaylist.ImportLists
             return credit[0]["artist"];
         }
 
-        private JToken? GetJson(string url, bool musicBrainz = false)
+        private JToken? GetJson(string url, bool musicBrainz = false, CancellationToken token = default)
         {
             var request = new HttpRequest(url, HttpAccept.Json);
             request.Headers.Add("User-Agent", UserAgent);
 
             for (var attempt = 0; ; attempt++)
             {
+                token.ThrowIfCancellationRequested();
+
                 var response = _httpClient.Get(request);
 
                 if (response.StatusCode == System.Net.HttpStatusCode.OK && response.Content.IsNotNullOrWhiteSpace())
@@ -1071,24 +1267,41 @@ namespace SXMPlaylist.ImportLists
 
                 if (!retriable)
                 {
+                    // If we exhausted MB retries on a 503/429, flag it as transient so the
+                    // caller can schedule a later re-attempt instead of giving up permanently.
+                    if (musicBrainz
+                        && attempt >= MusicBrainzMaxRetries
+                        && (response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable
+                            || response.StatusCode == System.Net.HttpStatusCode.TooManyRequests))
+                    {
+                        _hadTransientMbFailure = true;
+                    }
                     return null;
                 }
 
                 var backoff = MusicBrainzRetryBackoff * (attempt + 1);
                 _logger.Debug("MusicBrainz returned {0}, retrying in {1}ms", response.StatusCode, backoff.TotalMilliseconds);
-                Thread.Sleep(backoff);
+                if (token.WaitHandle.WaitOne(backoff))
+                {
+                    token.ThrowIfCancellationRequested();
+                }
             }
         }
 
-        private static void ThrottleMusicBrainz()
+        private static void ThrottleMusicBrainz(CancellationToken token = default)
         {
-            MusicBrainzGate.Wait();
+            MusicBrainzGate.Wait(token);
             try
             {
+                token.ThrowIfCancellationRequested();
                 var elapsed = DateTime.UtcNow - _lastMusicBrainzCallUtc;
                 if (elapsed < MusicBrainzMinInterval)
                 {
-                    Thread.Sleep(MusicBrainzMinInterval - elapsed);
+                    var wait = MusicBrainzMinInterval - elapsed;
+                    if (token.WaitHandle.WaitOne(wait))
+                    {
+                        token.ThrowIfCancellationRequested();
+                    }
                 }
 
                 _lastMusicBrainzCallUtc = DateTime.UtcNow;
@@ -1114,7 +1327,11 @@ namespace SXMPlaylist.ImportLists
             new HashSet<string> { "Official", "Promotion", "Bootleg", "Pseudo-Release" },
             ReleasePriorityMode.Singles);
 
-        public AlbumTypeFilter(HashSet<string> primaryTypes, HashSet<string> secondaryTypes, HashSet<string> statuses, ReleasePriorityMode releasePriority = ReleasePriorityMode.Singles)
+        public AlbumTypeFilter(
+            HashSet<string> primaryTypes,
+            HashSet<string> secondaryTypes,
+            HashSet<string> statuses,
+            ReleasePriorityMode releasePriority = ReleasePriorityMode.Singles)
         {
             PrimaryTypes = primaryTypes;
             SecondaryTypes = secondaryTypes;
