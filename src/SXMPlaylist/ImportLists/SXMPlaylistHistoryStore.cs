@@ -200,6 +200,7 @@ namespace SXMPlaylist.ImportLists
                 "ArtistMusicBrainzId TEXT, " +
                 "AlbumMusicBrainzId TEXT, " +
                 "RecordingMusicBrainzId TEXT, " +
+                "TrackMusicBrainzId TEXT, " +
                 "Isrc TEXT, " +
                 "ResolutionMethod TEXT, " +
                 "ResolvedUtc TEXT, " +
@@ -215,6 +216,7 @@ namespace SXMPlaylist.ImportLists
             var addedNextRetry = EnsureColumn(connection, "Tracks", "NextRetryUtc", "TEXT");
             var addedRetryAttempts = EnsureColumn(connection, "Tracks", "RetryAttempts", "INTEGER NOT NULL DEFAULT 0");
             EnsureColumn(connection, "Tracks", "RecordingMusicBrainzId", "TEXT");
+            EnsureColumn(connection, "Tracks", "TrackMusicBrainzId", "TEXT");
             EnsureColumn(connection, "Tracks", "Isrc", "TEXT");
             EnsureColumn(connection, "Tracks", "ResolutionMethod", "TEXT");
 
@@ -889,7 +891,7 @@ namespace SXMPlaylist.ImportLists
             return results;
         }
 
-        // Tracks with an album MBID but no recording MBID — candidates for Lidarr backfill.
+        // Tracks with an album MBID but no recording or track MBID — candidates for Lidarr backfill.
         public IReadOnlyList<(string TrackId, string AlbumMbid, string Song, string Channel)> GetTracksWithoutRecordingMbid()
         {
             var results = new List<(string, string, string, string)>();
@@ -898,7 +900,8 @@ namespace SXMPlaylist.ImportLists
             using var command = new SQLiteCommand(
                 "SELECT TrackId, AlbumMusicBrainzId, Song, Channel FROM Tracks " +
                 "WHERE AlbumMusicBrainzId IS NOT NULL AND AlbumMusicBrainzId <> '' " +
-                "AND (RecordingMusicBrainzId IS NULL OR RecordingMusicBrainzId = '')",
+                "AND ((RecordingMusicBrainzId IS NULL OR RecordingMusicBrainzId = '') " +
+                "OR (TrackMusicBrainzId IS NULL OR TrackMusicBrainzId = ''))",
                 connection);
 
             using var reader = command.ExecuteReader();
@@ -922,6 +925,18 @@ namespace SXMPlaylist.ImportLists
                 connection);
 
             command.Parameters.AddWithValue("@recordingMbid", recordingMusicBrainzId);
+            command.Parameters.AddWithValue("@trackId", trackId);
+            command.ExecuteNonQuery();
+        }
+
+        public void UpdateTrackMusicBrainzId(string trackId, string trackMusicBrainzId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET TrackMusicBrainzId = @trackMbid WHERE TrackId = @trackId",
+                connection);
+
+            command.Parameters.AddWithValue("@trackMbid", trackMusicBrainzId);
             command.Parameters.AddWithValue("@trackId", trackId);
             command.ExecuteNonQuery();
         }
@@ -965,6 +980,7 @@ namespace SXMPlaylist.ImportLists
                 "ArtistMusicBrainzId = CASE WHEN @priority = @singles THEN @artistMbid ELSE ArtistMusicBrainzId END, " +
                 "AlbumMusicBrainzId = CASE WHEN @priority = @singles THEN @albumMbid ELSE AlbumMusicBrainzId END, " +
                 "RecordingMusicBrainzId = COALESCE(@recordingMbid, RecordingMusicBrainzId), " +
+                "TrackMusicBrainzId = COALESCE(@trackMbid, TrackMusicBrainzId), " +
                 "Isrc = COALESCE(@isrc, Isrc), " +
                 "ResolutionMethod = COALESCE(@resolutionMethod, ResolutionMethod), " +
                 "ResolvedUtc = @resolvedUtc, " +
@@ -979,6 +995,7 @@ namespace SXMPlaylist.ImportLists
                 command.Parameters.AddWithValue("@artistMbid", (object?)resolution.ArtistMusicBrainzId ?? DBNull.Value);
                 command.Parameters.AddWithValue("@albumMbid", (object?)resolution.AlbumMusicBrainzId ?? DBNull.Value);
                 command.Parameters.AddWithValue("@recordingMbid", (object?)resolution.RecordingMusicBrainzId ?? DBNull.Value);
+                command.Parameters.AddWithValue("@trackMbid", (object?)resolution.TrackMusicBrainzId ?? DBNull.Value);
                 command.Parameters.AddWithValue("@isrc", (object?)resolution.Isrc ?? DBNull.Value);
                 command.Parameters.AddWithValue("@resolutionMethod", (object?)resolution.ResolutionMethod ?? DBNull.Value);
                 command.Parameters.AddWithValue("@resolvedUtc", resolvedAt.ToString("O"));
@@ -1401,7 +1418,7 @@ namespace SXMPlaylist.ImportLists
 
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
-                "SELECT p.PlayEventId, p.PlayId, p.Channel, p.TrackId, p.Artist, p.Song, p.TimestampUtc, p.ProgramId, p.ShowName, p.ShowStartUtc, p.ShowEndUtc, t.RecordingMusicBrainzId, t.Isrc, t.Album " +
+                "SELECT p.PlayEventId, p.PlayId, p.Channel, p.TrackId, p.Artist, p.Song, p.TimestampUtc, p.ProgramId, p.ShowName, p.ShowStartUtc, p.ShowEndUtc, t.RecordingMusicBrainzId, t.TrackMusicBrainzId, t.Isrc, t.Album " +
                 "FROM PlayEvents p LEFT JOIN Tracks t ON t.TrackId = p.TrackId WHERE p.Channel = @channel AND p.TimestampUtc >= @since AND p.TimestampUtc < @until" + showFilter +
                 " ORDER BY p.TimestampUtc",
                 connection);
@@ -1430,7 +1447,8 @@ namespace SXMPlaylist.ImportLists
                     reader.IsDBNull(10) ? null : DateTime.Parse(reader.GetString(10)).ToUniversalTime(),
                     reader.IsDBNull(11) ? null : reader.GetString(11),
                     reader.IsDBNull(12) ? null : reader.GetString(12),
-                    reader.IsDBNull(13) ? null : reader.GetString(13)));
+                    reader.IsDBNull(13) ? null : reader.GetString(13),
+                    reader.IsDBNull(14) ? null : reader.GetString(14)));
             }
 
             return results;
@@ -1685,6 +1703,7 @@ namespace SXMPlaylist.ImportLists
             DateTime? showStartUtc,
             DateTime? showEndUtc,
             string? recordingMusicBrainzId = null,
+            string? trackMusicBrainzId = null,
             string? isrc = null,
             string? album = null)
         {
@@ -1700,6 +1719,7 @@ namespace SXMPlaylist.ImportLists
             ShowStartUtc = showStartUtc;
             ShowEndUtc = showEndUtc;
             RecordingMusicBrainzId = recordingMusicBrainzId;
+            TrackMusicBrainzId = trackMusicBrainzId;
             Isrc = isrc;
             Album = album;
         }
@@ -1716,6 +1736,7 @@ namespace SXMPlaylist.ImportLists
         public DateTime? ShowStartUtc { get; }
         public DateTime? ShowEndUtc { get; }
         public string? RecordingMusicBrainzId { get; }
+        public string? TrackMusicBrainzId { get; }
         public string? Isrc { get; }
         public string? Album { get; }
     }
@@ -1830,6 +1851,7 @@ namespace SXMPlaylist.ImportLists
             string? artistMusicBrainzId,
             string? albumMusicBrainzId,
             string? recordingMusicBrainzId = null,
+            string? trackMusicBrainzId = null,
             string? isrc = null,
             string? resolutionMethod = null)
         {
@@ -1838,6 +1860,7 @@ namespace SXMPlaylist.ImportLists
             ArtistMusicBrainzId = artistMusicBrainzId;
             AlbumMusicBrainzId = albumMusicBrainzId;
             RecordingMusicBrainzId = recordingMusicBrainzId;
+            TrackMusicBrainzId = trackMusicBrainzId;
             Isrc = isrc;
             ResolutionMethod = resolutionMethod;
         }
@@ -1847,6 +1870,7 @@ namespace SXMPlaylist.ImportLists
         public string? ArtistMusicBrainzId { get; }
         public string? AlbumMusicBrainzId { get; }
         public string? RecordingMusicBrainzId { get; }
+        public string? TrackMusicBrainzId { get; }
         public string? Isrc { get; }
         public string? ResolutionMethod { get; }
     }

@@ -1875,7 +1875,7 @@ internal static class Program
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1", "recording-mbid-1", "USSM19601763", "isrc"), now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1", recordingMusicBrainzId: "recording-mbid-1", isrc: "USSM19601763", resolutionMethod: "isrc"), now);
 
         var dbPath = Path.Combine(folder.AppDataFolder, "SXMPlaylist", "history.db");
         using var connection = new SQLiteConnection($"Data Source={dbPath};Version=3;");
@@ -2778,7 +2778,7 @@ internal static class Program
         var client = NewPlexClient(httpClient);
         var result = client.Sync(42, "SXM Alt Nation", new[]
         {
-            new PlayEventRecord(1, "p1", "altnation", "track1", "Kool & The Gang", "Celebration", DateTime.UtcNow, null, null, null, null, "recording-mbid-1", "USDE12345678")
+            new PlayEventRecord(1, "p1", "altnation", "track1", "Kool & The Gang", "Celebration", DateTime.UtcNow, null, null, null, null, recordingMusicBrainzId: "recording-mbid-1", isrc: "USDE12345678")
         });
 
         var match = result.TrackMatches.SingleOrDefault();

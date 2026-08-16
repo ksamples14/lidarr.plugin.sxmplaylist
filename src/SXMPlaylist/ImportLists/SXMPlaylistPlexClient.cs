@@ -1000,7 +1000,7 @@ namespace SXMPlaylist.ImportLists
                     var cacheKey = $"{play.Artist}||{song}";
                     if (!_trackRatingKeyCache.TryGetValue(cacheKey, out var cached))
                     {
-                        cached = SearchTrack(baseUrl, plex, sectionIds, play.Artist, song, play.RecordingMusicBrainzId, play.Album);
+                        cached = SearchTrack(baseUrl, plex, sectionIds, play.Artist, song, play.RecordingMusicBrainzId, play.TrackMusicBrainzId, play.Album);
 
                         // Persist misses too: an "unmatched" record (empty RatingKey) is cached and
                         // exported so a track absent from the Plex library is not re-searched on
@@ -1047,6 +1047,10 @@ namespace SXMPlaylist.ImportLists
             {
                 mbidMatchStatus = "verified";
             }
+            else if (play.TrackMusicBrainzId.IsNotNullOrWhiteSpace())
+            {
+                mbidMatchStatus = "mismatch";
+            }
             else if (play.RecordingMusicBrainzId.IsNotNullOrWhiteSpace())
             {
                 mbidMatchStatus = "mismatch";
@@ -1081,7 +1085,7 @@ namespace SXMPlaylist.ImportLists
             return guid?.FirstOrDefault()?["id"]?.Value<string>() ?? match["guid"]?.Value<string>();
         }
 
-        private PlexTrackCacheRecord? SearchTrack(string baseUrl, PlexServerSettings plex, List<long> sectionIds, string artist, string song, string? recordingMusicBrainzId = null, string? expectedAlbum = null)
+        private PlexTrackCacheRecord? SearchTrack(string baseUrl, PlexServerSettings plex, List<long> sectionIds, string artist, string song, string? recordingMusicBrainzId = null, string? trackMusicBrainzId = null, string? expectedAlbum = null)
         {
             // Two-tier matching (curatorr-inspired): try an exact title match first, then a fuzzy
             // match that also tolerates version/remaster/live suffixes. When a RecordingMusicBrainzId
@@ -1115,13 +1119,13 @@ namespace SXMPlaylist.ImportLists
                     var exactHit = MatchTitle(matches, exactTitle, artistKeys, fuzzy: false, expectedAlbum);
                     if (exactHit != null)
                     {
-                        return VerifyOrFallback(baseUrl, plex, exactHit, matches, exactTitle, artistKeys, false, recordingMusicBrainzId);
+                        return VerifyOrFallback(baseUrl, plex, exactHit, matches, exactTitle, artistKeys, false, recordingMusicBrainzId, trackMusicBrainzId);
                     }
 
                     var fuzzyHit = MatchTitle(matches, fuzzyTitle, artistKeys, fuzzy: true, expectedAlbum);
                     if (fuzzyHit != null)
                     {
-                        return VerifyOrFallback(baseUrl, plex, fuzzyHit, matches, fuzzyTitle, artistKeys, true, recordingMusicBrainzId);
+                        return VerifyOrFallback(baseUrl, plex, fuzzyHit, matches, fuzzyTitle, artistKeys, true, recordingMusicBrainzId, trackMusicBrainzId);
                     }
                 }
             }
@@ -1137,14 +1141,17 @@ namespace SXMPlaylist.ImportLists
             string baseUrl, PlexServerSettings plex,
             PlexTrackCacheRecord firstHit, JArray allMatches,
             string normalizedTitle, IReadOnlyList<string> artistKeys, bool fuzzy,
-            string? recordingMusicBrainzId)
+            string? recordingMusicBrainzId, string? trackMusicBrainzId = null)
         {
-            if (recordingMusicBrainzId.IsNullOrWhiteSpace())
+            if (recordingMusicBrainzId.IsNullOrWhiteSpace() && trackMusicBrainzId.IsNullOrWhiteSpace())
                 return firstHit;
 
-            var verified = VerifyTrackMbid(baseUrl, plex, firstHit.RatingKey!, recordingMusicBrainzId!);
+            var verified = VerifyTrackMbid(baseUrl, plex, firstHit.RatingKey!, recordingMusicBrainzId!, trackMusicBrainzId);
             if (verified)
-                return BuildVerifiedRecord(firstHit, recordingMusicBrainzId!);
+            {
+                var matchedMbid = trackMusicBrainzId ?? recordingMusicBrainzId!;
+                return BuildVerifiedRecord(firstHit, matchedMbid);
+            }
 
             // First hit didn't match — collect all remaining text candidates and check each one
             foreach (var match in allMatches)
@@ -1153,14 +1160,15 @@ namespace SXMPlaylist.ImportLists
                 if (candidate == null) continue;
                 if (candidate.RatingKey == firstHit.RatingKey) continue; // already checked
 
-                if (VerifyTrackMbid(baseUrl, plex, candidate.RatingKey!, recordingMusicBrainzId!))
+                if (VerifyTrackMbid(baseUrl, plex, candidate.RatingKey!, recordingMusicBrainzId!, trackMusicBrainzId))
                 {
+                    var matchedMbid = trackMusicBrainzId ?? recordingMusicBrainzId!;
                     return new PlexTrackCacheRecord(
                         candidate.RatingKey,
                         candidate.Artist,
                         candidate.Title,
                         candidate.Album,
-                        $"mbid://{recordingMusicBrainzId}",
+                        $"mbid://{matchedMbid}",
                         fuzzy ? "fuzzy-title-artist" : "exact-title-artist",
                         "high");
                 }
@@ -1170,8 +1178,10 @@ namespace SXMPlaylist.ImportLists
             return firstHit;
         }
 
-        // Fetch a Plex track's mbid:// GUID and compare to our RecordingMusicBrainzId.
-        private bool VerifyTrackMbid(string baseUrl, PlexServerSettings plex, string ratingKey, string recordingMusicBrainzId)
+        // Fetch a Plex track's mbid:// GUID and compare to our Track or Recording MusicBrainz ID.
+        // Plex stores Track MBIDs (MusicBrainz Track ID) in its mbid:// GUID, while the SXM resolver
+        // stores Recording MBIDs. The Track MBID is the preferred comparison since it's apples-to-apples.
+        private bool VerifyTrackMbid(string baseUrl, PlexServerSettings plex, string ratingKey, string recordingMusicBrainzId, string? trackMusicBrainzId = null)
         {
             try
             {
@@ -1192,6 +1202,11 @@ namespace SXMPlaylist.ImportLists
                     var mbid = id!.StartsWith("mbid://", StringComparison.OrdinalIgnoreCase)
                         ? id.Substring(7)
                         : id;
+
+                    // Prefer Track MBID comparison (apples-to-apples with Plex), fall back to Recording
+                    if (trackMusicBrainzId.IsNotNullOrWhiteSpace() &&
+                        string.Equals(mbid, trackMusicBrainzId, StringComparison.OrdinalIgnoreCase))
+                        return true;
 
                     if (string.Equals(mbid, recordingMusicBrainzId, StringComparison.OrdinalIgnoreCase))
                         return true;

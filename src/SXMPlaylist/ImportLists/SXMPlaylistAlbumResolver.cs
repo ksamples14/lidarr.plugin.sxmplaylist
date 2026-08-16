@@ -374,6 +374,7 @@ namespace SXMPlaylist.ImportLists
             var releaseCandidates = new JArray();
             string? recordingArtistMbid = null;
             string? selectedRecordingMbid = null;
+            string? selectedRecordingTrackMbid = null;
             var artistRejected = 0;
             var titleRejected = 0;
             var noRecordings = 0;
@@ -453,6 +454,40 @@ namespace SXMPlaylist.ImportLists
 
                     selectedRecordingMbid ??= recordingId;
 
+                    // Extract Track MusicBrainz ID from the first matching track across releases.
+                    if (selectedRecordingTrackMbid == null)
+                    {
+                        var recTitle = fullRecording?["title"]?.Value<string>();
+                        if (recTitle.IsNotNullOrWhiteSpace())
+                        {
+                            var recReleases = fullRecording?["releases"] as JArray;
+                            if (recReleases != null)
+                            {
+                                foreach (var rel in recReleases)
+                                {
+                                    var media = rel["media"] as JArray;
+                                    if (media == null) continue;
+                                    foreach (var m in media)
+                                    {
+                                        var tracks = m["tracks"] as JArray;
+                                        if (tracks == null) continue;
+                                        foreach (var t in tracks)
+                                        {
+                                            var trTitle = t["title"]?.Value<string>();
+                                            if (string.Equals(trTitle, recTitle, StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                selectedRecordingTrackMbid = t["id"]?.Value<string>();
+                                                break;
+                                            }
+                                        }
+                                        if (selectedRecordingTrackMbid != null) break;
+                                    }
+                                    if (selectedRecordingTrackMbid != null) break;
+                                }
+                            }
+                        }
+                    }
+
                     var artistCredits = fullRecording?["artist-credit"] as JArray;
                     if (recordingArtistMbid == null && artistCredits is { Count: 1 })
                     {
@@ -491,7 +526,7 @@ namespace SXMPlaylist.ImportLists
             foreach (var priority in ReleasePriorities)
             {
                 var releaseGroup = SelectBestReleaseGroup(syntheticRecording, recordingArtistMbid, filter.WithReleasePriority(priority), _logger);
-                var resolution = BuildResolution(releaseGroup, recordingArtistMbid, selectedRecordingMbid, null, "recording-search");
+                var resolution = BuildResolution(releaseGroup, recordingArtistMbid, selectedRecordingMbid, selectedRecordingTrackMbid, resolutionMethod: "recording-search");
                 if (resolution != null)
                 {
                     results[priority] = resolution;
@@ -537,10 +572,42 @@ namespace SXMPlaylist.ImportLists
             var artistCredits = recording?["artist-credit"] as JArray;
             string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
 
+            // Extract Track MusicBrainz ID from the recording's releases — first track matching title.
+            string? trackMbid = null;
+            var recTitle = recording?["title"]?.Value<string>();
+            if (recTitle.IsNotNullOrWhiteSpace())
+            {
+                var releases = recording?["releases"] as JArray;
+                if (releases != null)
+                {
+                    foreach (var rel in releases)
+                    {
+                        var media = rel["media"] as JArray;
+                        if (media == null) continue;
+                        foreach (var m in media)
+                        {
+                            var tracks = m["tracks"] as JArray;
+                            if (tracks == null) continue;
+                            foreach (var t in tracks)
+                            {
+                                var trTitle = t["title"]?.Value<string>();
+                                if (string.Equals(trTitle, recTitle, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    trackMbid = t["id"]?.Value<string>();
+                                    break;
+                                }
+                            }
+                            if (trackMbid != null) break;
+                        }
+                        if (trackMbid != null) break;
+                    }
+                }
+            }
+
             foreach (var priority in ReleasePriorities)
             {
                 var releaseGroup = SelectBestReleaseGroup(recording, artistMbid, filter.WithReleasePriority(priority), _logger);
-                var resolution = BuildResolution(releaseGroup, artistMbid, recordingId, isrc, "isrc");
+                var resolution = BuildResolution(releaseGroup, artistMbid, recordingId, trackMbid, isrc, "isrc");
                 if (resolution != null)
                 {
                     results[priority] = resolution;
@@ -559,6 +626,7 @@ namespace SXMPlaylist.ImportLists
             JToken? releaseGroup,
             string? artistMbid,
             string? recordingMbid = null,
+            string? trackMbid = null,
             string? isrc = null,
             string? resolutionMethod = null)
         {
@@ -567,7 +635,7 @@ namespace SXMPlaylist.ImportLists
 
             return albumTitle.IsNullOrWhiteSpace() || albumMbid.IsNullOrWhiteSpace()
                 ? null
-                : new AlbumResolution(true, albumTitle, artistMbid, albumMbid, recordingMbid, isrc, resolutionMethod);
+                : new AlbumResolution(true, albumTitle, artistMbid, albumMbid, recordingMbid, trackMbid, isrc, resolutionMethod);
         }
 
         // Fallback after the exact ISRC path misses: search MusicBrainz release-groups by the

@@ -501,14 +501,25 @@ namespace SXMPlaylist.ImportLists
                         var tracks = _trackService.GetTracksByAlbum(album.Id);
                         var match = tracks.FirstOrDefault(t =>
                             string.Equals(t.Title, song, StringComparison.OrdinalIgnoreCase));
-                        if (match == null || match.ForeignRecordingId.IsNullOrWhiteSpace())
+                        if (match == null || (match.ForeignRecordingId.IsNullOrWhiteSpace() && match.ForeignTrackId.IsNullOrWhiteSpace()))
                         {
                             continue;
                         }
 
-                        _historyStore.UpdateRecordingMusicBrainzId(trackId, match.ForeignRecordingId);
-                        _logger.Debug("Backfilled recording MBID {0} for track {1} ({2} - {3})",
-                            match.ForeignRecordingId, trackId, channel, song);
+                        if (match.ForeignRecordingId.IsNotNullOrWhiteSpace())
+                        {
+                            _historyStore.UpdateRecordingMusicBrainzId(trackId, match.ForeignRecordingId);
+                        }
+
+                        if (match.ForeignTrackId.IsNotNullOrWhiteSpace())
+                        {
+                            _historyStore.UpdateTrackMusicBrainzId(trackId, match.ForeignTrackId);
+                        }
+
+                        _logger.Debug("Backfilled MBIDs for track {0} ({1} - {2}): recording={3} track={4}",
+                            trackId, channel, song,
+                            match.ForeignRecordingId ?? "<none>",
+                            match.ForeignTrackId ?? "<none>");
                     }
                     catch (Exception ex)
                     {
