@@ -5,6 +5,7 @@ using NzbDrone.Common.Http;
 using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Lifecycle;
 using NzbDrone.Core.Messaging.Events;
+using NzbDrone.Core.Music;
 using NzbDrone.Core.Notifications;
 using NzbDrone.Core.Plugins;
 using NzbDrone.Core.Profiles.Metadata;
@@ -30,10 +31,12 @@ namespace SXMPlaylist
             IAppFolderInfo appFolderInfo,
             IImportListFactory importListFactory,
             IMetadataProfileService metadataProfileService,
+            IAlbumService albumService,
+            ITrackService trackService,
             INotificationFactory notificationFactory,
             Logger logger)
         {
-            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, metadataProfileService, notificationFactory, logger);
+            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, metadataProfileService, albumService, trackService, notificationFactory, logger);
         }
 
         public void Handle(ApplicationStartingEvent message)

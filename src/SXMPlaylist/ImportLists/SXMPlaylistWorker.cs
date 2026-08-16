@@ -10,6 +10,7 @@ using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.ImportLists;
 using NzbDrone.Core.Notifications;
+using NzbDrone.Core.Music;
 using NzbDrone.Core.Profiles.Metadata;
 
 namespace SXMPlaylist.ImportLists
@@ -42,6 +43,8 @@ namespace SXMPlaylist.ImportLists
         private readonly IHttpClient _httpClient;
         private readonly IImportListFactory _importListFactory;
         private readonly IMetadataProfileService _metadataProfileService;
+        private readonly IAlbumService _albumService;
+        private readonly ITrackService _trackService;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistAlbumResolver _albumResolver;
         private readonly SXMPlaylistPlexClient _plexClient;
@@ -57,12 +60,16 @@ namespace SXMPlaylist.ImportLists
             IAppFolderInfo appFolderInfo,
             IImportListFactory importListFactory,
             IMetadataProfileService metadataProfileService,
+            IAlbumService albumService,
+            ITrackService trackService,
             INotificationFactory notificationFactory,
             Logger logger)
         {
             _httpClient = httpClient;
             _importListFactory = importListFactory;
             _metadataProfileService = metadataProfileService;
+            _albumService = albumService;
+            _trackService = trackService;
             _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
             _albumResolver = new SXMPlaylistAlbumResolver(httpClient, logger);
             _plexClient = new SXMPlaylistPlexClient(httpClient, notificationFactory, logger);

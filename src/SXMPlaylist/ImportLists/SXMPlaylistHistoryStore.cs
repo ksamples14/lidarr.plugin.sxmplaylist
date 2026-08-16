@@ -889,6 +889,43 @@ namespace SXMPlaylist.ImportLists
             return results;
         }
 
+        // Tracks with an album MBID but no recording MBID — candidates for Lidarr backfill.
+        public IReadOnlyList<(string TrackId, string AlbumMbid, string Song, string Channel)> GetTracksWithoutRecordingMbid()
+        {
+            var results = new List<(string, string, string, string)>();
+
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT TrackId, AlbumMusicBrainzId, Song, Channel FROM Tracks " +
+                "WHERE AlbumMusicBrainzId IS NOT NULL AND AlbumMusicBrainzId <> '' " +
+                "AND (RecordingMusicBrainzId IS NULL OR RecordingMusicBrainzId = '')",
+                connection);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add((
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.GetString(3)));
+            }
+
+            return results;
+        }
+
+        public void UpdateRecordingMusicBrainzId(string trackId, string recordingMusicBrainzId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET RecordingMusicBrainzId = @recordingMbid WHERE TrackId = @trackId",
+                connection);
+
+            command.Parameters.AddWithValue("@recordingMbid", recordingMusicBrainzId);
+            command.Parameters.AddWithValue("@trackId", trackId);
+            command.ExecuteNonQuery();
+        }
+
         public void MarkTrackResolved(string trackId, AlbumResolution resolution, DateTime? resolvedUtc = null)
         {
             MarkTrackResolved(trackId, ReleasePriorityMode.Singles, resolution, resolvedUtc);

@@ -2451,7 +2451,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2475,7 +2475,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2496,7 +2496,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2520,7 +2520,7 @@ internal static class Program
 
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
 
         worker.RunOnce(CancellationToken.None);
         var epgRequestsAfterFirstCapture = httpClient.RequestUrls.Count(u => u.Contains("sxmepg"));
@@ -2549,7 +2549,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
         var feedCallsAfterFirst = httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation"));
         worker.RunOnce(CancellationToken.None);
@@ -2575,7 +2575,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2625,7 +2625,7 @@ internal static class Program
         };
 
         var profiles = new FakeMetadataProfileService(singlesOnly);
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2675,7 +2675,7 @@ internal static class Program
             }
         };
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2725,7 +2725,7 @@ internal static class Program
             }
         };
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2751,7 +2751,7 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         var factory = new FakeImportListFactory();
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         Assert("no HTTP requests made", httpClient.CallCount == 0);
@@ -3713,4 +3713,24 @@ internal class FakePlexNotification : INotification
     public void ProcessQueue() { }
     public ValidationResult Test() => new();
     public object RequestAction(string action, IDictionary<string, string> query) => new();
+}
+
+internal class FakeTrackService : ITrackService
+{
+    public Track GetTrack(int id) => null!;
+    public List<Track> GetTracks(IEnumerable<int> ids) => new();
+    public List<Track> GetTracksByArtist(int artistId) => new();
+    public List<Track> GetTracksByAlbum(int albumId) => new();
+    public List<Track> GetTracksByRelease(int albumReleaseId) => new();
+    public List<Track> GetTracksByReleases(List<int> albumReleaseIds) => new();
+    public List<Track> GetTracksForRefresh(int albumReleaseId, List<string> foreignTrackIds) => new();
+    public List<Track> TracksWithFiles(int artistId) => new();
+    public List<Track> TracksWithoutFiles(int albumId) => new();
+    public List<Track> GetTracksByFileId(int trackFileId) => null!;
+    public List<Track> GetTracksByFileId(IEnumerable<int> trackFileIds) => new();
+    public void UpdateTrack(Track track) { }
+    public void InsertMany(List<Track> tracks) { }
+    public void UpdateMany(List<Track> tracks) { }
+    public void DeleteMany(List<Track> tracks) { }
+    public void SetFileIds(List<Track> tracks) { }
 }
