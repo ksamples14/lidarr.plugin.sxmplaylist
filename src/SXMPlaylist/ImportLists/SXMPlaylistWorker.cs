@@ -166,6 +166,8 @@ namespace SXMPlaylist.ImportLists
 
             ResolveDueTracks(token);
 
+            BackfillMissingRecordingMbids();
+
             SyncCompanionPlexPlaylists(token);
 
             _historyStore.Prune();
@@ -468,6 +470,55 @@ namespace SXMPlaylist.ImportLists
                 {
                     _logger.Warn(ex, "Failed to resolve track {0}", track.TrackId);
                 }
+            }
+        }
+
+        // After resolution, backfill RecordingMusicBrainzId for tracks that have an
+        // AlbumMusicBrainzId but no recording MBID — Lidarr's services hold the
+        // ForeignRecordingId from its own MusicBrainz import. Routing through the
+        // injected IAlbumService/ITrackService keeps the query on Lidarr's normal
+        // service layer rather than touching Postgres directly.
+        private void BackfillMissingRecordingMbids()
+        {
+            try
+            {
+                var candidates = _historyStore.GetTracksWithoutRecordingMbid();
+                if (candidates.Count == 0)
+                {
+                    return;
+                }
+
+                foreach (var (trackId, albumMbid, song, channel) in candidates)
+                {
+                    try
+                    {
+                        var album = _albumService.FindById(albumMbid);
+                        if (album == null)
+                        {
+                            continue;
+                        }
+
+                        var tracks = _trackService.GetTracksByAlbum(album.Id);
+                        var match = tracks.FirstOrDefault(t =>
+                            string.Equals(t.Title, song, StringComparison.OrdinalIgnoreCase));
+                        if (match == null || match.ForeignRecordingId.IsNullOrWhiteSpace())
+                        {
+                            continue;
+                        }
+
+                        _historyStore.UpdateRecordingMusicBrainzId(trackId, match.ForeignRecordingId);
+                        _logger.Debug("Backfilled recording MBID {0} for track {1} ({2} - {3})",
+                            match.ForeignRecordingId, trackId, channel, song);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Debug(ex, "Failed to backfill recording MBID for track {0}", trackId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Failed to backfill missing recording MBIDs via Lidarr services");
             }
         }
 
