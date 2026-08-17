@@ -10,8 +10,9 @@ namespace SXMPlaylist.ImportLists
 {
     /// <summary>
     /// xmplaylist's station endpoint only returns ~24 plays per page (a few minutes of history),
-    /// far short of the 6-hour poll interval. Walk its `next` cursor backwards until the page's
-    /// oldest play crosses the poll window, then hand the parser one merged result set.
+    /// far short of the ~2-hour backfill window the worker captures at ~hourly cadence. Walk its
+    /// `next` cursor backwards until the page's oldest play crosses the window, then hand the
+    /// parser one merged result set.
     /// </summary>
     public static class SXMPlaylistStationBackfill
     {

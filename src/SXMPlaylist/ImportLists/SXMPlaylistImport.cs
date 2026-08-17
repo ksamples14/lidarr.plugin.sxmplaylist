@@ -373,7 +373,17 @@ namespace SXMPlaylist.ImportLists
             }
             catch (Exception ex)
             {
-                _logger.Debug(ex, "Failed to refresh SiriusXM EPG for channel {0}, falling back to empty show window", channel);
+                // The EPG is unreachable — fall back to the worker's persisted show windows for this
+                // program so a show-filtered list keeps presenting from the last known schedule
+                // instead of returning nothing (an empty window set short-circuits presentation).
+                var cached = _historyStore.GetCachedShowWindows(channel!, show);
+                if (cached.Count > 0)
+                {
+                    _logger.Debug("EPG refresh failed for channel {0}; using {1} cached show windows for '{2}'", channel, cached.Count, show);
+                    return cached.Select(w => new ShowWindow(w.StartUtc, w.EndUtc)).ToList();
+                }
+
+                _logger.Debug(ex, "Failed to refresh SiriusXM EPG for channel {0} and no cached windows; falling back to empty show window", channel);
                 return Array.Empty<ShowWindow>();
             }
         }

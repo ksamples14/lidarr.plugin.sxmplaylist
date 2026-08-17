@@ -276,6 +276,10 @@ namespace SXMPlaylist.ImportLists
                 .Replace(" EST", " -05:00", StringComparison.OrdinalIgnoreCase);
             var formats = new[]
             {
+                "MM.dd.yyyy HH:mm:ss zzz",
+                "M.d.yyyy HH:mm:ss zzz",
+                "MM.dd.yyyy H:mm:ss zzz",
+                "M.d.yyyy H:mm:ss zzz",
                 "MM.dd.yyyy HH:mm zzz",
                 "M.d.yyyy HH:mm zzz",
                 "MM.dd.yyyy H:mm zzz",
@@ -287,7 +291,29 @@ namespace SXMPlaylist.ImportLists
                 return exact.UtcDateTime;
             }
 
-            return DateTime.TryParse(value, out var parsed) ? parsed.ToUniversalTime() : null;
+            // The EPG is requested with tzone=Eastern (see FetchPageCandidateEpgKeys), so an
+            // offset-less fallback string is Eastern time — never the host's local zone and never
+            // UTC. A UTC/WSL host would otherwise mis-convert every window and mis-attribute plays
+            // to shows. Convert Eastern explicitly (DST-aware); if the zone data is unavailable,
+            // fail the parse rather than guess.
+            if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed))
+            {
+                try
+                {
+                    var eastern = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+                    return TimeZoneInfo.ConvertTimeToUtc(parsed, eastern);
+                }
+                catch (TimeZoneNotFoundException)
+                {
+                    return null;
+                }
+                catch (InvalidTimeZoneException)
+                {
+                    return null;
+                }
+            }
+
+            return null;
         }
     }
 

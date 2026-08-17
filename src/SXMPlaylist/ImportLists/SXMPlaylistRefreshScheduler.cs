@@ -17,11 +17,11 @@ namespace SXMPlaylist.ImportLists
     /// an existing artist whose play's album already exists in the DB and is merely being turned on
     /// (ProcessAlbumReportForExistingAlbum, "Ensuring Album and Artist monitored") - nothing ever
     /// refreshes that artist. This scheduler pushes a RefreshArtistCommand for exactly that case.
-    /// 
+    ///
     /// It runs from within the plugin's Fetch(), which executes inside the ImportListSync command, so
     /// the refresh is queued and runs after the sync completes - by which point the album is already
     /// monitored, and the refresh + scan picks up that state.
-    /// 
+    ///
     /// Full artist refreshes are heavy (they pull the whole MusicBrainz discography), so they're
     /// throttled to at most one per artist per day using Lidarr's own LastInfoSync stamp - set on
     /// every successful artist refresh, including the ones Lidarr's sync already triggers for added
