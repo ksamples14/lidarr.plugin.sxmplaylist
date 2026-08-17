@@ -195,7 +195,6 @@ namespace SXMPlaylist.ImportLists
                 "AppleMusicUrl TEXT, " +
                 "TimestampUtc TEXT NOT NULL, " +
                 "Resolved INTEGER NOT NULL DEFAULT 0, " +
-                "Failures INTEGER NOT NULL DEFAULT 0, " +
                 "Album TEXT, " +
                 "ArtistMusicBrainzId TEXT, " +
                 "AlbumMusicBrainzId TEXT, " +
@@ -219,6 +218,11 @@ namespace SXMPlaylist.ImportLists
             EnsureColumn(connection, "Tracks", "TrackMusicBrainzId", "TEXT");
             EnsureColumn(connection, "Tracks", "Isrc", "TEXT");
             EnsureColumn(connection, "Tracks", "ResolutionMethod", "TEXT");
+
+            // The pre-retry-sweep schema carried a Failures counter that is never read anywhere
+            // (the unified retry system tracks RetryAttempts/NextRetryUtc instead; RecordTrackFailure
+            // was dead code). Drop the dead column — idempotent, no-op on DBs that never had it.
+            DropColumnIfExists(connection, "Tracks", "Failures");
 
             // Normalized song key for the minimumPlays EXISTS filter (indexed on Plays). Backfilled
             // for rows written before the column existed; new rows always set it via UpsertTrack.
@@ -479,6 +483,42 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
+        // Removes a column that the current schema no longer uses. Idempotent: skips when the
+        // column is absent, so it is safe to call on every Initialize() alongside EnsureColumn.
+        // Mirrors EnsureColumn's PRAGMA guard (and its concurrent-construct race tolerance).
+        private static void DropColumnIfExists(SQLiteConnection connection, string table, string column)
+        {
+            using var check = new SQLiteCommand($"PRAGMA table_info({table})", connection);
+            var present = false;
+            using (var reader = check.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                    {
+                        present = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!present)
+            {
+                return;
+            }
+
+            using var drop = new SQLiteCommand($"ALTER TABLE {table} DROP COLUMN {column}", connection);
+            try
+            {
+                drop.ExecuteNonQuery();
+            }
+            catch (SQLiteException ex) when (ex.Message.Contains("no such column", StringComparison.OrdinalIgnoreCase))
+            {
+                // Two import lists construct their store concurrently; the loser's DROP races a
+                // winner that already removed the column. Column is gone either way.
+            }
+        }
+
         private static bool GetSchemaFlag(SQLiteConnection connection, string key)
         {
             using var command = new SQLiteCommand("SELECT Value FROM SchemaInfo WHERE Key = @key", connection);
@@ -658,7 +698,7 @@ namespace SXMPlaylist.ImportLists
                 "VALUES (@trackId, @channel, @artists, @song, @songKey, @deezerUrl, @appleMusicUrl, @timestamp) " +
                 "ON CONFLICT(TrackId) DO UPDATE SET Channel = @channel, ArtistsJson = @artists, Song = @song, SongKey = @songKey, " +
                 "DeezerUrl = @deezerUrl, AppleMusicUrl = @appleMusicUrl, TimestampUtc = @timestamp, " +
-                "Failures = 0, NextRetryUtc = NULL, " +
+                "NextRetryUtc = NULL, " +
                 "RetryAttempts = CASE WHEN EXISTS (SELECT 1 FROM TrackResolutions r WHERE r.TrackId = Tracks.TrackId AND r.AlbumMusicBrainzId IS NULL) THEN 0 ELSE RetryAttempts END",
                 connection);
 
@@ -833,7 +873,7 @@ namespace SXMPlaylist.ImportLists
                 "VALUES (@trackId, @channel, @artists, @song, @songKey, @deezerUrl, @appleMusicUrl, @timestamp) " +
                 "ON CONFLICT(TrackId) DO UPDATE SET Channel = @channel, ArtistsJson = @artists, Song = @song, SongKey = @songKey, " +
                 "DeezerUrl = @deezerUrl, AppleMusicUrl = @appleMusicUrl, TimestampUtc = @timestamp, " +
-                "Failures = 0, NextRetryUtc = NULL, " +
+                "NextRetryUtc = NULL, " +
                 "RetryAttempts = CASE WHEN EXISTS (SELECT 1 FROM TrackResolutions r WHERE r.TrackId = Tracks.TrackId AND r.AlbumMusicBrainzId IS NULL) THEN 0 ELSE RetryAttempts END",
                 connection,
                 transaction);
@@ -975,7 +1015,7 @@ namespace SXMPlaylist.ImportLists
             }
 
             using (var command = new SQLiteCommand(
-                "UPDATE Tracks SET Resolved = 1, Failures = 0, " +
+                "UPDATE Tracks SET Resolved = 1, " +
                 "Album = CASE WHEN @priority = @singles THEN @album ELSE Album END, " +
                 "ArtistMusicBrainzId = CASE WHEN @priority = @singles THEN @artistMbid ELSE ArtistMusicBrainzId END, " +
                 "AlbumMusicBrainzId = CASE WHEN @priority = @singles THEN @albumMbid ELSE AlbumMusicBrainzId END, " +
@@ -1052,16 +1092,6 @@ namespace SXMPlaylist.ImportLists
 
             command.Parameters.AddWithValue("@album", string.IsNullOrEmpty(albumTitle) ? "Unknown" : albumTitle);
             command.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("O"));
-            command.Parameters.AddWithValue("@trackId", trackId);
-            command.ExecuteNonQuery();
-        }
-
-        public void RecordTrackFailure(string trackId)
-        {
-            using var connection = OpenConnection();
-            using var command = new SQLiteCommand(
-                "UPDATE Tracks SET Failures = Failures + 1 WHERE TrackId = @trackId",
-                connection);
             command.Parameters.AddWithValue("@trackId", trackId);
             command.ExecuteNonQuery();
         }

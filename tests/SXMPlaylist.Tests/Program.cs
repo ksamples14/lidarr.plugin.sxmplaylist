@@ -2199,7 +2199,7 @@ internal static class Program
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
         store.RecordTransientFailure("track1", now);
 
-        // A later replay triggers UpsertTrack ON CONFLICT, which sets Failures=0 and NextRetryUtc=NULL
+        // A later replay triggers UpsertTrack ON CONFLICT, which resets NextRetryUtc=NULL
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now + TimeSpan.FromHours(1));
 
         Assert("replay makes it due again immediately", store.GetDueTracks(10).Any(t => t.TrackId == "track1"));
@@ -2259,6 +2259,24 @@ internal static class Program
         // sweep; now they're permanent since title-floor is no longer retried. So they should
         // never appear in GetDueTracks.
         Assert("legacy no-MBID row never due after migration", !store.GetDueTracks(10).Any(t => t.TrackId == "legacy"));
+
+        // The old schema's write-only Failures column must be dropped by the migration.
+        using (var check = new System.Data.SQLite.SQLiteConnection($"Data Source={dbPath};Version=3;"))
+        {
+            check.Open();
+            using var pragma = new System.Data.SQLite.SQLiteCommand("PRAGMA table_info(Tracks)", check);
+            using var reader = pragma.ExecuteReader();
+            var hasFailures = false;
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "Failures", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasFailures = true;
+                }
+            }
+
+            Assert("Failures column dropped by migration", !hasFailures);
+        }
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, DateTime.UtcNow);
 
