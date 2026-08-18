@@ -33,10 +33,11 @@ namespace SXMPlaylist
             IMetadataProfileService metadataProfileService,
             IAlbumService albumService,
             ITrackService trackService,
+            IArtistService artistService,
             INotificationFactory notificationFactory,
             Logger logger)
         {
-            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, metadataProfileService, albumService, trackService, notificationFactory, logger);
+            _worker = new SXMPlaylistWorker(httpClient, appFolderInfo, importListFactory, metadataProfileService, albumService, trackService, artistService, notificationFactory, logger);
         }
 
         public void Handle(ApplicationStartingEvent message)

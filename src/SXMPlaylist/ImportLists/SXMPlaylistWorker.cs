@@ -45,6 +45,7 @@ namespace SXMPlaylist.ImportLists
         private readonly IMetadataProfileService _metadataProfileService;
         private readonly IAlbumService _albumService;
         private readonly ITrackService _trackService;
+        private readonly IArtistService _artistService;
         private readonly SXMPlaylistHistoryStore _historyStore;
         private readonly SXMPlaylistAlbumResolver _albumResolver;
         private readonly SXMPlaylistPlexClient _plexClient;
@@ -62,6 +63,7 @@ namespace SXMPlaylist.ImportLists
             IMetadataProfileService metadataProfileService,
             IAlbumService albumService,
             ITrackService trackService,
+            IArtistService artistService,
             INotificationFactory notificationFactory,
             Logger logger)
         {
@@ -70,6 +72,7 @@ namespace SXMPlaylist.ImportLists
             _metadataProfileService = metadataProfileService;
             _albumService = albumService;
             _trackService = trackService;
+            _artistService = artistService;
             _historyStore = new SXMPlaylistHistoryStore(appFolderInfo);
             _albumResolver = new SXMPlaylistAlbumResolver(httpClient, logger);
             _plexClient = new SXMPlaylistPlexClient(httpClient, notificationFactory, logger);
@@ -163,6 +166,8 @@ namespace SXMPlaylist.ImportLists
                     }
                 }
             }
+
+            CheckLibraryCoverage(token);
 
             ResolveDueTracks(token);
 
@@ -445,6 +450,110 @@ namespace SXMPlaylist.ImportLists
             return _historyStore.GetCachedChannels()
                 .FirstOrDefault(c => string.Equals(c.Deeplink, channel, StringComparison.OrdinalIgnoreCase))
                 ?.Name;
+        }
+
+        // Library-first coverage gate: for FUZZY resolutions (no recording/track MBID yet — the
+        // title-search tier where the resolved album is a guess), check whether the played track
+        // already exists in the library before spending MusicBrainz calls on resolution. Exact
+        // plays (recording/track MBID present) skip this — their album is trusted, and Fetch's
+        // album-level coverage check already handles the "album already owned" case.
+        //
+        // Sources, in order: Lidarr track files (authoritative — always available), then Plex
+        // (covers the beets split-brain where Lidarr shows 0/N but the track is on disk). Plex
+        // unconfigured/unreachable degrades gracefully to "cannot confirm" — the track then goes
+        // through normal resolution, identical to pre-gate behavior. Found tracks are marked
+        // covered (never resolved, never presented) and backfilled with the library copy's MBIDs.
+        private void CheckLibraryCoverage(CancellationToken token)
+        {
+            var due = _historyStore.GetDueTracks(ResolutionBatchSize);
+            foreach (var track in due)
+            {
+                token.ThrowIfCancellationRequested();
+
+                // Exact plays carry their own identity — no coverage check needed.
+                if (track.RecordingMusicBrainzId.IsNotNullOrWhiteSpace()
+                    || track.TrackMusicBrainzId.IsNotNullOrWhiteSpace())
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var libraryMatch = FindTrackInLidarrLibrary(track);
+                    if (libraryMatch != null)
+                    {
+                        _historyStore.MarkTrackCovered(
+                            track.TrackId,
+                            DateTime.UtcNow,
+                            libraryMatch.Value.RecordingMbid,
+                            libraryMatch.Value.TrackMbid);
+                        _logger.Info("Covered {0} '{1}' by {2}: already in the Lidarr library (recording={3} track={4}); skipping resolution",
+                            track.TrackId, track.Song, string.Join(", ", track.Artists),
+                            libraryMatch.Value.RecordingMbid ?? "<none>",
+                            libraryMatch.Value.TrackMbid ?? "<none>");
+                        continue;
+                    }
+
+                    var plexMatch = _plexClient.FindTrackInPlex(
+                        string.Join(", ", track.Artists), track.Song);
+                    if (plexMatch != null && plexMatch.RatingKey.IsNotNullOrWhiteSpace())
+                    {
+                        _historyStore.MarkTrackCovered(
+                            track.TrackId,
+                            DateTime.UtcNow,
+                            trackMusicBrainzId: ExtractTrackMbidFromGuid(plexMatch.Guid));
+                        _logger.Info("Covered {0} '{1}' by {2}: already in the Plex library (ratingKey={3}); skipping resolution",
+                            track.TrackId, track.Song, string.Join(", ", track.Artists), plexMatch.RatingKey);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // One track's lookup failure never aborts the pass; the track falls through to
+                    // normal resolution (pre-gate behavior).
+                    _logger.Debug(ex, "Coverage check failed for {0} - {1}; treating as not covered",
+                        track.Song, track.TrackId);
+                }
+            }
+        }
+
+        // Matches a fuzzy play against Lidarr's library: artist (exact clean name, then inexact)
+        // -> all tracks for that artist -> a track with a file whose title equals the played song.
+        // Returns the recording/track MBIDs of the library copy, or null when not found.
+        private (string? RecordingMbid, string? TrackMbid)? FindTrackInLidarrLibrary(PendingTrack track)
+        {
+            foreach (var artistName in track.Artists)
+            {
+                var artist = _artistService.FindByName(artistName)
+                             ?? _artistService.FindByNameInexact(artistName);
+                if (artist == null)
+                {
+                    continue;
+                }
+
+                foreach (var candidate in _trackService.GetTracksByArtist(artist.Id))
+                {
+                    if (candidate.HasFile
+                        && string.Equals(candidate.Title, track.Song, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return (candidate.ForeignRecordingId, candidate.ForeignTrackId);
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static string? ExtractTrackMbidFromGuid(string? guid)
+        {
+            // Plex mbid:// GUIDs are Track MBIDs (release/track-level), matching what the resolver
+            // stores as TrackMusicBrainzId — apples-to-apples.
+            return guid?.StartsWith("mbid://", StringComparison.OrdinalIgnoreCase) == true
+                ? guid.Substring("mbid://".Length)
+                : null;
         }
 
         private void ResolveDueTracks(CancellationToken token)

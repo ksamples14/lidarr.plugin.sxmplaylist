@@ -218,6 +218,9 @@ namespace SXMPlaylist.ImportLists
             EnsureColumn(connection, "Tracks", "TrackMusicBrainzId", "TEXT");
             EnsureColumn(connection, "Tracks", "Isrc", "TEXT");
             EnsureColumn(connection, "Tracks", "ResolutionMethod", "TEXT");
+            // Set when the library already contains the played track (library-first coverage check),
+            // so the worker skips resolution and Fetch never presents it for a download.
+            EnsureColumn(connection, "Tracks", "CoveredUtc", "TEXT");
 
             // The pre-retry-sweep schema carried a Failures counter that is never read anywhere
             // (the unified retry system tracks RetryAttempts/NextRetryUtc instead; RecordTrackFailure
@@ -905,8 +908,9 @@ namespace SXMPlaylist.ImportLists
 
             using var connection = OpenConnection();
             using var command = new SQLiteCommand(
-                "SELECT TrackId, Channel, ArtistsJson, Song, DeezerUrl, AppleMusicUrl FROM Tracks " +
+                "SELECT TrackId, Channel, ArtistsJson, Song, DeezerUrl, AppleMusicUrl, RecordingMusicBrainzId, TrackMusicBrainzId FROM Tracks " +
                 "WHERE Resolved = 0 " +
+                "AND CoveredUtc IS NULL " +
                 "AND RetryAttempts < @maxRetryAttempts " +
                 "AND (NextRetryUtc IS NULL OR NextRetryUtc <= @now) " +
                 "ORDER BY NextRetryUtc ASC NULLS FIRST, TimestampUtc ASC LIMIT @limit",
@@ -925,7 +929,9 @@ namespace SXMPlaylist.ImportLists
                     JsonConvert.DeserializeObject<List<string>>(reader.GetString(2)) ?? new List<string>(),
                     reader.GetString(3),
                     reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5)));
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7)));
             }
 
             return results;
@@ -977,6 +983,49 @@ namespace SXMPlaylist.ImportLists
                 connection);
 
             command.Parameters.AddWithValue("@trackMbid", trackMusicBrainzId);
+            command.Parameters.AddWithValue("@trackId", trackId);
+            command.ExecuteNonQuery();
+        }
+
+        // Reads the coverage state of one track (CoveredUtc + any MBIDs the library copy revealed).
+        // Used by the coverage-gate tests to assert MarkTrackCovered behavior.
+        public (DateTime? CoveredUtc, string? RecordingMusicBrainzId, string? TrackMusicBrainzId, int Resolved)? GetTrackCoverageState(string trackId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT CoveredUtc, RecordingMusicBrainzId, TrackMusicBrainzId, Resolved FROM Tracks WHERE TrackId = @trackId",
+                connection);
+            command.Parameters.AddWithValue("@trackId", trackId);
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            return (
+                reader.IsDBNull(0) ? (DateTime?)null : DateTime.Parse(reader.GetString(0)).ToUniversalTime(),
+                reader.IsDBNull(1) ? null : reader.GetString(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.GetInt32(3));
+        }
+
+        // Marks a track as already present in the library (library-first coverage check), so the
+        // worker skips resolution and Fetch never presents it for a download. Backfills any MBIDs
+        // the library copy revealed (recording/track) so the play carries the real identity.
+        public void MarkTrackCovered(string trackId, DateTime coveredUtc, string? recordingMusicBrainzId = null, string? trackMusicBrainzId = null)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET CoveredUtc = @coveredUtc, " +
+                "RecordingMusicBrainzId = COALESCE(@recordingMbid, RecordingMusicBrainzId), " +
+                "TrackMusicBrainzId = COALESCE(@trackMbid, TrackMusicBrainzId) " +
+                "WHERE TrackId = @trackId",
+                connection);
+
+            command.Parameters.AddWithValue("@coveredUtc", coveredUtc.ToString("O"));
+            command.Parameters.AddWithValue("@recordingMbid", (object?)recordingMusicBrainzId ?? DBNull.Value);
+            command.Parameters.AddWithValue("@trackMbid", (object?)trackMusicBrainzId ?? DBNull.Value);
             command.Parameters.AddWithValue("@trackId", trackId);
             command.ExecuteNonQuery();
         }
@@ -1153,7 +1202,7 @@ namespace SXMPlaylist.ImportLists
                 "SELECT Tracks.TrackId, ArtistsJson, Song, r.Album, r.ArtistMusicBrainzId, r.AlbumMusicBrainzId, TimestampUtc, alt.AlbumMusicBrainzId FROM Tracks " +
                 "JOIN TrackResolutions r ON r.TrackId = Tracks.TrackId AND r.ReleasePriority = @releasePriority " +
                 "LEFT JOIN TrackResolutions alt ON alt.TrackId = Tracks.TrackId AND alt.ReleasePriority <> @releasePriority " +
-                "WHERE Channel = @channel AND Resolved = 1 AND r.ResolvedUtc >= @resolvedSince AND TimestampUtc >= @retainedSince" + mbidFilter + minimumPlaysFilter + windowFilter + " ORDER BY r.ResolvedUtc DESC LIMIT @limit",
+                "WHERE Channel = @channel AND Resolved = 1 AND CoveredUtc IS NULL AND r.ResolvedUtc >= @resolvedSince AND TimestampUtc >= @retainedSince" + mbidFilter + minimumPlaysFilter + windowFilter + " ORDER BY r.ResolvedUtc DESC LIMIT @limit",
                 connection);
 
             command.Parameters.AddWithValue("@channel", channel);
@@ -1602,7 +1651,15 @@ namespace SXMPlaylist.ImportLists
 
     public class PendingTrack
     {
-        public PendingTrack(string trackId, string channel, IReadOnlyList<string> artists, string song, string? deezerUrl, string? appleMusicUrl)
+        public PendingTrack(
+            string trackId,
+            string channel,
+            IReadOnlyList<string> artists,
+            string song,
+            string? deezerUrl,
+            string? appleMusicUrl,
+            string? recordingMusicBrainzId = null,
+            string? trackMusicBrainzId = null)
         {
             TrackId = trackId;
             Channel = channel;
@@ -1610,6 +1667,8 @@ namespace SXMPlaylist.ImportLists
             Song = song;
             DeezerUrl = deezerUrl;
             AppleMusicUrl = appleMusicUrl;
+            RecordingMusicBrainzId = recordingMusicBrainzId;
+            TrackMusicBrainzId = trackMusicBrainzId;
         }
 
         public string TrackId { get; }
@@ -1618,6 +1677,8 @@ namespace SXMPlaylist.ImportLists
         public string Song { get; }
         public string? DeezerUrl { get; }
         public string? AppleMusicUrl { get; }
+        public string? RecordingMusicBrainzId { get; }
+        public string? TrackMusicBrainzId { get; }
     }
 
     // One parsed play from a channel capture, handed to RecordCapture for a single-transaction

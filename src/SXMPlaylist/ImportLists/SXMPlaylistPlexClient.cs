@@ -134,6 +134,42 @@ namespace SXMPlaylist.ImportLists
             }
         }
 
+        // Library-first coverage check: does the Plex library already contain this artist+song?
+        // Returns the matched track (rating key + optional track MBID from the mbid:// GUID) or
+        // null when Plex is unconfigured, unreachable, or the track is absent. Never throws —
+        // Plex unavailability degrades to "cannot confirm", same contract as Sync.
+        public PlexTrackCacheRecord? FindTrackInPlex(string artist, string song, string? recordingMusicBrainzId = null, string? trackMusicBrainzId = null)
+        {
+            try
+            {
+                var plex = FindPlexSettings();
+                if (plex == null)
+                {
+                    _logger.Debug("Coverage check: no Plex Media Server connection configured; cannot confirm via Plex");
+                    return null;
+                }
+
+                var baseUrl = BuildBaseUrl(plex);
+                var sectionIds = GetMusicSectionIds(baseUrl, plex);
+                if (sectionIds.Count == 0)
+                {
+                    _logger.Debug("Coverage check: no Plex music library found; cannot confirm via Plex");
+                    return null;
+                }
+
+                return SearchTrack(baseUrl, plex, sectionIds, artist, song, recordingMusicBrainzId, trackMusicBrainzId);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Coverage check: Plex lookup failed for '{0}' - '{1}'; treating as not confirmed", artist, song);
+                return null;
+            }
+        }
+
         public PlexSyncResult Sync(long listId, string playlistTitle, IReadOnlyList<PlayEventRecord> events)
         {
             var result = new PlexSyncResult();

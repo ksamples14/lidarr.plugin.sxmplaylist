@@ -145,6 +145,10 @@ internal static class Program
         TestWorkerUsesListReleasePriorityForResolution();
         TestWorkerStoresBothReleasePrioritiesForSharedChannel();
         TestWorkerIdlesWithNoChannels();
+        TestWorkerCoversFuzzyTrackAlreadyInLidarrLibrary();
+        TestWorkerCoversFuzzyTrackViaPlexWhenLidarrMisses();
+        TestWorkerDoesNotCoverWhenPlexDisabled();
+        TestWorkerDoesNotCoverWhenPlexUnreachable();
 
         TestPlexExactTitleMatch();
         TestPlexSyncReturnsTrackMatchAudit();
@@ -2588,7 +2592,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2612,7 +2616,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2633,7 +2637,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2657,7 +2661,7 @@ internal static class Program
 
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
 
         worker.RunOnce(CancellationToken.None);
         var epgRequestsAfterFirstCapture = httpClient.RequestUrls.Count(u => u.Contains("sxmepg"));
@@ -2686,7 +2690,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
         var feedCallsAfterFirst = httpClient.RequestUrls.Count(u => u.Contains("api/station/altnation"));
         worker.RunOnce(CancellationToken.None);
@@ -2712,7 +2716,7 @@ internal static class Program
         var factory = new FakeImportListFactory();
         factory.AddChannel("altnation");
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2762,7 +2766,7 @@ internal static class Program
         };
 
         var profiles = new FakeMetadataProfileService(singlesOnly);
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, profiles, new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2812,7 +2816,7 @@ internal static class Program
             }
         };
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2862,7 +2866,7 @@ internal static class Program
             }
         };
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(profile), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
@@ -2888,12 +2892,119 @@ internal static class Program
         var httpClient = new FakeHttpClient();
         var factory = new FakeImportListFactory();
 
-        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
         worker.RunOnce(CancellationToken.None);
 
         Assert("no HTTP requests made", httpClient.CallCount == 0);
         var store = new SXMPlaylistHistoryStore(folder);
         Assert("no plays recorded", store.GetPlays("altnation", DateTime.MinValue).Count == 0);
+    }
+
+    private static void TestWorkerCoversFuzzyTrackAlreadyInLidarrLibrary()
+    {
+        Console.WriteLine("\n[Test] Library-first gate covers a fuzzy track already in the Lidarr library");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.UpsertTrack("track1", "altnation", new[] { "The Rolling Stones" }, "Sympathy For The Devil", null, null, DateTime.UtcNow);
+
+        var artistService = new FakeArtistService();
+        artistService.Add(new Artist { Id = 42, Name = "The Rolling Stones", ForeignArtistId = "artist-mbid-1" });
+        var trackService = new FakeTrackService();
+        trackService.AddTracksByArtist(42,
+            new Track { Title = "Sympathy For The Devil", ForeignRecordingId = "rec-mbid-1", ForeignTrackId = "track-mbid-1", TrackFileId = 99 },
+            new Track { Title = "Brown Sugar", ForeignRecordingId = "rec-mbid-2", ForeignTrackId = "track-mbid-2", TrackFileId = 100 });
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), trackService, artistService, new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("fuzzy track marked covered", state?.CoveredUtc != null);
+        Assert("recording MBID backfilled from the library copy", state?.RecordingMusicBrainzId == "rec-mbid-1");
+        Assert("track MBID backfilled from the library copy", state?.TrackMusicBrainzId == "track-mbid-1");
+        Assert("covered track excluded from the due queue", store.GetDueTracks(10).All(t => t.TrackId != "track1"));
+        Assert("covered track never resolved (no MB calls)", httpClient.CallCount == 0);
+    }
+
+    private static void TestWorkerCoversFuzzyTrackViaPlexWhenLidarrMisses()
+    {
+        Console.WriteLine("\n[Test] Library-first gate covers a fuzzy track found in Plex when Lidarr misses");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        // Track match with a Plex mbid:// GUID (track-level, apples-to-apples with TrackMusicBrainzId).
+        httpClient.Respond("/library/sections/1/all",
+            "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"Sympathy For The Devil\",\"grandparentTitle\":\"The Rolling Stones\",\"ratingKey\":\"100\",\"Guid\":[{\"id\":\"mbid://plex-track-mbid-1\"}]}]}}");
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.UpsertTrack("track1", "altnation", new[] { "The Rolling Stones" }, "Sympathy For The Devil", null, null, DateTime.UtcNow);
+
+        var notificationFactory = new FakeNotificationFactory();
+        notificationFactory.AddPlexServer();
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), notificationFactory, LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("fuzzy track marked covered via Plex", state?.CoveredUtc != null);
+        Assert("track MBID backfilled from the Plex mbid:// GUID", state?.TrackMusicBrainzId == "plex-track-mbid-1");
+        Assert("covered track excluded from the due queue", store.GetDueTracks(10).All(t => t.TrackId != "track1"));
+    }
+
+    private static void TestWorkerDoesNotCoverWhenPlexDisabled()
+    {
+        Console.WriteLine("\n[Test] Library-first gate falls through gracefully when Plex is not configured");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, DateTime.UtcNow);
+
+        // No FakeArtistService entries (Lidarr misses), no Plex connection (FindPlexSettings == null).
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("track NOT marked covered when neither source confirms", state?.CoveredUtc == null);
+        Assert("track went through normal resolution (pre-gate behavior)", state?.Resolved == 1);
+    }
+
+    private static void TestWorkerDoesNotCoverWhenPlexUnreachable()
+    {
+        Console.WriteLine("\n[Test] Library-first gate falls through gracefully when Plex is configured but unreachable");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        // Plex identity/sections succeed, but the track search 503s — a real outage shape.
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        httpClient.RespondSequence("/library/sections/1/all", (HttpStatusCode.ServiceUnavailable, "{}"));
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, DateTime.UtcNow);
+
+        var notificationFactory = new FakeNotificationFactory();
+        notificationFactory.AddPlexServer();
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), notificationFactory, LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("track NOT marked covered when Plex search 503s", state?.CoveredUtc == null);
+        Assert("track went through normal resolution (pre-gate behavior)", state?.Resolved == 1);
     }
 
     private static void TestPlexExactTitleMatch()
@@ -3518,10 +3629,15 @@ internal class FakeAppFolderInfo : IAppFolderInfo
 internal class FakeArtistService : IArtistService
 {
     private readonly Dictionary<string, Artist> _byForeignId = new();
+    private readonly Dictionary<string, Artist> _byName = new(StringComparer.OrdinalIgnoreCase);
 
     public void Add(Artist artist)
     {
         _byForeignId[artist.ForeignArtistId] = artist;
+        if (artist.Name.IsNotNullOrWhiteSpace())
+        {
+            _byName[artist.Name] = artist;
+        }
     }
 
     public Artist FindById(string foreignArtistId)
@@ -3534,8 +3650,28 @@ internal class FakeArtistService : IArtistService
     public List<Artist> GetArtists(IEnumerable<int> artistIds) => throw new NotSupportedException();
     public Artist AddArtist(Artist newArtist, bool doRefresh) => throw new NotSupportedException();
     public List<Artist> AddArtists(List<Artist> newArtists, bool doRefresh) => throw new NotSupportedException();
-    public Artist FindByName(string title) => throw new NotSupportedException();
-    public Artist FindByNameInexact(string title) => throw new NotSupportedException();
+    public Artist FindByName(string title) => _byName.TryGetValue(title ?? "", out var artist) ? artist : null!;
+
+    public Artist FindByNameInexact(string title)
+    {
+        // Fall back to a normalized contains match for tests that don't set the exact name.
+        if (title.IsNullOrWhiteSpace())
+        {
+            return null!;
+        }
+
+        var normalized = title.Trim().ToLowerInvariant();
+        foreach (var pair in _byName)
+        {
+            if (pair.Key.ToLowerInvariant().Contains(normalized) || normalized.Contains(pair.Key.ToLowerInvariant()))
+            {
+                return pair.Value;
+            }
+        }
+
+        return null!;
+    }
+
     public List<Artist> GetCandidates(string title) => throw new NotSupportedException();
     public void DeleteArtist(int artistId, bool deleteFiles, bool addImportListExclusion = false) => throw new NotSupportedException();
     public void DeleteArtists(List<int> artistIds, bool deleteFiles, bool addImportListExclusion = false) => throw new NotSupportedException();
@@ -3854,9 +3990,22 @@ internal class FakePlexNotification : INotification
 
 internal class FakeTrackService : ITrackService
 {
+    private readonly Dictionary<int, List<Track>> _byArtistId = new();
+
+    public void AddTracksByArtist(int artistId, params Track[] tracks)
+    {
+        if (!_byArtistId.TryGetValue(artistId, out var list))
+        {
+            list = new List<Track>();
+            _byArtistId[artistId] = list;
+        }
+
+        list.AddRange(tracks);
+    }
+
     public Track GetTrack(int id) => null!;
     public List<Track> GetTracks(IEnumerable<int> ids) => new();
-    public List<Track> GetTracksByArtist(int artistId) => new();
+    public List<Track> GetTracksByArtist(int artistId) => _byArtistId.TryGetValue(artistId, out var tracks) ? tracks : new List<Track>();
     public List<Track> GetTracksByAlbum(int albumId) => new();
     public List<Track> GetTracksByRelease(int albumReleaseId) => new();
     public List<Track> GetTracksByReleases(List<int> albumReleaseIds) => new();
