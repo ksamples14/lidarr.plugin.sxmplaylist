@@ -54,7 +54,7 @@ namespace SXMPlaylist.ImportLists
         private static readonly int MusicBrainzMaxRetries = 2;
         private const int MusicBrainzTitleSearchLimit = 25;
         private const int MusicBrainzRecordingSearchLimit = 10;
-        private const int MusicBrainzRecordingDetailLimit = 3;
+        private const int MusicBrainzRecordingDetailLimit = 2;
         private static readonly SemaphoreSlim MusicBrainzGate = new(1, 1);
         private static DateTime _lastMusicBrainzCallUtc = DateTime.MinValue;
 
@@ -195,7 +195,14 @@ namespace SXMPlaylist.ImportLists
                 }
             }
 
-            AddTitleOnlyFallback(results, deezerAlbumTitle);
+            // Title floor: Deezer's or Apple's album title with no MusicBrainz ID, presented only
+            // when MusicBrainz was NOT transiently unavailable. If MB was busy (503/429), the
+            // worker must record a transient failure and retry later — a title-only fallback would
+            // mark the track Resolved=1 with no MBID and remove it from the retry queue forever.
+            if (!_hadTransientMbFailure)
+            {
+                AddTitleOnlyFallback(results, deezerAlbumTitle);
+            }
 
             if (!HasAllPriorities(results) && links.ContainsKey("appleMusic"))
             {
@@ -205,10 +212,13 @@ namespace SXMPlaylist.ImportLists
                     if (!appleLookupAttempted)
                     {
                         appleLookupAttempted = true;
-                        appleAlbumTitle = GetAppleAlbumTitle(artist, links);
+                        appleAlbumTitle = GetAppleAlbumTitle(artist, links, token);
                     }
 
-                    AddTitleOnlyFallback(results, appleAlbumTitle);
+                    if (!_hadTransientMbFailure)
+                    {
+                        AddTitleOnlyFallback(results, appleAlbumTitle);
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -327,7 +337,7 @@ namespace SXMPlaylist.ImportLists
 
             try
             {
-                foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artistCandidates, albumTitle, filter))
+                foreach (var result in ResolveViaMusicBrainzTitleSearchAll(artistCandidates, albumTitle, filter, token))
                 {
                     if (!results.ContainsKey(result.Key))
                     {
@@ -374,7 +384,7 @@ namespace SXMPlaylist.ImportLists
             var releaseCandidates = new JArray();
             string? recordingArtistMbid = null;
             string? selectedRecordingMbid = null;
-            string? selectedRecordingTrackMbid = null;
+            string? selectedRecordingTitle = null;
             var artistRejected = 0;
             var titleRejected = 0;
             var noRecordings = 0;
@@ -453,40 +463,7 @@ namespace SXMPlaylist.ImportLists
                     }
 
                     selectedRecordingMbid ??= recordingId;
-
-                    // Extract Track MusicBrainz ID from the first matching track across releases.
-                    if (selectedRecordingTrackMbid == null)
-                    {
-                        var recTitle = fullRecording?["title"]?.Value<string>();
-                        if (recTitle.IsNotNullOrWhiteSpace())
-                        {
-                            var recReleases = fullRecording?["releases"] as JArray;
-                            if (recReleases != null)
-                            {
-                                foreach (var rel in recReleases)
-                                {
-                                    var media = rel["media"] as JArray;
-                                    if (media == null) continue;
-                                    foreach (var m in media)
-                                    {
-                                        var tracks = m["tracks"] as JArray;
-                                        if (tracks == null) continue;
-                                        foreach (var t in tracks)
-                                        {
-                                            var trTitle = t["title"]?.Value<string>();
-                                            if (string.Equals(trTitle, recTitle, StringComparison.OrdinalIgnoreCase))
-                                            {
-                                                selectedRecordingTrackMbid = t["id"]?.Value<string>();
-                                                break;
-                                            }
-                                        }
-                                        if (selectedRecordingTrackMbid != null) break;
-                                    }
-                                    if (selectedRecordingTrackMbid != null) break;
-                                }
-                            }
-                        }
-                    }
+                    selectedRecordingTitle ??= fullRecording?["title"]?.Value<string>();
 
                     var artistCredits = fullRecording?["artist-credit"] as JArray;
                     if (recordingArtistMbid == null && artistCredits is { Count: 1 })
@@ -526,7 +503,15 @@ namespace SXMPlaylist.ImportLists
             foreach (var priority in ReleasePriorities)
             {
                 var releaseGroup = SelectBestReleaseGroup(syntheticRecording, recordingArtistMbid, filter.WithReleasePriority(priority), _logger);
-                var resolution = BuildResolution(releaseGroup, recordingArtistMbid, selectedRecordingMbid, selectedRecordingTrackMbid, resolutionMethod: "recording-search");
+                // Track MBID from the SELECTED release-group's releases (see ExtractTrackMbidFromReleases).
+                // The title fallback uses the recording's MB title (canonical) rather than the raw
+                // feed title, so versioned feed titles like "Whip It (80)" still match MB's "Whip It".
+                var priorityTrackMbid = ExtractTrackMbidFromReleases(
+                    releaseCandidates,
+                    selectedRecordingMbid,
+                    selectedRecordingTitle,
+                    releaseGroup?["id"]?.Value<string>());
+                var resolution = BuildResolution(releaseGroup, recordingArtistMbid, selectedRecordingMbid, priorityTrackMbid, resolutionMethod: "recording-search");
                 if (resolution != null)
                 {
                     results[priority] = resolution;
@@ -572,42 +557,19 @@ namespace SXMPlaylist.ImportLists
             var artistCredits = recording?["artist-credit"] as JArray;
             string? artistMbid = artistCredits is { Count: 1 } ? artistCredits[0]["artist"]?["id"]?.Value<string>() : null;
 
-            // Extract Track MusicBrainz ID from the recording's releases — first track matching title.
-            string? trackMbid = null;
-            var recTitle = recording?["title"]?.Value<string>();
-            if (recTitle.IsNotNullOrWhiteSpace())
-            {
-                var releases = recording?["releases"] as JArray;
-                if (releases != null)
-                {
-                    foreach (var rel in releases)
-                    {
-                        var media = rel["media"] as JArray;
-                        if (media == null) continue;
-                        foreach (var m in media)
-                        {
-                            var tracks = m["tracks"] as JArray;
-                            if (tracks == null) continue;
-                            foreach (var t in tracks)
-                            {
-                                var trTitle = t["title"]?.Value<string>();
-                                if (string.Equals(trTitle, recTitle, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    trackMbid = t["id"]?.Value<string>();
-                                    break;
-                                }
-                            }
-                            if (trackMbid != null) break;
-                        }
-                        if (trackMbid != null) break;
-                    }
-                }
-            }
-
             foreach (var priority in ReleasePriorities)
             {
                 var releaseGroup = SelectBestReleaseGroup(recording, artistMbid, filter.WithReleasePriority(priority), _logger);
-                var resolution = BuildResolution(releaseGroup, artistMbid, recordingId, trackMbid, isrc, "isrc");
+                // Track MBID must come from the SELECTED release-group's releases, not the first
+                // title-matching track anywhere: the same recording appears on many releases
+                // (studio album, compilation, reissue), each with its own track MBID, and Plex
+                // verifies against the release the user actually gets.
+                var priorityTrackMbid = ExtractTrackMbidFromReleases(
+                    recording?["releases"] as JArray,
+                    recordingId,
+                    recording?["title"]?.Value<string>(),
+                    releaseGroup?["id"]?.Value<string>());
+                var resolution = BuildResolution(releaseGroup, artistMbid, recordingId, priorityTrackMbid, isrc, "isrc");
                 if (resolution != null)
                 {
                     results[priority] = resolution;
@@ -636,6 +598,69 @@ namespace SXMPlaylist.ImportLists
             return albumTitle.IsNullOrWhiteSpace() || albumMbid.IsNullOrWhiteSpace()
                 ? null
                 : new AlbumResolution(true, albumTitle, artistMbid, albumMbid, recordingMbid, trackMbid, isrc, resolutionMethod);
+        }
+
+        // Extracts the MusicBrainz Track ID for a track on the SELECTED release-group's releases.
+        // The same recording appears on many releases (studio album, compilation, reissue), and
+        // each carries its own track MBID; grabbing the first title-matching track anywhere can
+        // point at a release the user never gets (e.g. a compilation), which then fails Plex's
+        // mbid:// GUID verification against the resolved album. Scope the search to releases whose
+        // release-group id matches the one that was selected. Tracks are matched by recording MBID
+        // first (precise), then by title (recording-search accumulates releases across several
+        // recordings, so a later recording's id may not be selectedRecordingMbid).
+        private static string? ExtractTrackMbidFromReleases(
+            JArray? releases,
+            string? recordingMbid,
+            string? recordingTitle,
+            string? selectedReleaseGroupId)
+        {
+            if (releases == null || selectedReleaseGroupId.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            string? titleFallback = null;
+            foreach (var rel in releases)
+            {
+                if (!string.Equals(rel["release-group"]?["id"]?.Value<string>(), selectedReleaseGroupId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var media = rel["media"] as JArray;
+                if (media == null)
+                {
+                    continue;
+                }
+
+                foreach (var m in media)
+                {
+                    var tracks = m["tracks"] as JArray;
+                    if (tracks == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var t in tracks)
+                    {
+                        // Match by the recording MBID when known — exact and unambiguous.
+                        if (recordingMbid.IsNotNullOrWhiteSpace()
+                            && string.Equals(t["recording"]?["id"]?.Value<string>(), recordingMbid, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return t["id"]?.Value<string>();
+                        }
+
+                        // Title fallback: the release's track title equals the recording title.
+                        if (recordingTitle.IsNotNullOrWhiteSpace()
+                            && string.Equals(t["title"]?.Value<string>(), recordingTitle, StringComparison.OrdinalIgnoreCase))
+                        {
+                            titleFallback ??= t["id"]?.Value<string>();
+                        }
+                    }
+                }
+            }
+
+            return titleFallback;
         }
 
         // Fallback after the exact ISRC path misses: search MusicBrainz release-groups by the
@@ -667,7 +692,7 @@ namespace SXMPlaylist.ImportLists
                 }
 
                 var query = BuildTitleSearchQuery(artist, albumTitle!);
-                ThrottleMusicBrainz();
+                ThrottleMusicBrainz(token);
                 var result = GetJson($"https://musicbrainz.org/ws/2/release?query={Uri.EscapeDataString(query)}&fmt=json&limit={MusicBrainzTitleSearchLimit}", musicBrainz: true, token);
 
                 var releases = result?["releases"] as JArray;
@@ -703,7 +728,12 @@ namespace SXMPlaylist.ImportLists
                     candidates.Add(release);
                 }
 
-                if (candidates.Count > 0)
+                // Only stop trying artist candidates when we actually accumulated a release that
+                // can survive release-group selection. The VA/compilation/profile gates run later
+                // inside SelectBestReleaseGroup, so a candidate whose only releases are VA
+                // compilations must not consume the budget and starve a later, correct artist
+                // candidate (mirrors the recording-search early-break at line 508).
+                if (candidates.Count > 0 && HasEligibleReleaseGroup(candidates, filter))
                 {
                     break;
                 }

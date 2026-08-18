@@ -699,7 +699,7 @@ namespace SXMPlaylist.ImportLists
                 "ON CONFLICT(TrackId) DO UPDATE SET Channel = @channel, ArtistsJson = @artists, Song = @song, SongKey = @songKey, " +
                 "DeezerUrl = @deezerUrl, AppleMusicUrl = @appleMusicUrl, TimestampUtc = @timestamp, " +
                 "NextRetryUtc = NULL, " +
-                "RetryAttempts = CASE WHEN EXISTS (SELECT 1 FROM TrackResolutions r WHERE r.TrackId = Tracks.TrackId AND r.AlbumMusicBrainzId IS NULL) THEN 0 ELSE RetryAttempts END",
+                "RetryAttempts = CASE WHEN Tracks.Resolved = 0 THEN 0 ELSE RetryAttempts END",
                 connection);
 
             command.Parameters.AddWithValue("@trackId", trackId);
@@ -874,7 +874,7 @@ namespace SXMPlaylist.ImportLists
                 "ON CONFLICT(TrackId) DO UPDATE SET Channel = @channel, ArtistsJson = @artists, Song = @song, SongKey = @songKey, " +
                 "DeezerUrl = @deezerUrl, AppleMusicUrl = @appleMusicUrl, TimestampUtc = @timestamp, " +
                 "NextRetryUtc = NULL, " +
-                "RetryAttempts = CASE WHEN EXISTS (SELECT 1 FROM TrackResolutions r WHERE r.TrackId = Tracks.TrackId AND r.AlbumMusicBrainzId IS NULL) THEN 0 ELSE RetryAttempts END",
+                "RetryAttempts = CASE WHEN Tracks.Resolved = 0 THEN 0 ELSE RetryAttempts END",
                 connection,
                 transaction);
 

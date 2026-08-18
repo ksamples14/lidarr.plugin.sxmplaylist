@@ -103,6 +103,9 @@ internal static class Program
         TestAlbumResolutionFilterExcludesDisallowedRelease();
         TestMusicBrainzBusyIsRetried();
         TestMusicBrainzGivesUpAfterMaxRetries();
+        TestTitleFloorSkippedWhenMusicBrainzTransientlyDown();
+        TestTitleSearchContinuesPastIneligibleArtistCandidate();
+        TestTrackMbidScopedToSelectedReleaseGroup();
 
         TestStoreRecordsAndDedupesPlays();
         TestStoreRecordsRepeatedPlayEvents();
@@ -126,6 +129,7 @@ internal static class Program
         TestStoreRetryGivesUpAfterMaxAttempts();
         TestStoreRetrySuccessClearsRetryState();
         TestStoreNewPlayResetsRetryClock();
+        TestStoreFreshPlayResetsExhaustedRetryBudget();
         TestStoreRetryFailureRenewsPresentationWindow();
         TestStoreMigrationAddsRetryColumnsIdempotently();
         TestStoreMigrationAddsSongKeyColumnsAndBackfills();
@@ -1141,7 +1145,7 @@ internal static class Program
         var results = resolver.ResolveAllPriorities("Artist One", "Song A", new Dictionary<string, string>());
         var detailCalls = httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording/rec-"));
 
-        Assert("recording search stopped before the fourth detail lookup", detailCalls == 3);
+        Assert("recording search stopped before the third detail lookup", detailCalls == 2);
         Assert("capped lookup did not use the fourth recording result", !results.ContainsKey(ReleasePriorityMode.Albums));
     }
 
@@ -1150,7 +1154,7 @@ internal static class Program
         Console.WriteLine("\n[Test] Recording search prefers a later studio recording over earlier compilations");
 
         // MusicBrainz relevance lists compilations first; the studio-album recording sits at index 3,
-        // beyond the 3-detail cap. Inline release metadata lets the resolver promote it before the cap.
+        // beyond the 2-detail cap. Inline release metadata lets the resolver promote it before the cap.
         var httpClient = new FakeHttpClient();
         httpClient.Respond("musicbrainz.org/ws/2/recording?query=",
             "{\"recordings\":[" +
@@ -1731,6 +1735,97 @@ internal static class Program
         }
     }
 
+    private static void TestTitleFloorSkippedWhenMusicBrainzTransientlyDown()
+    {
+        Console.WriteLine("\n[Test] Title floor is skipped when MusicBrainz is transiently down (D1)");
+
+        // Deezer gives a title (so the title floor COULD fill), but MB 503s on the ISRC lookup.
+        // The title floor must NOT be used — the worker needs a clean "nothing stored" result so
+        // it records a transient failure and retries later instead of pinning the track to a
+        // title-only resolution with no MBID forever.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\",\"album\":{\"title\":\"No Code\"},\"artist\":{\"name\":\"Artist One\"}}");
+        httpClient.RespondSequence("musicbrainz.org/ws/2/isrc/USSM19601763",
+            (HttpStatusCode.ServiceUnavailable, "{}"),
+            (HttpStatusCode.ServiceUnavailable, "{}"),
+            (HttpStatusCode.ServiceUnavailable, "{}"));
+
+        var originalBackoff = SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff;
+        SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = TimeSpan.Zero;
+        try
+        {
+            var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+            var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+            Assert("no title-floor fallback when MB transiently failed", resolution.Album == null);
+            Assert("transient failure flag set for the worker to retry", resolver.GetLastFailureTransient());
+        }
+        finally
+        {
+            SXMPlaylistAlbumResolver.MusicBrainzRetryBackoff = originalBackoff;
+        }
+    }
+
+    private static void TestTitleSearchContinuesPastIneligibleArtistCandidate()
+    {
+        Console.WriteLine("\n[Test] Title search continues to later artist candidates when the first can't survive selection (L2)");
+
+        // First candidate (Deezer's artist name) returns releases that pass the local artist/title
+        // gates but are filtered out later (here: Broadcast primary type, profile excludes it). The
+        // loop must NOT break on candidates.Count > 0 — it must keep trying the played artist name.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"album\":{\"title\":\"No Code\"},\"artist\":{\"name\":\"Kool\"}}");
+        // Recording search returns nothing so we reach the title search.
+        httpClient.Respond("musicbrainz.org/ws/2/recording?query=", "{\"recordings\":[]}");
+
+        // artist:"Kool" (first candidate) -> releases whose primary type the profile excludes.
+        httpClient.Respond("artist%3A%22Kool%22",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"name\":\"Kool\"}}]," +
+            "\"release-group\":{\"id\":\"broadcast-mbid\",\"title\":\"No Code\",\"primary-type\":\"Broadcast\"}}]}");
+        // artist:"Kool \& The Gang" (played artist) -> an eligible studio album.
+        httpClient.Respond("The%20Gang%22",
+            "{\"releases\":[{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"name\":\"Kool & The Gang\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid-1\",\"title\":\"No Code\",\"primary-type\":\"Album\"}}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var filter = new AlbumTypeFilter(
+            new HashSet<string> { "Single", "EP", "Album" },
+            new HashSet<string> { "Studio" },
+            new HashSet<string> { "Official" });
+        var resolution = resolver.Resolve("Kool & The Gang", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")), filter);
+
+        Assert("second artist candidate's eligible album won", resolution.AlbumMusicBrainzId == "album-mbid-1");
+    }
+
+    private static void TestTrackMbidScopedToSelectedReleaseGroup()
+    {
+        Console.WriteLine("\n[Test] Track MBID comes from the SELECTED release-group, not the first title match anywhere");
+
+        // The recording appears on a compilation (listed first, carries a track MBID) and on the
+        // artist's own single (ranked higher for Singles priority). The stored TrackMusicBrainzId
+        // must be the single's track MBID — the compilation's would fail Plex's mbid:// GUID check.
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"title\":\"I'm Open\"," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"comp-mbid\",\"title\":\"Best Of\",\"primary-type\":\"Album\",\"secondary-types\":[\"Compilation\"]}," +
+            "\"media\":[{\"tracks\":[{\"id\":\"comp-track-mbid\",\"title\":\"I'm Open\",\"recording\":{\"id\":\"rec-1\"}}]}]}," +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"single-mbid\",\"title\":\"No Code\",\"primary-type\":\"Single\"}," +
+            "\"media\":[{\"tracks\":[{\"id\":\"single-track-mbid\",\"title\":\"I'm Open\",\"recording\":{\"id\":\"rec-1\"}}]}]}]}");
+
+        var resolver = new SXMPlaylistAlbumResolver(httpClient, LogManager.GetLogger("Test"));
+        var resolution = resolver.Resolve("Artist One", "I'm Open", Links(("deezer", "https://www.deezer.com/track/624510")));
+
+        Assert("singles priority resolved to the single", resolution.AlbumMusicBrainzId == "single-mbid");
+        Assert("track MBID scoped to the selected release-group", resolution.TrackMusicBrainzId == "single-track-mbid");
+        Assert("compilation track MBID not used", resolution.TrackMusicBrainzId != "comp-track-mbid");
+    }
+
     private static void TestStoreRecordsAndDedupesPlays()
     {
         Console.WriteLine("\n[Test] History store records a play once");
@@ -2203,6 +2298,30 @@ internal static class Program
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now + TimeSpan.FromHours(1));
 
         Assert("replay makes it due again immediately", store.GetDueTracks(10).Any(t => t.TrackId == "track1"));
+    }
+
+    private static void TestStoreFreshPlayResetsExhaustedRetryBudget()
+    {
+        Console.WriteLine("\n[Test] A fresh play resets an exhausted transient retry budget (NEW-1)");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+
+        // Exhaust the transient retry budget (D1 leaves no null-MBID TrackResolutions row, so the
+        // old UpsertTrack reset condition never fired and the track could be permanently dead).
+        for (var i = 0; i < SXMPlaylistHistoryStore.MaxRetryAttempts; i++)
+        {
+            store.RecordTransientFailure("track1", now + TimeSpan.FromMinutes(i));
+        }
+
+        // Even with the retry clock well past due, the exhausted budget excludes the track.
+        Assert("exhausted budget keeps the track out of the due queue", !store.GetDueTracks(10, now + TimeSpan.FromHours(13)).Any(t => t.TrackId == "track1"));
+
+        // A fresh airing of the same track resets RetryAttempts so it gets a new budget.
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now + TimeSpan.FromHours(1));
+        Assert("fresh play revives the track for retry", store.GetDueTracks(10).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreRetryFailureRenewsPresentationWindow()
