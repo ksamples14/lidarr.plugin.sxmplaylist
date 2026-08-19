@@ -65,7 +65,7 @@ The Channel dropdown populates itself automatically whenever you open the Add/Ed
 SXM Playlist runs a background worker that checks each configured channel about once an hour, resolves played songs to albums via Deezer/MusicBrainz (with an Apple Music fallback), and makes the resolved tracks available to Lidarr's import system. New artists typically appear in your library within a few hours of first airing.
 
 1. **Capture.** The worker checks each channel's play feed every hour and records the plays it hasn't seen before.
-2. **Resolve.** Each new track's album is looked up in the background, retried up to 3 times before giving up.
+2. **Resolve.** Each new track's album is looked up in the background, retried up to 3 times before giving up. Before resolution, the worker checks linkless fuzzy plays (no Deezer link) against the library and skips songs already owned; plays carrying a Deezer link are exact-capable and skip that check, resolving via the ISRC path to their exact album.
 3. **Present.** Lidarr polls each import list hourly; the list returns resolved tracks (ordered by last-play time, capped by the Albums Per Day budget), which Lidarr adds to your library. Duplicate plays are skipped. A background pass later verifies each presented album actually landed in Lidarr monitored/on-disk, so unconfirmed albums are re-presented instead of silently dropped.
 4. **Playlist.** If enabled, the worker periodically mirrors recent plays from that list into a companion Plex playlist.
 

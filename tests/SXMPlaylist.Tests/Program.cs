@@ -146,6 +146,8 @@ internal static class Program
         TestWorkerStoresBothReleasePrioritiesForSharedChannel();
         TestWorkerIdlesWithNoChannels();
         TestWorkerCoversFuzzyTrackAlreadyInLidarrLibrary();
+        TestWorkerDoesNotGateDeezerLinkedPlay();
+        TestWorkerStillGatesAppleOnlyPlay();
         TestWorkerCoversFuzzyTrackViaPlexWhenLidarrMisses();
         TestWorkerDoesNotCoverWhenPlexDisabled();
         TestWorkerDoesNotCoverWhenPlexUnreachable();
@@ -2901,6 +2903,73 @@ internal static class Program
             httpClient.RequestUrls.Count(u => u.Contains("api.deezer.com/track/624510")) == 1 &&
             httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/isrc/USSM19601763")) == 1 &&
             httpClient.RequestUrls.Count(u => u.Contains("musicbrainz.org/ws/2/recording/rec-1")) == 1);
+    }
+
+    private static void TestWorkerDoesNotGateDeezerLinkedPlay()
+    {
+        Console.WriteLine("\n[Test] Coverage gate skips plays with a Deezer link (exact-capable) even when the song is in the library");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        // The song EXISTS in the library — pre-link-aware-gate this play would be covered.
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Exact Song", "https://www.deezer.com/track/624510", null, DateTime.UtcNow);
+
+        var artistService = new FakeArtistService();
+        artistService.Add(new Artist { Id = 42, Name = "Artist One", ForeignArtistId = "artist-mbid-1" });
+        var trackService = new FakeTrackService();
+        trackService.AddTracksByArtist(42,
+            new Track { Title = "Exact Song", ForeignRecordingId = "rec-mbid-1", ForeignTrackId = "track-mbid-1", TrackFileId = 99 });
+
+        // ISRC path responds so the play resolves exactly instead of being text-covered.
+        httpClient.Respond("api.deezer.com/track/624510", "{\"isrc\":\"USSM19601763\"}");
+        httpClient.Respond("musicbrainz.org/ws/2/isrc/USSM19601763", "{\"recordings\":[{\"id\":\"rec-1\"}]}");
+        httpClient.Respond("musicbrainz.org/ws/2/recording/rec-1",
+            "{\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"releases\":[" +
+            "{\"status\":\"Official\",\"artist-credit\":[{\"artist\":{\"id\":\"artist-mbid-1\",\"name\":\"Artist One\"}}]," +
+            "\"release-group\":{\"id\":\"album-mbid\",\"title\":\"The Album\",\"primary-type\":\"Album\",\"first-release-date\":\"1996-08-14\"}}]}");
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), trackService, artistService, new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("Deezer-linked play NOT marked covered despite library copy", state?.CoveredUtc == null);
+        Assert("Deezer-linked play resolved via the ISRC path", httpClient.RequestUrls.Any(u => u.Contains("api.deezer.com/track/624510")) && httpClient.RequestUrls.Any(u => u.Contains("musicbrainz.org/ws/2/isrc/USSM19601763")));
+        Assert("Deezer-linked play became presentable with the exact album", store.GetPresentableTracks("altnation", 10).Any(t => t.TrackId == "track1" && t.Album == "The Album"));
+    }
+
+    private static void TestWorkerStillGatesAppleOnlyPlay()
+    {
+        // Apple Music links carry no ISRC path in the resolver (they only feed the fuzzy
+        // title-search fallback), so an Apple-only play is NOT exact-capable and must stay
+        // gated. Regression guard: if a future Apple ISRC path is added, this test forces
+        // the gate condition to be revisited.
+        Console.WriteLine("\n[Test] Coverage gate still covers Apple-only plays (no exact identity)");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Fuzzy Song", null, "https://music.apple.com/us/album/1440664882?i=1440664900", DateTime.UtcNow);
+
+        var artistService = new FakeArtistService();
+        artistService.Add(new Artist { Id = 42, Name = "Artist One", ForeignArtistId = "artist-mbid-1" });
+        var trackService = new FakeTrackService();
+        trackService.AddTracksByArtist(42,
+            new Track { Title = "Fuzzy Song", ForeignRecordingId = "rec-mbid-1", ForeignTrackId = "track-mbid-1", TrackFileId = 99 });
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), trackService, artistService, new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("Apple-only play marked covered (library check still applies)", state?.CoveredUtc != null);
+        Assert("Apple-only play NOT resolved (no MB calls)", httpClient.CallCount == 0);
     }
 
     private static void TestWorkerIdlesWithNoChannels()

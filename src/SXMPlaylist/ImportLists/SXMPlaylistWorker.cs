@@ -455,11 +455,14 @@ namespace SXMPlaylist.ImportLists
                 ?.Name;
         }
 
-        // Library-first coverage gate: for FUZZY resolutions (no recording/track MBID yet — the
-        // title-search tier where the resolved album is a guess), check whether the played track
-        // already exists in the library before spending MusicBrainz calls on resolution. Exact
-        // plays (recording/track MBID present) skip this — their album is trusted, and Fetch's
-        // album-level coverage check already handles the "album already owned" case.
+        // Library-first coverage gate: for FUZZY resolutions (no exact identity — no recording/
+        // track MBID yet AND no Deezer link to obtain one), check whether the played track already
+        // exists in the library before spending MusicBrainz calls on resolution. Exact-capable
+        // plays skip this: a play carrying a Deezer link usually resolves via the ISRC path to its
+        // exact album (trusted, presented; if Deezer has no ISRC, recording-search runs as usual),
+        // and Fetch's album-level coverage check handles the "album already owned" case. The
+        // live-vs-studio tradeoff (a live play text-matching a studio copy in the library) is
+        // therefore limited to linkless fuzzy plays — the accepted policy.
         //
         // Sources, in order: Lidarr track files (authoritative — always available), then Plex
         // (covers the beets split-brain where Lidarr shows 0/N but the track is on disk). Plex
@@ -473,9 +476,11 @@ namespace SXMPlaylist.ImportLists
             {
                 token.ThrowIfCancellationRequested();
 
-                // Exact plays carry their own identity — no coverage check needed.
+                // Exact plays carry their own identity (already-resolved MBIDs) or can obtain it
+                // cheaply (a Deezer link feeds the ISRC path) — no coverage check needed.
                 if (track.RecordingMusicBrainzId.IsNotNullOrWhiteSpace()
-                    || track.TrackMusicBrainzId.IsNotNullOrWhiteSpace())
+                    || track.TrackMusicBrainzId.IsNotNullOrWhiteSpace()
+                    || track.DeezerUrl.IsNotNullOrWhiteSpace())
                 {
                     continue;
                 }
