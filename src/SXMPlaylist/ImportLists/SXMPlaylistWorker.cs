@@ -36,6 +36,7 @@ namespace SXMPlaylist.ImportLists
         private static readonly TimeSpan PlexSyncInterval = TimeSpan.FromHours(6);
         private static readonly TimeSpan CompanionCleanupInterval = TimeSpan.FromHours(24);
         private const int ResolutionBatchSize = 50;
+        private const int PresentationVerifyBatchSize = 50;
 
         private const string BaseUrl = "https://xmplaylist.com";
         private const string ImplementationName = "SXMPlaylistImport";
@@ -172,6 +173,8 @@ namespace SXMPlaylist.ImportLists
             ResolveDueTracks(token);
 
             BackfillMissingRecordingMbids();
+
+            VerifyPresentations(token);
 
             SyncCompanionPlexPlaylists(token);
 
@@ -537,7 +540,7 @@ namespace SXMPlaylist.ImportLists
                 foreach (var candidate in _trackService.GetTracksByArtist(artist.Id))
                 {
                     if (candidate.HasFile
-                        && string.Equals(candidate.Title, track.Song, StringComparison.OrdinalIgnoreCase))
+                        && SXMPlaylistTitleNormalizer.TitlesEqual(candidate.Title, track.Song))
                     {
                         return (candidate.ForeignRecordingId, candidate.ForeignTrackId);
                     }
@@ -609,7 +612,7 @@ namespace SXMPlaylist.ImportLists
 
                         var tracks = _trackService.GetTracksByAlbum(album.Id);
                         var match = tracks.FirstOrDefault(t =>
-                            string.Equals(t.Title, song, StringComparison.OrdinalIgnoreCase));
+                            SXMPlaylistTitleNormalizer.TitlesEqual(t.Title, song));
                         if (match == null || (match.ForeignRecordingId.IsNullOrWhiteSpace() && match.ForeignTrackId.IsNullOrWhiteSpace()))
                         {
                             continue;
@@ -639,6 +642,74 @@ namespace SXMPlaylist.ImportLists
             catch (Exception ex)
             {
                 _logger.Debug(ex, "Failed to backfill missing recording MBIDs via Lidarr services");
+            }
+        }
+
+        // Presentation verification: for tracks Fetch has handed to Lidarr (PresentedUtc set) but
+        // not yet confirmed, check whether the album actually exists in Lidarr monitored or on disk.
+        // Verified tracks leave the presentation queue forever (album-scoped — one Lidarr add covers
+        // every play of that album). Tracks whose album is present but unmonitored/off-disk are left
+        // unverified so Fetch re-presents them (Lidarr's "Rejected, Album Exists in DB. Ensuring
+        // Album and Artist monitored" flips them — verified 9/9 in the live audit). Albums Lidarr
+        // can never match (absent) count attempts and cap out as dead-enders.
+        private void VerifyPresentations(CancellationToken token)
+        {
+            var candidates = _historyStore.GetUnverifiedPresentedTracks(PresentationVerifyBatchSize);
+            foreach (var (trackId, albumMbid, song, channel) in candidates)
+            {
+                token.ThrowIfCancellationRequested();
+
+                try
+                {
+                    var album = _albumService.FindById(albumMbid);
+                    if (album == null)
+                    {
+                        _historyStore.RecordPresentationAttempt(trackId);
+                        if (_historyStore.GetPresentAttempts(trackId) >= SXMPlaylistHistoryStore.MaxPresentAttempts)
+                        {
+                            _logger.Warn("Presentation failed permanently for {0} ({1} - {2}): album {3} not in Lidarr after {4} attempts",
+                                trackId, channel, song, albumMbid, SXMPlaylistHistoryStore.MaxPresentAttempts);
+                        }
+
+                        continue;
+                    }
+
+                    if (album.Monitored)
+                    {
+                        _historyStore.MarkTrackVerified(albumMbid, DateTime.UtcNow);
+                        _logger.Debug("Verified {0} ({1} - {2}): album '{3}' monitored in Lidarr",
+                            trackId, channel, song, album.Title);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var artist = album.Artist?.Value;
+                        if (artist != null && _albumService.GetArtistAlbumsWithFiles(artist).Any(a =>
+                                string.Equals(a.ForeignAlbumId, album.ForeignAlbumId, StringComparison.OrdinalIgnoreCase)
+                                || (album.Id > 0 && a.Id == album.Id)))
+                        {
+                            _historyStore.MarkTrackVerified(albumMbid, DateTime.UtcNow);
+                            _logger.Debug("Verified {0} ({1} - {2}): album '{3}' on disk in Lidarr",
+                                trackId, channel, song, album.Title);
+                        }
+                        else
+                        {
+                            // Present but unmonitored and not on disk — leave unverified so Fetch
+                            // re-presents and Lidarr's ensure-monitored path flips it. NOT an attempt.
+                            _logger.Debug("Present but unmonitored/off-disk {0} ({1} - {2}): album '{3}', will re-present",
+                                trackId, channel, song, album.Title);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Debug(ex, "Could not determine whether album '{0}' is on disk", albumMbid);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug(ex, "Failed to verify presentation for track {0}", trackId);
+                }
             }
         }
 

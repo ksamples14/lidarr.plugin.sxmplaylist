@@ -1626,10 +1626,36 @@ namespace SXMPlaylist.ImportLists
             var terms = new List<string>();
             AddTitleSearchTerm(terms, value);
 
+            // Plex's title search only matches its stored form of apostrophes (curly U+2019):
+            // a feed title with a straight apostrophe ("My Own Soul's Warning") returns ZERO
+            // results, silently dropping the track from playlist matching even when the song is
+            // in the library (observed 2026-08-19, Killers "My Own Soul's Warning" — 4 syncs
+            // unmatched while 2 library copies existed). Add a curly-folded variant so both
+            // feed conventions match Plex's stored titles.
+            var curlyFolded = FoldApostrophesToCurly(value);
+            AddTitleSearchTerm(terms, curlyFolded);
+
             var stripped = SXMPlaylistTitleNormalizer.StripTrailingParentheticalSuffixes(StripFeat(value));
             AddTitleSearchTerm(terms, stripped);
 
+            var strippedCurly = SXMPlaylistTitleNormalizer.StripTrailingParentheticalSuffixes(StripFeat(curlyFolded));
+            AddTitleSearchTerm(terms, strippedCurly);
+
             return terms;
+        }
+
+        // Maps straight (U+0027) and existing curly (U+2018/2019) apostrophes to curly U+2019 —
+        // the form Plex stores titles with and the only form its title search accepts.
+        private static string FoldApostrophesToCurly(string value)
+        {
+            if (value.IndexOf('\'') < 0 && value.IndexOf('\u2019') < 0 && value.IndexOf('\u2018') < 0)
+            {
+                return value;
+            }
+
+            return value
+                .Replace('\u2018', '\u2019')
+                .Replace('\'', '\u2019');
         }
 
         private static void AddTitleSearchTerm(List<string> terms, string value)

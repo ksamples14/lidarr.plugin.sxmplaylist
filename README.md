@@ -58,7 +58,7 @@
 
 The Channel dropdown populates itself automatically whenever you open the Add/Edit dialog — no separate button to press. It's backed by a small cache (see [Channel List](#channel-list) below) so opening the dialog doesn't hit xmplaylist.com every time.
 
-> The background worker captures each channel roughly every **1 hour**, and the import lists present resolved tracks to Lidarr hourly (capped at 20 per fetch). Resolution happens in the background, so imports arrive spread across the day rather than in bursts. Artist monitoring, quality profile, and root folder are configured in Lidarr's own **Added Artist Settings** section of the import list modal, not by this plugin. Whether a previously-unmonitored artist gets re-monitored when it shows up in the feed again is controlled by Lidarr's own **Monitor Existing** setting on the list — not by this plugin.
+> The background worker captures each channel roughly every **1 hour**, and the import lists present resolved tracks to Lidarr hourly (capped by the Albums Per Day budget). Resolution happens in the background, so imports arrive spread across the day rather than in bursts. Artist monitoring, quality profile, and root folder are configured in Lidarr's own **Added Artist Settings** section of the import list modal, not by this plugin. Whether a previously-unmonitored artist gets re-monitored when it shows up in the feed again is controlled by Lidarr's own **Monitor Existing** setting on the list — not by this plugin.
 
 ## How It Works
 
@@ -66,7 +66,7 @@ SXM Playlist runs a background worker that checks each configured channel about 
 
 1. **Capture.** The worker checks each channel's play feed every hour and records the plays it hasn't seen before.
 2. **Resolve.** Each new track's album is looked up in the background, retried up to 3 times before giving up.
-3. **Present.** Lidarr polls each import list hourly; the list returns resolved tracks from the last 25 hours, which Lidarr adds to your library. Duplicate plays are skipped.
+3. **Present.** Lidarr polls each import list hourly; the list returns resolved tracks (ordered by last-play time, capped by the Albums Per Day budget), which Lidarr adds to your library. Duplicate plays are skipped. A background pass later verifies each presented album actually landed in Lidarr monitored/on-disk, so unconfirmed albums are re-presented instead of silently dropped.
 4. **Playlist.** If enabled, the worker periodically mirrors recent plays from that list into a companion Plex playlist.
 
 <details>
@@ -114,7 +114,7 @@ Plex search results are cached per import list in `PlexPlaylistState.TrackCacheJ
 The plugin keeps a local SQLite database (`Lidarr/AppData/SXMPlaylist/history.db`) recording every play it sees, across all channel lists: artist, song, channel, and timestamp. Alongside the play history it keeps per-track resolution state (the album and MusicBrainz IDs once resolved, plus a 3-strike failure counter), per-channel "last captured" markers, companion Plex playlist state, and playlist match audit rows. This serves four purposes:
 
 - **Dedup** — duplicate plays are skipped, so overlapping capture windows never duplicate an import.
-- **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks become presentable to Lidarr for the next 25 hours.
+- **Resolution queue** — each track is resolved by the background worker up to 3 times before it gives up; resolved tracks stay presentable to Lidarr until their album is verified in the library (no fixed expiry).
 - **Plex playlists** — companion playlists use play history to mirror what aired on a channel or show.
 - **Auditability** — playlist match rows explain which SXM play mapped to which Plex track, with match method and confidence.
 

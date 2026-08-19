@@ -38,6 +38,12 @@ namespace SXMPlaylist.ImportLists
         public static readonly TimeSpan RetryInterval = TimeSpan.FromHours(12);
         public static readonly int MaxRetryAttempts = 10;
 
+        // Presentation dead-ender cap: an album that Lidarr can never match (artist-name mismatch,
+        // absent from MusicBrainz) stops being re-presented after this many attempts. Mirrors the
+        // resolver's strikes semantics; the unmonitored-but-present case does NOT increment (it is
+        // recoverable via re-presentation, which flips Lidarr's "ensure monitored").
+        public static readonly int MaxPresentAttempts = 3;
+
         private readonly string _connectionString;
 
         public SXMPlaylistHistoryStore(IAppFolderInfo appFolderInfo)
@@ -221,6 +227,18 @@ namespace SXMPlaylist.ImportLists
             // Set when the library already contains the played track (library-first coverage check),
             // so the worker skips resolution and Fetch never presents it for a download.
             EnsureColumn(connection, "Tracks", "CoveredUtc", "TEXT");
+
+            // Presentation ledger: PresentedUtc = when Fetch last handed the album to Lidarr;
+            // PresentedAlbumMbid = the EXACT album MBID handed over (Tracks.AlbumMusicBrainzId only
+            // holds the Singles-priority resolution, which can differ from what an Albums-priority
+            // list presented — verification must use what Fetch actually gave Lidarr);
+            // VerifiedUtc = when a worker pass confirmed the album exists in Lidarr monitored/on-disk
+            // (terminal, like CoveredUtc); PresentAttempts = presentation strike counter for albums
+            // that can never land (name-mismatch dead-enders).
+            EnsureColumn(connection, "Tracks", "PresentedUtc", "TEXT");
+            EnsureColumn(connection, "Tracks", "PresentedAlbumMbid", "TEXT");
+            EnsureColumn(connection, "Tracks", "VerifiedUtc", "TEXT");
+            EnsureColumn(connection, "Tracks", "PresentAttempts", "INTEGER NOT NULL DEFAULT 0");
 
             // The pre-retry-sweep schema carried a Failures counter that is never read anywhere
             // (the unified retry system tracks RetryAttempts/NextRetryUtc instead; RecordTrackFailure
@@ -1010,6 +1028,41 @@ namespace SXMPlaylist.ImportLists
                 reader.GetInt32(3));
         }
 
+        // Reads the presentation-attempt count for one track (dead-ender cap check).
+        public int GetPresentAttempts(string trackId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT PresentAttempts FROM Tracks WHERE TrackId = @trackId",
+                connection);
+            command.Parameters.AddWithValue("@trackId", trackId);
+
+            using var reader = command.ExecuteReader();
+            return reader.Read() ? reader.GetInt32(0) : 0;
+        }
+
+        // Reads the full presentation-ledger state of one track (presented/verified timestamps +
+        // attempt count). Used by the presentation-ledger tests to assert Fetch/verify behavior.
+        public (DateTime? PresentedUtc, DateTime? VerifiedUtc, int PresentAttempts)? GetPresentationState(string trackId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT PresentedUtc, VerifiedUtc, PresentAttempts FROM Tracks WHERE TrackId = @trackId",
+                connection);
+            command.Parameters.AddWithValue("@trackId", trackId);
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            return (
+                reader.IsDBNull(0) ? (DateTime?)null : DateTime.Parse(reader.GetString(0)).ToUniversalTime(),
+                reader.IsDBNull(1) ? (DateTime?)null : DateTime.Parse(reader.GetString(1)).ToUniversalTime(),
+                reader.GetInt32(2));
+        }
+
         // Marks a track as already present in the library (library-first coverage check), so the
         // worker skips resolution and Fetch never presents it for a download. Backfills any MBIDs
         // the library copy revealed (recording/track) so the play carries the real identity.
@@ -1028,6 +1081,93 @@ namespace SXMPlaylist.ImportLists
             command.Parameters.AddWithValue("@trackMbid", (object?)trackMusicBrainzId ?? DBNull.Value);
             command.Parameters.AddWithValue("@trackId", trackId);
             command.ExecuteNonQuery();
+        }
+
+        // Presentation ledger. Fetch() marks a track as presented when the album is actually handed
+        // to Lidarr; the worker later verifies whether Lidarr added/monitored it (album-scoped —
+        // Lidarr adds albums, and several tracks may resolve to the same one). Verified is terminal,
+        // like CoveredUtc; PresentAttempts caps albums Lidarr can never match (name-mismatch
+        // dead-enders) so they stop churning the presentation queue.
+        public void MarkTrackPresented(string trackId, string? albumMusicBrainzId, DateTime presentedUtc)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET PresentedUtc = @presentedUtc, PresentedAlbumMbid = @albumMbid WHERE TrackId = @trackId",
+                connection);
+
+            command.Parameters.AddWithValue("@presentedUtc", presentedUtc.ToString("O"));
+            command.Parameters.AddWithValue("@albumMbid", (object?)albumMusicBrainzId ?? DBNull.Value);
+            command.Parameters.AddWithValue("@trackId", trackId);
+            command.ExecuteNonQuery();
+        }
+
+        // Album-scoped verification: marks every Tracks row whose resolution points at this album
+        // MBID as verified. A single Lidarr add covers all plays of that album, so one pass
+        // converges multi-track albums instead of re-presenting a different track per Fetch cycle.
+        public void MarkTrackVerified(string albumMusicBrainzId, DateTime verifiedUtc)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET VerifiedUtc = @verifiedUtc " +
+                "WHERE VerifiedUtc IS NULL AND TrackId IN (" +
+                "SELECT TrackId FROM TrackResolutions WHERE AlbumMusicBrainzId = @albumMbid)",
+                connection);
+
+            command.Parameters.AddWithValue("@verifiedUtc", verifiedUtc.ToString("O"));
+            command.Parameters.AddWithValue("@albumMbid", albumMusicBrainzId);
+            command.ExecuteNonQuery();
+        }
+
+        public void RecordPresentationAttempt(string trackId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET PresentAttempts = PresentAttempts + 1 WHERE TrackId = @trackId",
+                connection);
+
+            command.Parameters.AddWithValue("@trackId", trackId);
+            command.ExecuteNonQuery();
+        }
+
+        public void MarkTrackPresentFailed(string trackId)
+        {
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "UPDATE Tracks SET PresentAttempts = @maxAttempts WHERE TrackId = @trackId",
+                connection);
+
+            command.Parameters.AddWithValue("@maxAttempts", MaxPresentAttempts);
+            command.Parameters.AddWithValue("@trackId", trackId);
+            command.ExecuteNonQuery();
+        }
+
+        // Tracks that were presented to Lidarr but not yet confirmed — the verification pass source.
+        // Only MBID-presented tracks (title-floor has no album identity to verify), capped attempts.
+        // Uses PresentedAlbumMbid — the exact album handed to Lidarr — not Tracks.AlbumMusicBrainzId,
+        // which only holds the Singles-priority resolution (an Albums-priority list may have handed
+        // over a different album).
+        public IReadOnlyList<(string TrackId, string AlbumMusicBrainzId, string Song, string Channel)> GetUnverifiedPresentedTracks(int limit)
+        {
+            var results = new List<(string, string, string, string)>();
+            using var connection = OpenConnection();
+            using var command = new SQLiteCommand(
+                "SELECT TrackId, PresentedAlbumMbid, Song, Channel FROM Tracks " +
+                "WHERE PresentedUtc IS NOT NULL AND VerifiedUtc IS NULL " +
+                "AND PresentedAlbumMbid IS NOT NULL AND PresentedAlbumMbid <> '' " +
+                "AND PresentAttempts < @maxAttempts " +
+                "ORDER BY PresentedUtc ASC LIMIT @limit",
+                connection);
+
+            command.Parameters.AddWithValue("@maxAttempts", MaxPresentAttempts);
+            command.Parameters.AddWithValue("@limit", limit);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3)));
+            }
+
+            return results;
         }
 
         public void MarkTrackResolved(string trackId, AlbumResolution resolution, DateTime? resolvedUtc = null)
@@ -1145,12 +1285,13 @@ namespace SXMPlaylist.ImportLists
             command.ExecuteNonQuery();
         }
 
-        // Tracks resolved within the presentation window, for this channel - i.e. what the import
-        // list hands to Lidarr. Resolved tracks stay presentable for the window; Lidarr's own
-        // import-list processing is idempotent, so re-presentation is harmless.
+        // Tracks ready for presentation to Lidarr for this channel — i.e. what the import list
+        // hands over. The queue never expires a track: it stays presentable until verified in Lidarr
+        // (VerifiedUtc), covered (CoveredUtc), or the presentation dead-ender cap is hit
+        // (PresentAttempts >= MaxPresentAttempts). Ordered by last-play recency so replays float to
+        // the top; Lidarr's import-list processing is idempotent, so re-presentation is harmless.
         public IReadOnlyList<PresentableTrack> GetPresentableTracks(
             string channel,
-            DateTime resolvedSinceUtc,
             int limit,
             IReadOnlyList<ShowWindow>? windows = null,
             bool requireMusicBrainzId = false,
@@ -1159,7 +1300,6 @@ namespace SXMPlaylist.ImportLists
         {
             return GetPresentableTracks(
                 channel,
-                resolvedSinceUtc,
                 DateTime.UtcNow - PlayRetention,
                 limit,
                 windows,
@@ -1170,7 +1310,6 @@ namespace SXMPlaylist.ImportLists
 
         public IReadOnlyList<PresentableTrack> GetPresentableTracks(
             string channel,
-            DateTime resolvedSinceUtc,
             DateTime retainedSinceUtc,
             int limit,
             IReadOnlyList<ShowWindow>? windows = null,
@@ -1202,12 +1341,13 @@ namespace SXMPlaylist.ImportLists
                 "SELECT Tracks.TrackId, ArtistsJson, Song, r.Album, r.ArtistMusicBrainzId, r.AlbumMusicBrainzId, TimestampUtc, alt.AlbumMusicBrainzId FROM Tracks " +
                 "JOIN TrackResolutions r ON r.TrackId = Tracks.TrackId AND r.ReleasePriority = @releasePriority " +
                 "LEFT JOIN TrackResolutions alt ON alt.TrackId = Tracks.TrackId AND alt.ReleasePriority <> @releasePriority " +
-                "WHERE Channel = @channel AND Resolved = 1 AND CoveredUtc IS NULL AND r.ResolvedUtc >= @resolvedSince AND TimestampUtc >= @retainedSince" + mbidFilter + minimumPlaysFilter + windowFilter + " ORDER BY r.ResolvedUtc DESC LIMIT @limit",
+                "WHERE Channel = @channel AND Resolved = 1 AND CoveredUtc IS NULL AND VerifiedUtc IS NULL " +
+                "AND PresentAttempts < @maxPresentAttempts AND TimestampUtc >= @retainedSince" + mbidFilter + minimumPlaysFilter + windowFilter + " ORDER BY TimestampUtc DESC LIMIT @limit",
                 connection);
 
             command.Parameters.AddWithValue("@channel", channel);
             command.Parameters.AddWithValue("@releasePriority", (int)releasePriority);
-            command.Parameters.AddWithValue("@resolvedSince", resolvedSinceUtc.ToString("O"));
+            command.Parameters.AddWithValue("@maxPresentAttempts", MaxPresentAttempts);
             command.Parameters.AddWithValue("@retainedSince", retainedSinceUtc.ToString("O"));
             command.Parameters.AddWithValue("@limit", limit);
             command.Parameters.AddWithValue("@minimumPlays", Math.Max(minimumPlays, 1));

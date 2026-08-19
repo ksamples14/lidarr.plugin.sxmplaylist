@@ -149,6 +149,19 @@ internal static class Program
         TestWorkerCoversFuzzyTrackViaPlexWhenLidarrMisses();
         TestWorkerDoesNotCoverWhenPlexDisabled();
         TestWorkerDoesNotCoverWhenPlexUnreachable();
+        TestStorePresentationLedgerLifecycle();
+        TestStorePresentAttemptsCap();
+        TestStoreAlbumScopedVerification();
+        TestWorkerVerifiesMonitoredAlbum();
+        TestWorkerVerifiesOnDiskAlbum();
+        TestWorkerRePresentsUnmonitoredAlbum();
+        TestWorkerPresentationDeadEnderCaps();
+        TestImportMarksPresentedOncePerAlbum();
+        TestImportUnlimitedPresentsWholeQueue();
+        TestImportReplayFloatsTrackUp();
+        TestTitleNormalizerComparison();
+        TestWorkerCoversVersionedFuzzyTrackInLidarrLibrary();
+        TestWorkerBackfillsVersionedAndCurlyTitles();
 
         TestPlexExactTitleMatch();
         TestPlexSyncReturnsTrackMatchAudit();
@@ -156,6 +169,7 @@ internal static class Program
         TestPlexFuzzyTitleVersionMatch();
         TestPlexPrefersAlbumMatchWhenAvailable();
         TestPlexRetriesSearchWithStrippedTitleSuffix();
+        TestPlexCurlyApostropheSearchTerm();
         TestPlexMultiArtistPlayMatchesPrimaryArtist();
         TestPlexRepeatedTrackUsesPersistedCache();
         TestPlexRetriesTransientSearchFailure();
@@ -491,10 +505,10 @@ internal static class Program
         store.MarkTrackResolved("showTrack", new AlbumResolution(true, "Show Album", null, "show-album"), now.AddMinutes(-30));
 
         var windows = new[] { new ShowWindow(showTime.AddMinutes(-5), showTime.AddMinutes(5)) };
-        var presentable = store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 20, windows);
+        var presentable = store.GetPresentableTracks("altnation", 20, windows);
 
         Assert("show-window match is returned even when newer non-show rows exceed limit", presentable.Count == 1 && presentable[0].TrackId == "showTrack");
-        Assert("empty show windows return no tracks", store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 20, Array.Empty<ShowWindow>()).Count == 0);
+        Assert("empty show windows return no tracks", store.GetPresentableTracks("altnation", 20, Array.Empty<ShowWindow>()).Count == 0);
     }
 
     private static void TestImportAllowsSameChannelDifferentShows()
@@ -1946,10 +1960,10 @@ internal static class Program
 
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1"), now);
 
-        var presentable = store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 10);
+        var presentable = store.GetPresentableTracks("altnation", 10);
         Assert("resolved track is presentable", presentable.Count == 1 && presentable[0].Album == "No Code");
         Assert("artist MBID carried for single-artist track", presentable[0].ArtistMusicBrainzId == "artist-mbid-1");
-        Assert("not presentable for another channel", store.GetPresentableTracks("lithium", now - SXMPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
+        Assert("not presentable for another channel", store.GetPresentableTracks("lithium", 10).Count == 0);
     }
 
     private static void TestStoreThreeStrikesExcludesTrack()
@@ -2063,7 +2077,7 @@ internal static class Program
 
     private static void TestStorePresentableWindowExpires()
     {
-        Console.WriteLine("\n[Test] A resolved track falls out of the presentation window after 25 hours");
+        Console.WriteLine("\n[Test] A resolved track stays presentable indefinitely (no 25h presentation window)");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
@@ -2071,7 +2085,7 @@ internal static class Program
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now - SXMPlaylistHistoryStore.PresentationWindow - TimeSpan.FromMinutes(1));
 
-        Assert("old resolution is no longer presentable", store.GetPresentableTracks("altnation", now - SXMPlaylistHistoryStore.PresentationWindow, 10).Count == 0);
+        Assert("old resolution remains presentable (window removed)", store.GetPresentableTracks("altnation", 10).Count == 1);
     }
 
     private static void TestStoreRequireMbidFiltersBeforeLimit()
@@ -2091,7 +2105,7 @@ internal static class Program
         store.UpsertTrack("mbidTrack", "altnation", new[] { "Artist" }, "MBID Song", null, null, now.AddMinutes(-5));
         store.MarkTrackResolved("mbidTrack", new AlbumResolution(true, "MBID Album", null, "album-mbid"), now.AddMinutes(-5));
 
-        var strict = store.GetPresentableTracks("altnation", now.AddHours(-1), 20, requireMusicBrainzId: true);
+        var strict = store.GetPresentableTracks("altnation", 20, requireMusicBrainzId: true);
 
         Assert("older MBID row is returned even when newer title-only rows exceed limit", strict.Count == 1 && strict[0].TrackId == "mbidTrack");
     }
@@ -2116,7 +2130,7 @@ internal static class Program
         store.UpsertTrack("repeatTrack", "altnation", new[] { "Artist" }, "Repeat Song", null, null, now.AddMinutes(-10));
         store.MarkTrackResolved("repeatTrack", new AlbumResolution(true, "Repeat Album", null, "repeat-mbid"), now.AddMinutes(-10));
 
-        var presentable = store.GetPresentableTracks("altnation", now.AddHours(-1), 20, minimumPlays: 2);
+        var presentable = store.GetPresentableTracks("altnation", 20, minimumPlays: 2);
 
         Assert("older repeated row is returned while newer single-play rows are hidden", presentable.Count == 1 && presentable[0].TrackId == "repeatTrack");
     }
@@ -2135,7 +2149,7 @@ internal static class Program
             store.MarkTrackResolved(trackId, new AlbumResolution(true, "Album " + i, null, "album-mbid" + i), now.AddMinutes(i));
         }
 
-        var presentable = store.GetPresentableTracks("altnation", now.AddHours(-1), 3);
+        var presentable = store.GetPresentableTracks("altnation", 3);
 
         Assert($"presentation is limited to 3 rows (got {presentable.Count})", presentable.Count == 3);
     }
@@ -2231,8 +2245,8 @@ internal static class Program
         store.UpsertTrack("oldTrack", "altnation", new[] { "Artist" }, "Old Song", null, null, twoDaysOld);
         store.MarkTrackResolved("oldTrack", new AlbumResolution(true, "Old Album", null, "old-mbid"), now);
 
-        var oneDayList = store.GetPresentableTracks("altnation", now.AddHours(-1), now.AddDays(-1), 10);
-        var threeDayList = store.GetPresentableTracks("altnation", now.AddHours(-1), now.AddDays(-3), 10);
+        var oneDayList = store.GetPresentableTracks("altnation", now.AddDays(-1), 10);
+        var threeDayList = store.GetPresentableTracks("altnation", now.AddDays(-3), 10);
         store.Prune();
 
         Assert("one-day query hides the old play", oneDayList.Count == 0);
@@ -2285,7 +2299,7 @@ internal static class Program
         store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", "artist-mbid-1", "album-mbid-1"), now + TimeSpan.FromHours(1));
 
         Assert("MBID track no longer due for retry", store.GetDueTracks(10).Count == 0);
-        Assert("still presentable after renewal", store.GetPresentableTracks("altnation", now + TimeSpan.FromHours(1) - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
+        Assert("still presentable after renewal", store.GetPresentableTracks("altnation", 10).Any(t => t.TrackId == "track1"));
     }
 
     private static void TestStoreNewPlayResetsRetryClock()
@@ -2330,19 +2344,25 @@ internal static class Program
 
     private static void TestStoreRetryFailureRenewsPresentationWindow()
     {
-        Console.WriteLine("\n[Test] A transient failure renews ResolvedUtc so the track stays presentable");
+        // Repurposed after the presentation-window removal: ResolvedUtc renewal no longer affects
+        // presentation eligibility (GetPresentableTracks never reads ResolvedUtc), so the old
+        // "still presentable" assertion was trivially true. What RecordTransientFailure actually
+        // does that matters now is the retry schedule: increment attempts and push NextRetryUtc
+        // forward so the track is not due for re-resolution until that time.
+        Console.WriteLine("\n[Test] A transient failure increments attempts and pushes NextRetryUtc forward");
 
         var store = NewHistoryStore();
         var now = DateTime.UtcNow;
 
         store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
-        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, null), now);
 
-        // A transient failure past the 25h presentation window; ResolvedUtc gets renewed.
-        var retryFailureTime = now + SXMPlaylistHistoryStore.PresentationWindow + TimeSpan.FromHours(1);
+        // A transient failure at now+RetryInterval+1h: attempts become 1, NextRetryUtc lands there.
+        var retryFailureTime = now + SXMPlaylistHistoryStore.RetryInterval + TimeSpan.FromHours(1);
         store.RecordTransientFailure("track1", retryFailureTime);
 
-        Assert("track still presentable after transient failure renewed the window", store.GetPresentableTracks("altnation", retryFailureTime - SXMPlaylistHistoryStore.PresentationWindow, 10).Any(t => t.TrackId == "track1"));
+        Assert("track not due before NextRetryUtc", store.GetDueTracks(10, now).Count == 0);
+        Assert("track due again once NextRetryUtc passes",
+            store.GetDueTracks(10, retryFailureTime.Add(SXMPlaylistHistoryStore.RetryInterval).AddSeconds(1)).Count == 1);
     }
 
     private static void TestStoreMigrationAddsRetryColumnsIdempotently()
@@ -2479,7 +2499,7 @@ internal static class Program
         // The minimumPlays filter must work on the migrated DB: two legacy plays for the same
         // song satisfy minimumPlays = 2, and the legacy track is presented.
         store.MarkTrackResolved("legacy-track", new AlbumResolution(true, "Repeat Album", null, "repeat-mbid"), DateTime.UtcNow);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow.AddHours(-3), 20, minimumPlays: 2);
+        var presentable = store.GetPresentableTracks("altnation", 20, minimumPlays: 2);
         Assert("minimumPlays=2 filter matches backfilled SongKey rows", presentable.Count == 1 && presentable[0].TrackId == "legacy-track");
 
         // Re-initializing (every start) must not throw, must not re-run the backfill, and must
@@ -2487,7 +2507,7 @@ internal static class Program
         // GetDueTracks still lists it for the Albums priority — that is correct behavior, not a
         // migration artifact.)
         var store2 = new SXMPlaylistHistoryStore(folder);
-        var presentableAfterReinit = store2.GetPresentableTracks("altnation", DateTime.UtcNow.AddHours(-3), 20, minimumPlays: 2);
+        var presentableAfterReinit = store2.GetPresentableTracks("altnation", 20, minimumPlays: 2);
         Assert("second initialize keeps backfilled data queryable", presentableAfterReinit.Count == 1 && presentableAfterReinit[0].TrackId == "legacy-track");
     }
 
@@ -2720,7 +2740,7 @@ internal static class Program
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
+        var presentable = store.GetPresentableTracks("altnation", 10, releasePriority: ReleasePriorityMode.Albums);
 
         Assert("captured + resolved track is presentable", presentable.Count == 1);
         Assert("correct album resolved", presentable[0].Album == "No Code");
@@ -2770,7 +2790,7 @@ internal static class Program
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
+        var presentable = store.GetPresentableTracks("altnation", 10, releasePriority: ReleasePriorityMode.Albums);
 
         Assert("track still resolved via Deezer title fallback", presentable.Count == 1);
         Assert("album title kept from Deezer", presentable[0].Album == "No Code");
@@ -2820,7 +2840,7 @@ internal static class Program
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
-        var presentable = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
+        var presentable = store.GetPresentableTracks("altnation", 10, releasePriority: ReleasePriorityMode.Albums);
 
         Assert("album-first list selected the album", presentable.Count == 1 && presentable[0].Album == "The Album");
         Assert("album-first list used album MBID", presentable[0].AlbumMusicBrainzId == "album-mbid");
@@ -2870,8 +2890,8 @@ internal static class Program
         worker.RunOnce(CancellationToken.None);
 
         var store = new SXMPlaylistHistoryStore(folder);
-        var singles = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Singles);
-        var albums = store.GetPresentableTracks("altnation", DateTime.UtcNow - SXMPlaylistHistoryStore.PresentationWindow, 10, releasePriority: ReleasePriorityMode.Albums);
+        var singles = store.GetPresentableTracks("altnation", 10, releasePriority: ReleasePriorityMode.Singles);
+        var albums = store.GetPresentableTracks("altnation", 10, releasePriority: ReleasePriorityMode.Albums);
 
         Assert("singles-priority presentation uses the single", singles.Count == 1 && singles[0].Album == "The Single");
         Assert("albums-priority presentation uses the album", albums.Count == 1 && albums[0].Album == "The Album");
@@ -3007,6 +3027,344 @@ internal static class Program
         Assert("track went through normal resolution (pre-gate behavior)", state?.Resolved == 1);
     }
 
+    private static void TestStorePresentationLedgerLifecycle()
+    {
+        Console.WriteLine("\n[Test] Presentation ledger: presented -> verified -> leaves the queue");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+
+        Assert("unpresented track is presentable", store.GetPresentableTracks("altnation", 10).Count == 1);
+
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+        Assert("presented-but-unverified track stays presentable (re-presentable)", store.GetPresentableTracks("altnation", 10).Count == 1);
+
+        store.MarkTrackVerified("album-mbid-1", now);
+        Assert("verified track leaves the presentation queue", store.GetPresentableTracks("altnation", 10).Count == 0);
+
+        var state = store.GetPresentationState("track1");
+        Assert("presented timestamp recorded", state?.PresentedUtc != null);
+        Assert("verified timestamp recorded", state?.VerifiedUtc != null);
+    }
+
+    private static void TestStorePresentAttemptsCap()
+    {
+        Console.WriteLine("\n[Test] Presentation dead-ender cap excludes a track from the queue");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+
+        store.RecordPresentationAttempt("track1");
+        store.RecordPresentationAttempt("track1");
+        Assert("track still presentable below the cap", store.GetPresentableTracks("altnation", 10).Count == 1);
+
+        store.MarkTrackPresentFailed("track1");
+        Assert("track excluded once attempts hit the cap", store.GetPresentableTracks("altnation", 10).Count == 0);
+        Assert("attempt count reached the cap", store.GetPresentAttempts("track1") == SXMPlaylistHistoryStore.MaxPresentAttempts);
+    }
+
+    private static void TestStoreAlbumScopedVerification()
+    {
+        Console.WriteLine("\n[Test] Verifying one album covers every track resolved to it");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        // Two tracks resolve to the SAME album; Fetch only presents the first (album dedup), so
+        // only track1 gets PresentedUtc. Verifying the album must clear BOTH from the queue.
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+        store.UpsertTrack("track2", "altnation", new[] { "Artist One" }, "Song B", null, null, now.AddMinutes(-1));
+        store.MarkTrackResolved("track2", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now.AddMinutes(-1));
+
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+        store.MarkTrackVerified("album-mbid-1", now);
+
+        Assert("both tracks leave the queue when the shared album is verified",
+            store.GetPresentableTracks("altnation", 10).Count == 0);
+    }
+
+    private static void TestWorkerVerifiesMonitoredAlbum()
+    {
+        Console.WriteLine("\n[Test] Verify pass marks a presented track verified when Lidarr has it monitored");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { ForeignAlbumId = "album-mbid-1", Monitored = true });
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), albumService, new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetPresentationState("track1");
+        Assert("track verified (album monitored in Lidarr)", state?.VerifiedUtc != null);
+        Assert("verified track no longer presentable", store.GetPresentableTracks("altnation", 10).Count == 0);
+    }
+
+    private static void TestWorkerVerifiesOnDiskAlbum()
+    {
+        Console.WriteLine("\n[Test] Verify pass marks a track verified when the album has files in Lidarr");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+
+        // Unmonitored but with files on disk — the beets split-brain shape (Lidarr 0/N vs files).
+        var artist = new Artist { Id = 42 };
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { Id = 10, ForeignAlbumId = "album-mbid-1", Monitored = false, Artist = artist });
+        albumService.AddWithFiles(new Album { Id = 10, ForeignAlbumId = "album-mbid-1" }, artist);
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), albumService, new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetPresentationState("track1");
+        Assert("track verified (album on disk in Lidarr)", state?.VerifiedUtc != null);
+    }
+
+    private static void TestWorkerRePresentsUnmonitoredAlbum()
+    {
+        Console.WriteLine("\n[Test] Verify pass re-presents an album present but unmonitored (no attempt counted)");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { ForeignAlbumId = "album-mbid-1", Monitored = false });
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), albumService, new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetPresentationState("track1");
+        Assert("track NOT verified when album unmonitored and off-disk", state?.VerifiedUtc == null);
+        Assert("re-presentable: still in the queue", store.GetPresentableTracks("altnation", 10).Count == 1);
+        Assert("no attempt counted for the recoverable case", state?.PresentAttempts == 0);
+    }
+
+    private static void TestWorkerPresentationDeadEnderCaps()
+    {
+        Console.WriteLine("\n[Test] Verify pass caps albums Lidarr can never match (dead-ender)");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "No Code", null, "album-mbid-1"), now);
+        store.MarkTrackPresented("track1", "album-mbid-1", now);
+
+        // Empty FakeAlbumService: FindById returns null — album absent from Lidarr.
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), new FakeTrackService(), new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+
+        worker.RunOnce(CancellationToken.None);
+        worker.RunOnce(CancellationToken.None);
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetPresentationState("track1");
+        Assert("attempts accumulate for an absent album", state?.PresentAttempts == SXMPlaylistHistoryStore.MaxPresentAttempts);
+        Assert("dead-ender excluded from the presentation queue", store.GetPresentableTracks("altnation", 10).Count == 0);
+    }
+
+    private static void TestImportMarksPresentedOncePerAlbum()
+    {
+        Console.WriteLine("\n[Test] Fetch marks presented once per handed album, budget-skipped items untouched");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+
+        // Two albums, budget 1: only the newest gets handed over (and marked).
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Singles, new AlbumResolution(true, "New Album", "artist-mbid-1", "new-mbid"), now);
+        store.UpsertTrack("track2", "altnation", new[] { "Artist Two" }, "Song B", null, null, now.AddMinutes(-1));
+        store.MarkTrackResolved("track2", ReleasePriorityMode.Singles, new AlbumResolution(true, "Older Album", "artist-mbid-2", "older-mbid"), now.AddMinutes(-1));
+
+        var repo = new FakeImportListRepository();
+        var import = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue);
+        ((SXMPlaylistImportSettings)import.Definition.Settings).AlbumsPerDay = 24;
+
+        var items = import.Fetch();
+        Assert("budget 1 emits the one newest album", items.Count == 1 && items[0].AlbumMusicBrainzId == "new-mbid");
+
+        var presented = store.GetPresentationState("track1");
+        var skipped = store.GetPresentationState("track2");
+        Assert("handed album marked presented", presented?.PresentedUtc != null);
+        Assert("budget-skipped album NOT marked presented", skipped?.PresentedUtc == null);
+    }
+
+    private static void TestImportUnlimitedPresentsWholeQueue()
+    {
+        Console.WriteLine("\n[Test] AlbumsPerDay=0 (unlimited) presents every uncovered album and marks each");
+
+        var folder = NewFolder();
+        var store = new SXMPlaylistHistoryStore(folder);
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("track1", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+        store.MarkTrackResolved("track1", ReleasePriorityMode.Singles, new AlbumResolution(true, "New Album", "artist-mbid-1", "new-mbid"), now);
+        store.UpsertTrack("track2", "altnation", new[] { "Artist Two" }, "Song B", null, null, now.AddMinutes(-1));
+        store.MarkTrackResolved("track2", ReleasePriorityMode.Singles, new AlbumResolution(true, "Another Album", "artist-mbid-2", "another-mbid"), now.AddMinutes(-1));
+
+        var repo = new FakeImportListRepository();
+        var import = NewImport(new FakeHttpClient(), folder, repo, 1, "altnation", SXMPlaylistShowSchedule.ChannelValue);
+        ((SXMPlaylistImportSettings)import.Definition.Settings).AlbumsPerDay = 0;
+
+        var items = import.Fetch();
+        Assert("unlimited emits both albums", items.Count == 2);
+        Assert("both handed albums marked presented",
+            store.GetPresentationState("track1")?.PresentedUtc != null
+            && store.GetPresentationState("track2")?.PresentedUtc != null);
+    }
+
+    private static void TestImportReplayFloatsTrackUp()
+    {
+        Console.WriteLine("\n[Test] Queue orders by last-play time; a replay floats a track to the top");
+
+        var store = NewHistoryStore();
+        var now = DateTime.UtcNow;
+
+        store.UpsertTrack("oldTrack", "altnation", new[] { "Artist One" }, "Song A", null, null, now.AddHours(-5));
+        store.MarkTrackResolved("oldTrack", new AlbumResolution(true, "Old Album", null, "old-mbid"), now.AddHours(-5));
+        store.UpsertTrack("newTrack", "altnation", new[] { "Artist Two" }, "Song B", null, null, now.AddHours(-2));
+        store.MarkTrackResolved("newTrack", new AlbumResolution(true, "New Album", null, "new-mbid"), now.AddHours(-2));
+
+        // Replay the OLD track: UpsertTrack refreshes TimestampUtc to now.
+        store.UpsertTrack("oldTrack", "altnation", new[] { "Artist One" }, "Song A", null, null, now);
+
+        var presentable = store.GetPresentableTracks("altnation", 10);
+        Assert("replayed track floats to the top of the queue",
+            presentable.Count == 2 && presentable[0].TrackId == "oldTrack");
+    }
+
+    private static void TestTitleNormalizerComparison()
+    {
+        Console.WriteLine("\n[Test] Title normalization folds version suffixes and curly quotes for library matching");
+
+        // Versioned feed titles match canonical library titles.
+        Assert("year suffix stripped ('Shattered Dreams (88)' vs 'Shattered Dreams')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("Shattered Dreams (88)", "Shattered Dreams"));
+        Assert("full-year suffix stripped ('Emergency (1985)' vs 'Emergency')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("Emergency (1985)", "Emergency"));
+        Assert("edition suffix stripped ('Live Forever (Remastered)' vs 'Live Forever')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("Live Forever (Remastered)", "Live Forever"));
+        // Explicit live-vs-canonical case: the accepted tradeoff the fix is designed to support.
+        Assert("live suffix stripped ('Champagne Supernova (Live)' vs 'Champagne Supernova')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("Champagne Supernova (Live)", "Champagne Supernova"));
+        // Curly quotes/apostrophes fold to straight.
+        Assert("curly apostrophe folds ('Hangin' On' vs 'Hangin\u2019 On')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("Hangin' On", "Hangin\u2019 On"));
+        Assert("curly double quotes fold ('\"Heroes\"' vs '\u201CHeroes\u201D')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("\"Heroes\"", "\u201CHeroes\u201D"));
+        // Case + whitespace insensitivity.
+        Assert("case and whitespace insensitive ('champagne  supernova' vs 'Champagne Supernova')",
+            SXMPlaylistTitleNormalizer.TitlesEqual("champagne  supernova", "Champagne Supernova"));
+        // Genuinely different titles still differ.
+        Assert("different titles still differ",
+            !SXMPlaylistTitleNormalizer.TitlesEqual("Shattered Dreams (88)", "Brown Sugar"));
+        Assert("null safety",
+            !SXMPlaylistTitleNormalizer.TitlesEqual(null, "Brown Sugar")
+            && !SXMPlaylistTitleNormalizer.TitlesEqual("Brown Sugar", null)
+            && SXMPlaylistTitleNormalizer.TitlesEqual(null, null));
+    }
+
+    private static void TestWorkerCoversVersionedFuzzyTrackInLidarrLibrary()
+    {
+        Console.WriteLine("\n[Test] Coverage gate matches a versioned feed title to the canonical library title");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        // Feed title carries the SiriusXM year annotation; the library copy is the canonical title.
+        store.UpsertTrack("track1", "altnation", new[] { "Johnny Hates Jazz" }, "Shattered Dreams (88)", null, null, DateTime.UtcNow);
+
+        var artistService = new FakeArtistService();
+        artistService.Add(new Artist { Id = 42, Name = "Johnny Hates Jazz", ForeignArtistId = "artist-mbid-1" });
+        var trackService = new FakeTrackService();
+        trackService.AddTracksByArtist(42,
+            new Track { Title = "Shattered Dreams", ForeignRecordingId = "rec-mbid-1", ForeignTrackId = "track-mbid-1", TrackFileId = 99 });
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), new FakeAlbumService(), trackService, artistService, new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state = store.GetTrackCoverageState("track1");
+        Assert("versioned fuzzy track marked covered", state?.CoveredUtc != null);
+        Assert("recording MBID backfilled from the canonical library copy", state?.RecordingMusicBrainzId == "rec-mbid-1");
+        Assert("track MBID backfilled from the canonical library copy", state?.TrackMusicBrainzId == "track-mbid-1");
+        Assert("covered track excluded from the due queue", store.GetDueTracks(10).All(t => t.TrackId != "track1"));
+    }
+
+    private static void TestWorkerBackfillsVersionedAndCurlyTitles()
+    {
+        Console.WriteLine("\n[Test] MBID backfill matches versioned and curly-apostrophe feed titles to Lidarr tracks");
+
+        SXMPlaylistFeedCache.Clear();
+        var folder = NewFolder();
+        var httpClient = new FakeHttpClient();
+        var factory = new FakeImportListFactory();
+
+        var store = new SXMPlaylistHistoryStore(folder);
+        // Versioned feed title resolved to an album (title-search tier: album MBID, no recording MBID).
+        store.UpsertTrack("track1", "altnation", new[] { "Johnny Hates Jazz" }, "Shattered Dreams (88)", null, null, DateTime.UtcNow.AddMinutes(-10));
+        store.MarkTrackResolved("track1", new AlbumResolution(true, "Turn Back the Clock", "artist-mbid-1", "album-mbid-1"), DateTime.UtcNow.AddMinutes(-9));
+        // Curly-apostrophe mismatch: feed uses straight quote, library uses curly.
+        store.UpsertTrack("track2", "altnation", new[] { "Vern Gosdin" }, "Hangin' On", null, null, DateTime.UtcNow.AddMinutes(-8));
+        store.MarkTrackResolved("track2", new AlbumResolution(true, "Till the End", "artist-mbid-2", "album-mbid-2"), DateTime.UtcNow.AddMinutes(-7));
+
+        var albumService = new FakeAlbumService();
+        albumService.Add(new Album { Id = 10, ForeignAlbumId = "album-mbid-1", Monitored = true });
+        albumService.Add(new Album { Id = 11, ForeignAlbumId = "album-mbid-2", Monitored = true });
+        var trackService = new FakeTrackService();
+        trackService.AddTracksByAlbum(10, new Track { Title = "Shattered Dreams", ForeignRecordingId = "rec-mbid-1", ForeignTrackId = "track-mbid-1", TrackFileId = 99 });
+        trackService.AddTracksByAlbum(11, new Track { Title = "Hangin\u2019 On", ForeignRecordingId = "rec-mbid-2", ForeignTrackId = "track-mbid-2", TrackFileId = 100 });
+
+        var worker = new SXMPlaylistWorker(httpClient, folder, factory, new FakeMetadataProfileService(), albumService, trackService, new FakeArtistService(), new FakeNotificationFactory(), LogManager.GetLogger("Test"));
+        worker.RunOnce(CancellationToken.None);
+
+        var state1 = store.GetTrackCoverageState("track1");
+        Assert("versioned title backfilled recording MBID", state1?.RecordingMusicBrainzId == "rec-mbid-1");
+        Assert("versioned title backfilled track MBID", state1?.TrackMusicBrainzId == "track-mbid-1");
+        var state2 = store.GetTrackCoverageState("track2");
+        Assert("curly-apostrophe title backfilled recording MBID", state2?.RecordingMusicBrainzId == "rec-mbid-2");
+        Assert("curly-apostrophe title backfilled track MBID", state2?.TrackMusicBrainzId == "track-mbid-2");
+    }
+
     private static void TestPlexExactTitleMatch()
     {
         Console.WriteLine("\n[Test] Plex match uses exact title + artist");
@@ -3089,7 +3447,6 @@ internal static class Program
     private static void TestPlexRetriesSearchWithStrippedTitleSuffix()
     {
         Console.WriteLine("\n[Test] Plex search retries with stripped title suffixes");
-
         var httpClient = new FakeHttpClient();
         httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
         httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
@@ -3103,6 +3460,31 @@ internal static class Program
         Assert("year-suffixed title matched after stripped-title search", HasPlaylistItem(httpClient, "100"));
         Assert("raw title was searched first", httpClient.RequestUrls.Any(u => u.Contains("title=When%20Doves%20Cry%20%2884%29")));
         Assert("stripped title was searched after raw title", httpClient.RequestUrls.Any(u => u.Contains("title=When%20Doves%20Cry&")));
+    }
+
+    private static void TestPlexCurlyApostropheSearchTerm()
+    {
+        // Plex's title search only matches its stored (curly U+2019) apostrophe form: a straight
+        // apostrophe in the feed title ("My Own Soul's Warning") returns zero results even when
+        // the song is in the library. The search must fall back to a curly-folded term.
+        Console.WriteLine("\n[Test] Plex search falls back to a curly-apostrophe title term");
+
+        var httpClient = new FakeHttpClient();
+        httpClient.Respond("/identity", "{\"MediaContainer\":{\"machineIdentifier\":\"mach1\"}}");
+        httpClient.Respond("/library/sections", "{\"MediaContainer\":{\"Directory\":[{\"key\":\"1\",\"type\":\"artist\"}]}}");
+        // Raw straight-apostrophe search: Plex returns zero results (the observed failure mode).
+        httpClient.Respond("artist=The%20Killers&title=My%20Own%20Soul%27s%20Warning&", "{\"MediaContainer\":{}}");
+        // Curly-folded search term: Plex finds the track.
+        httpClient.Respond("title=My%20Own%20Soul%E2%80%99s%20Warning&", TrackMatchJson("My Own Soul’s Warning", "The Killers"));
+        httpClient.Respond("/playlists?playlistType=audio", "{\"MediaContainer\":{\"Metadata\":[{\"title\":\"SXM Alt Nation\",\"ratingKey\":\"500\"}]}}");
+        httpClient.Respond("/playlists/500/items", "{\"MediaContainer\":{\"Metadata\":[{\"ratingKey\":\"999\"}]}}");
+
+        var client = NewPlexClient(httpClient);
+        client.Sync(42, "SXM Alt Nation", new[] { PlayEvent("p1", "The Killers", "My Own Soul's Warning") });
+
+        Assert("curly-apostrophe title matched after straight search came up empty", HasPlaylistItem(httpClient, "100"));
+        Assert("straight-apostrophe title was searched first", httpClient.RequestUrls.Any(u => u.Contains("title=My%20Own%20Soul%27s%20Warning")));
+        Assert("curly-apostrophe term was searched as the fallback", httpClient.RequestUrls.Any(u => u.Contains("title=My%20Own%20Soul%E2%80%99s%20Warning")));
     }
 
     private static void TestPlexMultiArtistPlayMatchesPrimaryArtist()
@@ -3991,6 +4373,7 @@ internal class FakePlexNotification : INotification
 internal class FakeTrackService : ITrackService
 {
     private readonly Dictionary<int, List<Track>> _byArtistId = new();
+    private readonly Dictionary<int, List<Track>> _byAlbumId = new();
 
     public void AddTracksByArtist(int artistId, params Track[] tracks)
     {
@@ -4003,10 +4386,21 @@ internal class FakeTrackService : ITrackService
         list.AddRange(tracks);
     }
 
+    public void AddTracksByAlbum(int albumId, params Track[] tracks)
+    {
+        if (!_byAlbumId.TryGetValue(albumId, out var list))
+        {
+            list = new List<Track>();
+            _byAlbumId[albumId] = list;
+        }
+
+        list.AddRange(tracks);
+    }
+
     public Track GetTrack(int id) => null!;
     public List<Track> GetTracks(IEnumerable<int> ids) => new();
     public List<Track> GetTracksByArtist(int artistId) => _byArtistId.TryGetValue(artistId, out var tracks) ? tracks : new List<Track>();
-    public List<Track> GetTracksByAlbum(int albumId) => new();
+    public List<Track> GetTracksByAlbum(int albumId) => _byAlbumId.TryGetValue(albumId, out var tracks) ? tracks : new List<Track>();
     public List<Track> GetTracksByRelease(int albumReleaseId) => new();
     public List<Track> GetTracksByReleases(List<int> albumReleaseIds) => new();
     public List<Track> GetTracksForRefresh(int albumReleaseId, List<string> foreignTrackIds) => new();
